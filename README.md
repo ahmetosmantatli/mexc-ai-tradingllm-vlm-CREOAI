@@ -122,8 +122,9 @@ Services: `api`, `worker`, `postgres`, `redis`. API is bound to **127.0.0.1:8080
 | `LIVE_TRADING_ENABLED` | `false` | Hard gate for live order path |
 | `BROKER_MODE` | `paper` | Active broker (`paper` / `live`) |
 | `RISK_PROFILE` | `aggressive_growth` | Default preset |
-| `STARTING_CAPITAL_TRY` | `700` | Paper deposit basis `E0` |
-| `CAPITAL_FLOOR_TRY` | `700` | Floor `F` (default = `E0`) |
+| `STARTING_CAPITAL_TRY` | `700` | **Seed only** (örnek) for empty DB / first boot — not live cash |
+| `CAPITAL_FLOOR_TRY` | `700` | **Seed floor** `F`; after boot, floor tracks deposit via API/DB |
+| `EQUITY_RESET` | `false` | When `true`, wipe snapshots and re-seed from env |
 | `ALWAYS_ON_SCAN` | `true` | Continuous scan preference |
 | `FEE_FREE_PREFERENCE` | `true` | Prefer zero-commission pairs when suitable |
 | `WORKER_LOOP_INTERVAL_SECONDS` | `60` | Worker cycle interval |
@@ -136,6 +137,14 @@ Services: `api`, `worker`, `postgres`, `redis`. API is bound to **127.0.0.1:8080
 | `COMPOSE_PROJECT_NAME` | `mexc-ai` | Isolate from Creotora |
 
 See `.env.example` for the full template. **Do not invent or paste API keys into the repo.**
+
+### Dynamic equity (not a static 700)
+
+- `STARTING_CAPITAL_TRY` / `CAPITAL_FLOOR_TRY` are **seed defaults** for first boot or empty DB (`örnek / seed, gerçek kasa değil`).
+- Paper mode restores last equity from Postgres `equity_snapshots` (optional Redis cache). Restarts do **not** reset to 700 unless DB empty or `EQUITY_RESET=true`.
+- When MEXC read-only keys are set, `/equity` prefers available balance from account assets (TRY vs USDT shown clearly). Orders stay **paper** while `LIVE_TRADING_ENABLED=false`.
+- Risk engine and position sizing use **current equity E** from that view — never the env constant alone.
+- Operator deposits / floor updates: `POST /equity/deposit`, `POST /equity/floor`, `POST /equity/reset`.
 
 ---
 

@@ -6,6 +6,8 @@ from trading.agents.graph import EvaluationGraph
 from trading.agents.schemas import EvaluationResult, GraphAction
 from trading.brokers.paper import PaperBroker
 from trading.config import RiskProfile, Settings
+from trading.equity.service import EquityService
+from trading.equity.store import InMemoryEquityStore
 from trading.exchange.mexc_public import MexcPublicClient, TickerSnapshot
 from trading.models.domain import DecisionAction, Side, StopLossSpec, TradeProposal
 from trading.pipeline import TradingPipeline
@@ -13,6 +15,15 @@ from trading.quant.scanner import ScanResult
 from trading.quant.signals import CandidateSignal, StrategyName
 from trading.risk.engine import RiskEngine
 from trading.risk.presets import get_preset
+
+
+def _equity_service(settings: Settings, equity: float = 700.0) -> EquityService:
+    svc = EquityService(settings=settings, store=InMemoryEquityStore())
+    state = svc.seed_state()
+    state.equity = equity
+    svc.store.save(state)
+    svc._current = state  # noqa: SLF001
+    return svc
 
 
 class _FixedGraph(EvaluationGraph):
@@ -81,6 +92,7 @@ def test_pipeline_risk_reject_does_not_execute_paper() -> None:
             preset=get_preset(RiskProfile.AGGRESSIVE_GROWTH),
         ),
         broker=broker,
+        equity_service=_equity_service(settings),
     )
     audit = pipeline.run_cycle()
     assert audit.decision is not None
@@ -103,6 +115,7 @@ def test_pipeline_hold_skips_risk_and_broker() -> None:
         graph=graph,
         risk_engine=RiskEngine(settings=settings),
         broker=broker,
+        equity_service=_equity_service(settings),
     )
     audit = pipeline.run_cycle()
     assert audit.decision is None
@@ -144,6 +157,7 @@ def test_pipeline_accept_places_paper_fill_only() -> None:
             preset=get_preset(RiskProfile.AGGRESSIVE_GROWTH),
         ),
         broker=broker,
+        equity_service=_equity_service(settings),
     )
     audit = pipeline.run_cycle()
     assert audit.decision is not None
@@ -160,6 +174,7 @@ def test_pipeline_refuses_live_flag() -> None:
         settings=settings,
         public_client=MexcPublicClient(use_fixtures=True),
         broker=PaperBroker(starting_equity=700.0),
+        equity_service=_equity_service(settings),
     )
     audit = pipeline.run_cycle()
     assert audit.skipped == "LIVE_TRADING_ENABLED_REFUSED"
