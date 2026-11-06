@@ -82,6 +82,8 @@ class EquitySnapshot(Base):
     starting_capital: Mapped[float] = mapped_column(Float, default=0.0)
     broker: Mapped[str] = mapped_column(String(16), default="paper")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # source / TRY↔USDT display / operator notes — not secrets
+    extra: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class DecisionRecord(Base):

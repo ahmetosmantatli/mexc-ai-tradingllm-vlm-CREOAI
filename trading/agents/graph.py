@@ -19,6 +19,8 @@ from trading.agents.schemas import (
     PortfolioAnalystNote,
     StrategyReviewNote,
 )
+from trading.equity.sizing import max_loss_budget, notional_for_stop
+from trading.equity.state import EquityState
 from trading.models.domain import Side, StopLossSpec, TradeProposal
 from trading.quant.signals import CandidateSignal
 
@@ -45,16 +47,23 @@ def _best_candidate(state: GraphState) -> CandidateSignal | None:
 def size_proposal_from_signal(
     signal: CandidateSignal,
     *,
-    equity: float,
+    equity: float | EquityState,
     risk_per_trade_pct: float,
     target_leverage: float,
     rationale_prefix: str = "",
 ) -> TradeProposal:
-    """Convert a CandidateSignal into a TradeProposal with residual-aware sizing."""
+    """Convert a CandidateSignal into a TradeProposal sized from live equity E.
+
+    ``equity`` must be the current bankroll (or EquityState). Do not pass the
+    static STARTING_CAPITAL_TRY env constant unless that is truly the live E.
+    """
     stop_pct = max(signal.stop_distance_pct, 1e-4)
-    max_loss = max(equity * risk_per_trade_pct, 1e-6)
-    # Approximate notional so a stop of stop_pct loses ~max_loss.
-    notional = max_loss / stop_pct
+    max_loss = max(max_loss_budget(equity, risk_per_trade_pct), 1e-6)
+    notional = notional_for_stop(
+        equity,
+        risk_per_trade_pct=risk_per_trade_pct,
+        stop_distance_pct=stop_pct,
+    )
     leverage = max(1.0, min(float(target_leverage), 25.0))
     entry = signal.entry_price
     stop = signal.stop_loss_price
@@ -62,6 +71,7 @@ def size_proposal_from_signal(
     rationale = signal.rationale
     if rationale_prefix:
         rationale = f"{rationale_prefix} | {rationale}"
+    live_e = float(equity.equity) if isinstance(equity, EquityState) else float(equity)
     return TradeProposal(
         symbol=signal.symbol,
         side=signal.side,
@@ -78,6 +88,7 @@ def size_proposal_from_signal(
             "strategy": signal.strategy.value,
             "signal_id": signal.signal_id,
             "confidence": signal.confidence,
+            "sized_from_equity": live_e,
         },
     )
 

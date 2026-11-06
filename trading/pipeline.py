@@ -12,6 +12,8 @@ from trading.agents.schemas import EvaluationResult, GraphAction
 from trading.brokers.base import Broker, BrokerOrderRequest
 from trading.brokers.factory import get_broker
 from trading.config import Settings, get_settings
+from trading.equity.service import EquityService
+from trading.equity.state import EquityState
 from trading.exchange.mexc_public import MexcPublicClient
 from trading.models.domain import DecisionAction, RiskDecision, TradeProposal
 from trading.quant.scanner import LiquidityFilter, MarketScanner, ScanResult
@@ -27,6 +29,7 @@ class CycleAudit:
     evaluation: EvaluationResult | None = None
     decision: RiskDecision | None = None
     execution: dict[str, Any] | None = None
+    equity: EquityState | None = None
     skipped: str | None = None
 
 
@@ -35,6 +38,7 @@ class TradingPipeline:
     """Wires Quant scanner → LangGraph → Risk Engine → PaperBroker.
 
     LIVE path is never selected here; worker refuses LIVE_TRADING_ENABLED.
+    Risk / sizing use live equity E from EquityService — not static env capital.
     """
 
     settings: Settings = field(default_factory=get_settings)
@@ -42,6 +46,7 @@ class TradingPipeline:
     graph: EvaluationGraph | None = None
     risk_engine: RiskEngine | None = None
     broker: Broker | None = None
+    equity_service: EquityService | None = None
     open_risk: float = 0.0
     open_positions: int = 0
     floor_activated: bool = False
@@ -49,6 +54,9 @@ class TradingPipeline:
     audit_log: list[CycleAudit] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.equity_service is None:
+            self.equity_service = EquityService.from_settings(self.settings)
+        equity_state = self.equity_service.resolve()
         if self.public_client is None:
             self.public_client = MexcPublicClient(base_url=self.settings.mexc_base_url)
         if self.graph is None:
@@ -57,7 +65,11 @@ class TradingPipeline:
             preset = get_preset(self.settings.risk_profile)
             self.risk_engine = RiskEngine(settings=self.settings, preset=preset)
         if self.broker is None:
-            self.broker = get_broker(self.settings)
+            self.broker = get_broker(self.settings, equity_state=equity_state)
+        else:
+            # Keep injected broker equity aligned with resolved state on boot.
+            if hasattr(self.broker, "set_equity"):
+                self.broker.set_equity(equity_state.equity)
 
     def _scanner(self) -> MarketScanner:
         assert self.public_client is not None
@@ -71,15 +83,20 @@ class TradingPipeline:
             max_symbols=self.settings.scanner_max_symbols,
         )
 
+    def _equity_state(self) -> EquityState:
+        assert self.equity_service is not None
+        return self.equity_service.current or self.equity_service.resolve()
+
     def _risk_context(self, equity: float) -> RiskContext:
+        state = self._equity_state()
         return RiskContext(
             equity=equity,
-            starting_capital=self.settings.starting_capital_try,
-            capital_floor=self.settings.capital_floor_try,
+            starting_capital=state.starting_capital,
+            capital_floor=state.capital_floor,
             open_risk=self.open_risk,
             open_positions=self.open_positions,
             always_on_scan=self.settings.always_on_scan,
-            floor_activated=self.floor_activated or equity > self.settings.starting_capital_try,
+            floor_activated=self.floor_activated or equity > state.starting_capital,
             halt_new_risk=self.halt_new_risk,
         )
 
@@ -90,7 +107,17 @@ class TradingPipeline:
             logger.error("refusing cycle: LIVE_TRADING_ENABLED must stay false in Phase 2")
             return audit
 
-        assert self.graph is not None and self.risk_engine is not None and self.broker is not None
+        assert (
+            self.graph is not None
+            and self.risk_engine is not None
+            and self.broker is not None
+            and self.equity_service is not None
+        )
+
+        # Refresh equity view (MEXC read-only when keys present; else persisted paper).
+        equity_state = self.equity_service.resolve()
+        if hasattr(self.broker, "set_equity") and equity_state.source.value == "mexc_readonly":
+            self.broker.set_equity(equity_state.equity)
 
         scan = self._scanner().scan(symbols)
         equity = float(self.broker.get_equity())
@@ -105,17 +132,24 @@ class TradingPipeline:
             always_on_scan=self.settings.always_on_scan,
         )
 
-        audit = CycleAudit(scan=scan, evaluation=evaluation)
+        audit = CycleAudit(scan=scan, evaluation=evaluation, equity=equity_state)
 
         if evaluation.action == GraphAction.HOLD or evaluation.proposal is None:
             audit.skipped = evaluation.hold_reason or "hold"
+            self.equity_service.persist_paper_equity(
+                equity,
+                starting_capital=equity_state.starting_capital,
+                capital_floor=equity_state.capital_floor,
+            )
             self.audit_log.append(audit)
             logger.info(
-                "cycle HOLD | scanned=%s kept=%s candidates=%s reason=%s",
+                "cycle HOLD | scanned=%s kept=%s candidates=%s reason=%s equity=%.4f source=%s",
                 scan.scanned,
                 scan.kept,
                 len(scan.candidates),
                 audit.skipped,
+                equity,
+                equity_state.source.value,
             )
             return audit
 
@@ -125,11 +159,17 @@ class TradingPipeline:
 
         if decision.action != DecisionAction.ACCEPT:
             audit.skipped = "risk_reject"
+            self.equity_service.persist_paper_equity(
+                equity,
+                starting_capital=equity_state.starting_capital,
+                capital_floor=equity_state.capital_floor,
+            )
             self.audit_log.append(audit)
             logger.info(
-                "cycle RISK_REJECT | proposal=%s reasons=%s",
+                "cycle RISK_REJECT | proposal=%s reasons=%s equity=%.4f",
                 proposal.proposal_id,
                 decision.reason_codes,
+                equity,
             )
             return audit
 
@@ -139,6 +179,12 @@ class TradingPipeline:
         result = self.broker.place_order(request)
         self.open_positions += 1
         self.open_risk += proposal.max_loss_if_stopped
+        # Persist post-cycle paper equity (broker may adjust later via PnL hooks).
+        self.equity_service.persist_paper_equity(
+            float(self.broker.get_equity()),
+            starting_capital=equity_state.starting_capital,
+            capital_floor=equity_state.capital_floor,
+        )
         audit.execution = {
             "client_order_id": result.client_order_id,
             "status": result.status,
@@ -149,10 +195,11 @@ class TradingPipeline:
         }
         self.audit_log.append(audit)
         logger.info(
-            "cycle PAPER_FILL | symbol=%s side=%s notional=%.4f proposal=%s",
+            "cycle PAPER_FILL | symbol=%s side=%s notional=%.4f proposal=%s equity=%.4f",
             proposal.symbol,
             proposal.side.value,
             proposal.notional,
             proposal.proposal_id,
+            float(self.broker.get_equity()),
         )
         return audit

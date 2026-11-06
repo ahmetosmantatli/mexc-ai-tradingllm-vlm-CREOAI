@@ -70,8 +70,34 @@ class MexcReadOnlyClient:
         return {
             "assets": [],
             "source": "stub",
-            "note": "Phase 1 read-only stub; wire real GET when read-only key is configured.",
+            "note": "Read-only stub; wire real GET when read-only key is configured.",
         }
+
+    def get_account_assets(self) -> dict[str, Any]:
+        """Fetch account assets for equity view only — never places orders.
+
+        When keys are missing, returns the empty stub. Real HTTP uses the
+        read-only assets allowlist path; private order mutation paths are denied.
+        """
+        if not self.api_key or not self.api_secret:
+            return self.get_account_assets_stub()
+        path = "/api/v1/private/account/assets"
+        assert_not_private_order_path(path)
+        headers = self.signed_headers()
+        try:
+            response = self.request("GET", path, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict):
+                data.setdefault("source", "mexc")
+                return data
+            return {"assets": data, "source": "mexc"}
+        except Exception as exc:  # noqa: BLE001 — equity view degrades to stub
+            return {
+                "assets": [],
+                "source": "error",
+                "note": f"read-only assets fetch failed: {exc}",
+            }
 
     def get_open_positions_stub(self) -> dict[str, Any]:
         return {

@@ -68,7 +68,8 @@ class GraphState(BaseModel):
     """Mutable state passed through Market Analyst → Strategy Reviewer → Portfolio Analyst."""
 
     candidates: list[CandidateSignal] = Field(default_factory=list)
-    equity: float = 700.0
+    # Default 0 — callers must pass live equity; do not imply a static 700 seed.
+    equity: float = 0.0
     open_risk: float = 0.0
     open_positions: int = 0
     risk_profile: str = "aggressive_growth"

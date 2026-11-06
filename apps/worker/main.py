@@ -50,14 +50,20 @@ def main() -> int:
         graph=graph,
         risk_engine=engine,
     )
+    equity_state = pipeline._equity_state()
 
     logger.info(
-        "worker started | broker=%s profile=%s always_on_scan=%s floor=%s live=%s "
+        "worker started | broker=%s profile=%s always_on_scan=%s "
+        "equity=%.4f floor=%.4f e0=%.4f source=%s seed_env=%.4f live=%s "
         "interval=%.1fs anthropic=%s",
         settings.effective_broker_mode().value,
         settings.risk_profile.value,
         settings.always_on_scan and preset.always_on_scan,
-        settings.capital_floor_try,
+        equity_state.equity,
+        equity_state.capital_floor,
+        equity_state.starting_capital,
+        equity_state.source.value,
+        settings.starting_capital_try,
         settings.live_trading_enabled,
         settings.worker_loop_interval_seconds,
         "enabled" if llm.available else "stub",

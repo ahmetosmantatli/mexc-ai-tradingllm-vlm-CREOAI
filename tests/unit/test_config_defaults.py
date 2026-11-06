@@ -50,6 +50,15 @@ def test_public_dict_redacts_secrets() -> None:
     assert public["anthropic_api_key_configured"] is True
     assert public["live_trading_enabled"] is False
     assert public["risk_profile"] == "aggressive_growth"
+    assert public["starting_capital_is_seed_only"] is True
+    assert public["equity_reset"] is False
+
+
+def test_starting_capital_documented_as_seed() -> None:
+    settings = Settings(_env_file=None)
+    desc = Settings.model_fields["starting_capital_try"].description or ""
+    assert "seed" in desc.lower()
+    assert settings.equity_reset is False
 
 
 def test_get_settings_cached_singleton() -> None:

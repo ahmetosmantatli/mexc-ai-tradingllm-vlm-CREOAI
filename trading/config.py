@@ -47,12 +47,42 @@ class Settings(BaseSettings):
         description="Default risk preset for new installs (Aggressive Growth).",
     )
 
-    # --- Account / floor / horizon ---
-    starting_capital_try: float = Field(default=700.0, ge=0)
-    capital_floor_try: float = Field(default=700.0, ge=0)
+    # --- Account / floor / horizon (SEED ONLY — not live cash register) ---
+    starting_capital_try: float = Field(
+        default=700.0,
+        ge=0,
+        description=(
+            "Seed default for first boot / empty DB only (örnek). "
+            "Ahmet may deposit 500, 700, or any amount — runtime equity comes from "
+            "persisted paper state or MEXC read-only balance, not this constant."
+        ),
+    )
+    capital_floor_try: float = Field(
+        default=700.0,
+        ge=0,
+        description=(
+            "Seed floor F for empty state only. After first equity observation, "
+            "floor tracks deposit basis via settings API / persisted snapshot."
+        ),
+    )
     target_equity_try: float = Field(default=8000.0, ge=0)
     stretch_target_equity_try: float = Field(default=100_000.0, ge=0)
     currency: str = Field(default="TRY")
+    equity_reset: bool = Field(
+        default=False,
+        description=(
+            "When true, clear persisted equity and re-seed from STARTING_CAPITAL_TRY / "
+            "CAPITAL_FLOOR_TRY. Default false — restarts restore last equity."
+        ),
+    )
+    usdt_try_rate: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional display FX for converting MEXC USDT available balance into TRY "
+            "equity view. Not a trading rate guarantee."
+        ),
+    )
 
     # --- Aggressive Growth operational defaults ---
     always_on_scan: bool = Field(default=True)
@@ -119,6 +149,10 @@ class Settings(BaseSettings):
             return value.strip().lower()
         return value
 
+    @property
+    def mexc_api_key_configured(self) -> bool:
+        return bool(self.mexc_api_key and self.mexc_api_secret)
+
     def effective_broker_mode(self) -> BrokerMode:
         """Live broker only when both the mode and hard gate agree."""
         if self.broker_mode == BrokerMode.LIVE and self.live_trading_enabled:
@@ -133,9 +167,17 @@ class Settings(BaseSettings):
             "risk_profile": self.risk_profile.value,
             "starting_capital_try": self.starting_capital_try,
             "capital_floor_try": self.capital_floor_try,
+            "starting_capital_is_seed_only": True,
+            "capital_seed_note": (
+                "STARTING_CAPITAL_TRY / CAPITAL_FLOOR_TRY are örnek/seed defaults for "
+                "first boot or empty DB only — not the live cash register (gerçek kasa değil). "
+                "Runtime equity comes from persisted paper equity or MEXC read-only balance."
+            ),
             "target_equity_try": self.target_equity_try,
             "stretch_target_equity_try": self.stretch_target_equity_try,
             "currency": self.currency,
+            "equity_reset": self.equity_reset,
+            "usdt_try_rate": self.usdt_try_rate,
             "always_on_scan": self.always_on_scan,
             "fee_free_preference": self.fee_free_preference,
             "chart_vision_enabled": self.chart_vision_enabled,
@@ -144,7 +186,7 @@ class Settings(BaseSettings):
             "abs_max_loss_pct": self.abs_max_loss_pct,
             "residual_min_pct": self.residual_min_pct,
             "mexc_base_url": self.mexc_base_url,
-            "mexc_api_key_configured": bool(self.mexc_api_key),
+            "mexc_api_key_configured": self.mexc_api_key_configured,
             "anthropic_api_key_configured": bool(self.anthropic_api_key),
             "worker_loop_interval_seconds": self.worker_loop_interval_seconds,
             "scanner_min_quote_volume_24h": self.scanner_min_quote_volume_24h,
