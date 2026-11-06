@@ -1,7 +1,6 @@
-"""Worker stub for Phase 1.
+"""Worker loop: scan → propose → risk → paper execute (Phase 2).
 
-Phase 2+ will run Quant → LangGraph → Risk → PaperBroker loops here.
-This process only boots, logs safety defaults, and idles cleanly.
+PAPER ONLY. LIVE_TRADING_ENABLED must remain false.
 """
 
 from __future__ import annotations
@@ -11,7 +10,10 @@ import signal
 import sys
 import time
 
+from trading.agents.anthropic_client import AnthropicClient
+from trading.agents.graph import EvaluationGraph
 from trading.config import get_settings
+from trading.pipeline import TradingPipeline
 from trading.risk import RiskEngine, get_preset
 
 logging.basicConfig(
@@ -34,35 +36,57 @@ def main() -> int:
     logging.getLogger().setLevel(settings.log_level.upper())
 
     if settings.live_trading_enabled:
-        logger.error("LIVE_TRADING_ENABLED=true is not supported in Phase 1 worker — refusing start")
+        logger.error(
+            "LIVE_TRADING_ENABLED=true is not supported in Phase 2 worker — refusing start"
+        )
         return 2
 
     preset = get_preset(settings.risk_profile)
+    llm = AnthropicClient(settings=settings)
+    graph = EvaluationGraph(llm=llm)
     engine = RiskEngine(settings=settings, preset=preset)
+    pipeline = TradingPipeline(
+        settings=settings,
+        graph=graph,
+        risk_engine=engine,
+    )
 
     logger.info(
-        "worker started | broker=%s profile=%s always_on_scan=%s floor=%s live=%s",
+        "worker started | broker=%s profile=%s always_on_scan=%s floor=%s live=%s "
+        "interval=%.1fs anthropic=%s",
         settings.effective_broker_mode().value,
         settings.risk_profile.value,
         settings.always_on_scan and preset.always_on_scan,
         settings.capital_floor_try,
         settings.live_trading_enabled,
+        settings.worker_loop_interval_seconds,
+        "enabled" if llm.available else "stub",
     )
     logger.info(
-        "risk engine ready | stop_required=%s residual_min_pct=%.2f",
+        "pipeline ready | stop_required=%s residual_min_pct=%.2f scanner_max_symbols=%s",
         preset.stop_required,
         preset.residual_min_pct,
+        settings.scanner_max_symbols,
     )
-    _ = engine  # Phase 2 wires proposal loop
 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
 
     while _RUNNING:
-        # Always-on scan flag is honored as a readiness signal only in Phase 1.
-        time.sleep(5)
+        try:
+            if settings.always_on_scan or preset.always_on_scan:
+                pipeline.run_cycle()
+            else:
+                logger.info("always_on_scan disabled — idle tick")
+        except Exception:  # noqa: BLE001 — keep loop alive; log and continue
+            logger.exception("cycle failed; continuing after interval")
 
-    logger.info("worker stopped")
+        # Interruptible sleep
+        deadline = time.monotonic() + float(settings.worker_loop_interval_seconds)
+        while _RUNNING and time.monotonic() < deadline:
+            time.sleep(min(0.5, deadline - time.monotonic()))
+
+    logger.info("worker stopped | cycles=%s", len(pipeline.audit_log))
     return 0
 
 
