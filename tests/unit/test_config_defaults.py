@@ -40,11 +40,14 @@ def test_public_dict_redacts_secrets() -> None:
         _env_file=None,
         mexc_api_key="super-secret-key",
         mexc_api_secret="super-secret-secret",
+        anthropic_api_key="should-not-leak",
     )
     public = settings.public_dict()
     assert "mexc_api_secret" not in public
     assert "mexc_api_key" not in public
+    assert "anthropic_api_key" not in public
     assert public["mexc_api_key_configured"] is True
+    assert public["anthropic_api_key_configured"] is True
     assert public["live_trading_enabled"] is False
     assert public["risk_profile"] == "aggressive_growth"
 

@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0")
     api_port: int = Field(default=8080, ge=1, le=65535)
     log_level: str = Field(default="INFO")
+    worker_loop_interval_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        description="Seconds between scan → propose → risk → paper cycles.",
+    )
+    default_target_leverage: float = Field(default=10.0, gt=0, le=25.0)
+
+    # --- Scanner ---
+    scanner_min_quote_volume_24h: float = Field(default=500_000.0, ge=0)
+    scanner_max_spread_bps: float = Field(default=25.0, ge=0)
+    scanner_max_symbols: int = Field(default=40, ge=1, le=500)
 
     # --- Infra ---
     database_url: str = Field(
@@ -82,11 +93,17 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://localhost:6379/0")
     compose_project_name: str = Field(default="mexc-ai")
 
-    # --- MEXC (read-only expected in Phase 1) ---
+    # --- MEXC (read-only expected; no order placement in Phase 2) ---
     mexc_api_key: str = Field(default="")
     mexc_api_secret: str = Field(default="")
     mexc_base_url: str = Field(default="https://contract.mexc.com")
     mexc_recv_window_ms: int = Field(default=5000, ge=0)
+
+    # --- Anthropic (optional; graph falls back to deterministic stub) ---
+    anthropic_api_key: str = Field(
+        default="",
+        description="Read from ANTHROPIC_API_KEY only. Never hardcode. Empty → stub mode.",
+    )
 
     @field_validator("broker_mode", mode="before")
     @classmethod
@@ -128,6 +145,11 @@ class Settings(BaseSettings):
             "residual_min_pct": self.residual_min_pct,
             "mexc_base_url": self.mexc_base_url,
             "mexc_api_key_configured": bool(self.mexc_api_key),
+            "anthropic_api_key_configured": bool(self.anthropic_api_key),
+            "worker_loop_interval_seconds": self.worker_loop_interval_seconds,
+            "scanner_min_quote_volume_24h": self.scanner_min_quote_volume_24h,
+            "scanner_max_spread_bps": self.scanner_max_spread_bps,
+            "scanner_max_symbols": self.scanner_max_symbols,
             "compose_project_name": self.compose_project_name,
         }
 
