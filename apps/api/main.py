@@ -11,7 +11,8 @@ app = FastAPI(
     title="MEXC Hybrid AI Trading API",
     version=__version__,
     description=(
-        "Phase 1 skeleton. Paper-first. LIVE_TRADING_ENABLED defaults false. "
+        "Phase 2. Paper-first Quant → LangGraph → Risk → PaperBroker. "
+        "LIVE_TRADING_ENABLED defaults false. "
         "Aggressive Growth is the default risk profile — not a profit promise."
     ),
 )
