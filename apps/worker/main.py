@@ -1,100 +1,70 @@
-"""Worker loop: scan → propose → risk → paper execute (Phase 2).
-
-PAPER ONLY. LIVE_TRADING_ENABLED must remain false.
-"""
-
-from __future__ import annotations
-
+"""Single persistent paper worker. Never submits real exchange orders."""
+import fcntl
 import logging
+from pathlib import Path
 import signal
-import sys
 import time
 
-from trading.agents.anthropic_client import AnthropicClient
-from trading.agents.graph import EvaluationGraph
 from trading.config import get_settings
-from trading.pipeline import TradingPipeline
-from trading.risk import RiskEngine, get_preset
+from trading.runtime.runner import PaperRunner
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [worker] %(message)s",
-)
-logger = logging.getLogger("worker")
-
+logger = logging.getLogger('worker')
 _RUNNING = True
 
 
-def _handle_stop(signum: int, _frame: object) -> None:
+def _stop(*_):
     global _RUNNING
-    logger.info("received signal %s — shutting down", signum)
     _RUNNING = False
 
 
-def main() -> int:
-    settings = get_settings()
-    logging.getLogger().setLevel(settings.log_level.upper())
-
-    if settings.live_trading_enabled:
-        logger.error(
-            "LIVE_TRADING_ENABLED=true is not supported in Phase 2 worker — refusing start"
-        )
-        return 2
-
-    preset = get_preset(settings.risk_profile)
-    llm = AnthropicClient(settings=settings)
-    graph = EvaluationGraph(llm=llm)
-    engine = RiskEngine(settings=settings, preset=preset)
-    pipeline = TradingPipeline(
-        settings=settings,
-        graph=graph,
-        risk_engine=engine,
-    )
-    equity_state = pipeline._equity_state()
-
-    logger.info(
-        "worker started | broker=%s profile=%s always_on_scan=%s "
-        "equity=%.4f floor=%.4f e0=%.4f source=%s seed_env=%.4f live=%s "
-        "interval=%.1fs anthropic=%s",
-        settings.effective_broker_mode().value,
-        settings.risk_profile.value,
-        settings.always_on_scan and preset.always_on_scan,
-        equity_state.equity,
-        equity_state.capital_floor,
-        equity_state.starting_capital,
-        equity_state.source.value,
-        settings.starting_capital_try,
-        settings.live_trading_enabled,
-        settings.worker_loop_interval_seconds,
-        "enabled" if llm.available else "stub",
-    )
-    logger.info(
-        "pipeline ready | stop_required=%s residual_min_pct=%.2f scanner_max_symbols=%s",
-        preset.stop_required,
-        preset.residual_min_pct,
-        settings.scanner_max_symbols,
-    )
-
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
-
-    while _RUNNING:
+def main():
+    cfg = get_settings()
+    logging.basicConfig(level=cfg.log_level.upper(), format='%(asctime)s %(levelname)s %(message)s')
+    # httpx INFO logs include the full Telegram bot URL/token.
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+    lock_path = Path(cfg.runtime_db_path+'.worker.lock')
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open('a') as lock:
         try:
-            if settings.always_on_scan or preset.always_on_scan:
-                pipeline.run_cycle()
-            else:
-                logger.info("always_on_scan disabled — idle tick")
-        except Exception:  # noqa: BLE001 — keep loop alive; log and continue
-            logger.exception("cycle failed; continuing after interval")
-
-        # Interruptible sleep
-        deadline = time.monotonic() + float(settings.worker_loop_interval_seconds)
-        while _RUNNING and time.monotonic() < deadline:
-            time.sleep(min(0.5, deadline - time.monotonic()))
-
-    logger.info("worker stopped | cycles=%s", len(pipeline.audit_log))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.error('another worker owns this ledger')
+            return 2
+        try:
+            if Path(cfg.accounts_file).is_file():
+                from trading.runtime.fleet import Fleet
+                fleet = Fleet(cfg)
+                fleet.start()
+                signal.signal(signal.SIGINT, _stop)
+                signal.signal(signal.SIGTERM, _stop)
+                try:
+                    while _RUNNING:
+                        fleet.tick()
+                        time.sleep(1)
+                finally:
+                    fleet.stop()
+                return 0
+            runner = PaperRunner(cfg)
+        except ValueError as exc:
+            logger.error('startup refused: %s', exc)
+            return 2
+        signal.signal(signal.SIGINT, _stop)
+        signal.signal(signal.SIGTERM, _stop)
+        logger.info('PAPER worker started; no live orders; account credentials configured=%s', cfg.mexc_api_key_configured)
+        while _RUNNING:
+            try:
+                status = runner.cycle()
+                logger.info('paper cycle: %s', status['reason'])
+            except Exception as exc:
+                # A persistence failure is fatal. Do not trade against stale memory.
+                logger.error('fatal worker failure (%s); restart/reconciliation required', type(exc).__name__)
+                return 1
+            deadline = time.monotonic()+cfg.position_poll_seconds
+            while _RUNNING and time.monotonic() < deadline:
+                time.sleep(max(0, min(0.5, deadline-time.monotonic())))
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    raise SystemExit(main())

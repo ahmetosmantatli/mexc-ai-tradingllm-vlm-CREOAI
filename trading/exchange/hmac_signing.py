@@ -40,27 +40,20 @@ def sign_payload(secret: str, payload: str) -> str:
 def sign_mexc_request(
     secret: str,
     *,
+    api_key: str,
     params: Mapping[str, object] | None = None,
     body: str = "",
     timestamp_ms: int | None = None,
     recv_window_ms: int = 5000,
 ) -> dict[str, str | int]:
-    """Build signed auth fields for a MEXC contract private request.
+    """Contract signature = HMAC(secret, api_key + request_time + sorted query/body).
 
-    Signature material = query_string + body (when present), after injecting
-    timestamp / recvWindow into the param set. Callers attach returned fields
-    as headers / query params per MEXC docs when wiring real HTTP later.
+    Request-Time and Recv-Window are headers, never inserted into signed query.
     """
     ts = timestamp_ms if timestamp_ms is not None else current_timestamp_ms()
-    merged: dict[str, object] = dict(params or {})
-    merged["timestamp"] = ts
-    merged["recvWindow"] = recv_window_ms
-    query = build_query_string(merged)
-    payload = f"{query}{body}" if body else query
-    signature = sign_payload(secret, payload)
-    return {
-        "timestamp": ts,
-        "recvWindow": recv_window_ms,
-        "signature": signature,
-        "query_string": query,
-    }
+    if not api_key:
+        raise ValueError("MEXC API key is required")
+    query = build_query_string(params)
+    signature = sign_payload(secret, f"{api_key}{ts}{body or query}")
+    return {"timestamp": ts, "recvWindow": recv_window_ms,
+            "signature": signature, "query_string": query}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 
 from trading.config import RiskProfile, Settings, get_settings
 from trading.models.domain import DecisionAction, RiskDecision, TradeProposal
@@ -39,6 +40,24 @@ class RiskEngine:
         reasons: list[str] = []
         preset = self.preset or get_preset(RiskProfile.AGGRESSIVE_GROWTH)
 
+        values = [context.equity, context.open_risk, proposal.notional, proposal.leverage,
+                  proposal.max_loss_if_stopped, context.daily_loss_pct, context.weekly_loss_pct, context.drawdown_pct]
+        if not all(isfinite(v) for v in values):
+            return RiskDecision(action=DecisionAction.REJECT, proposal_id=proposal.proposal_id,
+                                reason_codes=["NONFINITE_RISK_INPUT"])
+        major = proposal.symbol in {"BTC_USDT", "ETH_USDT"}
+        if proposal.leverage > (preset.max_leverage_majors if major else preset.max_leverage_alts):
+            reasons.append("LEVERAGE_CAP")
+        if proposal.notional / proposal.leverage > context.equity:
+            reasons.append("INSUFFICIENT_MARGIN")
+        if proposal.entry_price and proposal.stop_loss and proposal.stop_loss.price:
+            entry, stop = proposal.entry_price, proposal.stop_loss.price
+            if not isfinite(entry) or not isfinite(stop) or (stop >= entry if proposal.side.value == "long" else stop <= entry):
+                reasons.append("INVALID_STOP_DIRECTION")
+            modeled_loss = proposal.notional * abs(entry-stop) / entry
+            if modeled_loss > proposal.max_loss_if_stopped + 1e-8:
+                reasons.append("UNDERSTATED_STOP_LOSS")
+
         # 1) Mandatory stop-loss (schema usually enforces; double-check).
         if proposal.stop_loss is None:
             reasons.append("MISSING_STOP_LOSS")
@@ -56,7 +75,7 @@ class RiskEngine:
         if equity <= 0:
             reasons.append("EQUITY_ZERO_HALT")
 
-        risk_cap = min(preset.risk_per_trade_pct, preset.abs_max_loss_pct, self.settings.abs_max_loss_pct)
+        risk_cap = min(preset.risk_per_trade_pct, preset.abs_max_loss_pct, self.settings.abs_max_loss_pct, self.settings.risk_per_trade_pct)
         max_allowed_loss = equity * risk_cap
         if proposal.max_loss_if_stopped > max_allowed_loss + 1e-9:
             reasons.append("MAX_LOSS_EXCEEDS_CAP")
@@ -72,7 +91,7 @@ class RiskEngine:
 
         # 3) Capital floor fields — halt new risk that would breach floor when activated.
         if preset.capital_floor_enabled and context.floor_activated:
-            projected = equity - proposal.max_loss_if_stopped
+            projected = equity - proposal.max_loss_if_stopped - max(context.open_risk, 0.0)
             if projected < context.capital_floor - 1e-9:
                 reasons.append("CAPITAL_FLOOR_THREAT")
 

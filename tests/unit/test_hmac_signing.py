@@ -18,6 +18,7 @@ def test_build_query_string_sorted() -> None:
 def test_sign_mexc_request_includes_fields() -> None:
     result = sign_mexc_request(
         "test-secret",
+        api_key="test-key",
         params={"symbol": "BTC_USDT"},
         timestamp_ms=1_700_000_000_000,
         recv_window_ms=5000,
@@ -26,3 +27,6 @@ def test_sign_mexc_request_includes_fields() -> None:
     assert result["recvWindow"] == 5000
     assert isinstance(result["signature"], str)
     assert "symbol=BTC_USDT" in str(result["query_string"])
+
+    assert result["signature"] == sign_payload("test-secret", "test-key1700000000000symbol=BTC_USDT")
+    assert "timestamp" not in result["query_string"]

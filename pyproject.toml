@@ -20,6 +20,8 @@ dependencies = [
   "python-dotenv>=1.0.1",
   "langgraph>=0.2.0",
   "anthropic>=0.39.0",
+  "matplotlib>=3.9,<4",
+  "cryptography>=43,<47",
 ]
 
 [project.optional-dependencies]
@@ -37,3 +39,4 @@ include = ["trading*", "apps*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

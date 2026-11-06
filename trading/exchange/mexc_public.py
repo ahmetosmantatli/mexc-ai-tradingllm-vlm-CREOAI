@@ -113,7 +113,10 @@ class MexcPublicClient:
     def _json(self, method: str, path: str, **kwargs: Any) -> Any:
         response = self.request(method, path, **kwargs)
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        if isinstance(payload, dict) and (payload.get("success") is False or payload.get("code", 0) != 0):
+            raise ValueError("MEXC market response unsuccessful")
+        return payload
 
     def list_contract_symbols(self) -> list[str]:
         if self.use_fixtures:
@@ -255,3 +258,20 @@ class MexcPublicClient:
                 if row.get("feeFree") or row.get("isZeroFee") or row.get("zeroFee"):
                     out.append(str(row["symbol"]).upper())
         return out
+
+    def get_contract_rules(self, symbol):
+        from trading.exchange.contracts import ContractRules
+        payload = self._json("GET", "/api/v1/contract/detail", params={"symbol": symbol})
+        rows = payload.get("data")
+        if isinstance(rows, dict):
+            rows = [rows]
+        row = next(r for r in rows if r.get("symbol") == symbol)
+        return ContractRules.parse(row)
+
+    def get_funding_history(self, symbol):
+        payload = self._json("GET", "/api/v1/contract/funding_rate/history", params={"symbol": symbol, "page_num": 1, "page_size": 1000})
+        data = payload["data"]
+        rows = data["resultList"]
+        if not isinstance(rows, list):
+            raise ValueError("funding history incomplete; manual reconciliation required")
+        return rows

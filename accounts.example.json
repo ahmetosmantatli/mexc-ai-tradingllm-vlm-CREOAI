@@ -1,0 +1,4 @@
+{"accounts": [
+  {"id":"ahmet", "telegram_user_id":111111111, "telegram_chat_id":111111111, "mexc_key_env":"AHMET_MEXC_KEY", "mexc_secret_env":"AHMET_MEXC_SECRET"},
+  {"id":"friend", "telegram_user_id":222222222, "telegram_chat_id":222222222, "mexc_key_env":"FRIEND_MEXC_KEY", "mexc_secret_env":"FRIEND_MEXC_SECRET"}
+]}

@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from trading.exchange.hmac_signing import sign_mexc_request
+from trading.exchange.hmac_signing import build_query_string, current_timestamp_ms, sign_payload
 from trading.exchange.order_deny import assert_not_private_order_path
 
 
@@ -48,22 +48,21 @@ class MexcReadOnlyClient:
         params: dict[str, object] | None = None,
         body: str = "",
     ) -> dict[str, str]:
-        signed = sign_mexc_request(
-            self.api_secret,
-            params=params,
-            body=body,
-            recv_window_ms=self.recv_window_ms,
-        )
+        timestamp = current_timestamp_ms()
+        material = body if body else build_query_string(params)
         return {
             "ApiKey": self.api_key,
-            "Request-Time": str(signed["timestamp"]),
-            "Recv-Window": str(signed["recvWindow"]),
-            "Signature": str(signed["signature"]),
+            "Request-Time": str(timestamp),
+            "Recv-Window": str(self.recv_window_ms),
+            "Content-Type": "application/json",
+            "Signature": sign_payload(self.api_secret, f"{self.api_key}{timestamp}{material}"),
         }
 
     def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """HTTP helper that refuses private order mutation paths."""
         assert_not_private_order_path(path)
+        if method.upper() != "GET" or path not in READONLY_PATH_ALLOWLIST:
+            raise ValueError("read-only client only permits explicitly allowed GET requests")
         return self._client().request(method, path, **kwargs)
 
     def get_account_assets_stub(self) -> dict[str, Any]:
@@ -104,3 +103,16 @@ class MexcReadOnlyClient:
             "positions": [],
             "source": "stub",
         }
+
+    def get_futures_account(self):
+        from trading.exchange.account import FuturesAccount
+        return FuturesAccount.parse(self.get_account_assets())
+
+    def get_open_positions(self):
+        path = "/api/v1/private/position/open_positions"
+        response = self.request("GET", path, headers=self.signed_headers())
+        response.raise_for_status()
+        data = response.json()
+        if data.get("success") is not True or data.get("code", 0) != 0 or not isinstance(data.get("data"), list):
+            raise ValueError("MEXC positions response unsuccessful")
+        return data["data"]

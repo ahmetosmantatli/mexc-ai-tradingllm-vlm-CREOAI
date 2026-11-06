@@ -32,3 +32,5 @@ logs/
 *.log
 data/
 tmp/
+
+work/

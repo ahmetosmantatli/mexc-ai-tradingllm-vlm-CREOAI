@@ -14,7 +14,8 @@ services:
     environment:
       LIVE_TRADING_ENABLED: "false"
       BROKER_MODE: paper
-      RISK_PROFILE: aggressive_growth
+      RUNTIME_DB_PATH: /app/data/runtime.sqlite3
+      KILL_SWITCH_PATH: /app/data/STOP
       DATABASE_URL: postgresql+psycopg://mexc:${POSTGRES_PASSWORD:-mexc}@postgres:5432/${POSTGRES_DB:-mexc_ai}
       REDIS_URL: redis://redis:6379/0
     ports:
@@ -25,6 +26,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - mexc_ai_runtime:/app/data
     restart: unless-stopped
     # Resource limit placeholders — tune after measuring Creotora headroom on Hetzner
     deploy:
@@ -55,7 +58,8 @@ services:
     environment:
       LIVE_TRADING_ENABLED: "false"
       BROKER_MODE: paper
-      RISK_PROFILE: aggressive_growth
+      RUNTIME_DB_PATH: /app/data/runtime.sqlite3
+      KILL_SWITCH_PATH: /app/data/STOP
       DATABASE_URL: postgresql+psycopg://mexc:${POSTGRES_PASSWORD:-mexc}@postgres:5432/${POSTGRES_DB:-mexc_ai}
       REDIS_URL: redis://redis:6379/0
     depends_on:
@@ -63,6 +67,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    volumes:
+      - mexc_ai_runtime:/app/data
+      - ../secrets:/app/secrets:ro
     restart: unless-stopped
     deploy:
       resources:
@@ -119,5 +126,6 @@ services:
       retries: 5
 
 volumes:
+  mexc_ai_runtime:
   mexc_ai_pgdata:
   mexc_ai_redis:

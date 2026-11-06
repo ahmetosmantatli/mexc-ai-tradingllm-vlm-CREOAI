@@ -135,6 +135,38 @@ class Settings(BaseSettings):
         description="Read from ANTHROPIC_API_KEY only. Never hardcode. Empty → stub mode.",
     )
 
+    # Worker runtime: real account observation, independent simulated ledger.
+    account_vault_key: str = ""
+    ai_budget_enabled: bool = True
+    position_update_seconds: float = Field(default=300, ge=30)
+    accounts_file: str = "secrets/accounts.json"
+    shared_budget_db_path: str = "data/shared-budget.sqlite3"
+    analysis_version: str = "text"
+    analysis_chart_dir: str = "data/charts"
+    decision_ttl_seconds: float = Field(default=60, ge=5, le=300)
+    protection_max_age_seconds: float = Field(default=30, ge=5)
+    position_poll_seconds: float = Field(default=5, ge=1, le=60)
+    runtime_db_path: str = "data/runtime.sqlite3"
+    require_mexc_balance: bool = True
+    paper_seed_usdt: float = Field(default=0, ge=0)
+    paper_fee_rate: float = Field(default=0.0006, ge=0, le=0.01)
+    paper_slippage_bps: float = Field(default=5, ge=0, le=100)
+    paper_max_leverage: float = Field(default=3, ge=1, le=5)
+    liquidation_buffer_pct: float = Field(default=0.02, gt=0, lt=0.5)
+    market_max_age_seconds: float = Field(default=30, gt=0)
+    daily_loss_limit_pct: float = Field(default=0.02, gt=0, le=0.1)
+    drawdown_limit_pct: float = Field(default=0.08, gt=0, le=0.3)
+    kill_switch_path: str = "data/STOP"
+    anthropic_model: str = "claude-sonnet-4-6"
+    anthropic_daily_budget_usd: float = Field(default=3, ge=0)
+    anthropic_total_budget_usd: float = Field(default=24, ge=0, le=25)
+    anthropic_input_usd_per_million: float = Field(default=3, gt=0)
+    anthropic_output_usd_per_million: float = Field(default=15, gt=0)
+    anthropic_min_interval_seconds: float = Field(default=300, ge=0)
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_status_interval_seconds: float = Field(default=3600, ge=60)
+
     @field_validator("broker_mode", mode="before")
     @classmethod
     def _normalize_broker_mode(cls, value: object) -> object:

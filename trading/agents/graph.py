@@ -157,7 +157,7 @@ def strategy_reviewer_node(state: GraphState, llm: AnthropicClient) -> GraphStat
             ),
         )
         if payload:
-            selected = payload.get("selected_signal_id") or stub.selected_signal_id
+            selected = payload.get("selected_signal_id")
             if selected and _signal_by_id(state, str(selected)) is None:
                 selected = stub.selected_signal_id
             stub = StrategyReviewNote(
@@ -212,6 +212,10 @@ def portfolio_analyst_node(state: GraphState, llm: AnthropicClient) -> GraphStat
         elif payload and str(payload.get("action", "")).lower() == "trade" and selected:
             should_trade = adj_confidence >= MIN_CONFIDENCE_TO_TRADE
 
+    if llm.available and (not payload or str(payload.get("action", "")).lower() not in {"trade", "hold"}):
+        should_trade = False
+        hold_reason = "llm_unavailable_or_invalid"
+
     if should_trade and selected is not None:
         proposal = size_proposal_from_signal(
             selected,
@@ -224,7 +228,7 @@ def portfolio_analyst_node(state: GraphState, llm: AnthropicClient) -> GraphStat
             action=GraphAction.TRADE,
             sizing_notes=f"max_loss_budget={max_loss_budget:.4f}",
             max_loss_budget=max_loss_budget,
-            mode="llm" if llm.available else "stub",
+            mode="llm" if llm.available and payload else "stub",
         )
         state.portfolio = portfolio
         state.result = EvaluationResult(
@@ -242,7 +246,7 @@ def portfolio_analyst_node(state: GraphState, llm: AnthropicClient) -> GraphStat
         action=GraphAction.HOLD,
         sizing_notes="no trade sized",
         max_loss_budget=max_loss_budget,
-        mode="llm" if llm.available else "stub",
+        mode="llm" if llm.available and payload else "stub",
     )
     state.portfolio = portfolio
     state.result = EvaluationResult(
@@ -334,6 +338,8 @@ class EvaluationGraph:
         target_leverage: float = 10.0,
         always_on_scan: bool = True,
     ) -> EvaluationResult:
+        if not candidates:
+            return EvaluationResult(action=GraphAction.HOLD, hold_reason="no_selected_signal")
         state = GraphState(
             candidates=candidates,
             equity=equity,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Sequence
+import time
 
 from trading.exchange.mexc_public import MexcPublicClient, TickerSnapshot
 from trading.quant.signals import CandidateSignal
@@ -76,10 +77,16 @@ class MarketScanner:
                 continue
             kept += 1
             klines = self.client.get_klines(sym, interval=self.kline_interval, limit=self.kline_limit)
+            candles = klines.get("candles") or []
+            if not self.client.use_fixtures:
+                candles = [c for c in candles if isinstance(c, list) and len(c) >= 5 and float(c[0])+900 <= time.time()]
+                if not candles or time.time()-(float(candles[-1][0])+900) > 1200:
+                    filtered_out[sym] = "STALE_OR_MISSING_CANDLES"
+                    continue
             ctx = StrategyContext(
                 symbol=sym,
                 last_price=float(ticker.last_price or 0.0),
-                klines=klines.get("candles") or [],
+                klines=candles,
                 fee_free_pair=sym in fee_free or bool(ticker.fee_free),
                 quote_volume_24h=ticker.quote_volume_24h,
             )
