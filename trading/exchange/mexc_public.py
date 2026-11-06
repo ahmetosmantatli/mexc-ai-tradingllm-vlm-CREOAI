@@ -79,7 +79,7 @@ class MexcPublicClient:
     Order / private mutation paths are denied.
     """
 
-    base_url: str = "https://contract.mexc.com"
+    base_url: str = "https://api.mexc.com"
     timeout_seconds: float = 10.0
     transport: httpx.BaseTransport | None = field(default=None, repr=False)
     _http: httpx.Client | None = field(default=None, repr=False)

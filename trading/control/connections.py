@@ -5,6 +5,7 @@ of end-to-end secrecy. Users may instead provision secrets on the server.
 """
 import json
 import time
+from trading.exchange.errors import ConnectionIssue
 
 
 class ConnectionFlow:
@@ -51,10 +52,22 @@ class ConnectionFlow:
             except Exception:
                 self.controller.send(ident,'Anahtar mesajı silinemedi; sohbetinden elle sil.')
             try:
-                payload=json.loads(command)
+                raw=command.strip()
+                if raw.startswith('```') and raw.endswith('```'):
+                    raw=raw.split('\n',1)[-1].rsplit('```',1)[0].strip()
+                try:
+                    payload=json.loads(raw)
+                except (ValueError,TypeError):
+                    raise ConnectionIssue('JSON okunamadı. Tek mesajda düz çift tırnaklarla api_key ve api_secret alanlarını gönder.') from None
                 if not isinstance(payload,dict) or set(payload)!={'api_key','api_secret'}:
-                    raise ValueError('format')
-                self.bind(ident,payload['api_key'],payload['api_secret'])
+                    raise ConnectionIssue('JSON içinde yalnız api_key ve api_secret alanları olmalı.')
+                values=[payload['api_key'],payload['api_secret']]
+                if not all(isinstance(v,str) and 8<=len(v.strip())<=512 and not any(ch.isspace() for ch in v.strip()) for v in values):
+                    raise ConnectionIssue('Key/secret boş, çok kısa veya içinde boşluk var. İki değeri MEXC kaydından yeniden kopyala.')
+                self.bind(ident,values[0].strip(),values[1].strip())
+            except ConnectionIssue as exc:
+                self.controller.send(ident,'Bağlama başarısız: '+str(exc)+' Yeniden denemek için /connect.')
+                return True
             except Exception:
                 self.controller.send(ident,'Bağlama başarısız. Açık pozisyon/analiz, anahtar izinleri, IP ve JSON biçimini kontrol et. Yeniden denemek için /connect.')
                 return True

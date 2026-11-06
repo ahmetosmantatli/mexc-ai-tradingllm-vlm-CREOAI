@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from trading.exchange.errors import ConnectionIssue, exchange_issue
 
 from trading.exchange.hmac_signing import build_query_string, current_timestamp_ms, sign_payload
 from trading.exchange.order_deny import assert_not_private_order_path
@@ -27,7 +28,7 @@ READONLY_PATH_ALLOWLIST: tuple[str, ...] = (
 class MexcReadOnlyClient:
     api_key: str = ""
     api_secret: str = ""
-    base_url: str = "https://contract.mexc.com"
+    base_url: str = "https://api.mexc.com"
     recv_window_ms: int = 5000
     timeout_seconds: float = 10.0
     _http: httpx.Client | None = field(default=None, repr=False)
@@ -104,15 +105,37 @@ class MexcReadOnlyClient:
             "source": "stub",
         }
 
+    def _private_json(self, path, stage):
+        try:
+            response = self.request("GET", path, headers=self.signed_headers())
+        except httpx.TimeoutException:
+            raise ConnectionIssue(f'MEXC {stage}: bağlantı zaman aşımı. Sunucu ağını ve API adresini kontrol et.') from None
+        except httpx.RequestError:
+            raise ConnectionIssue(f'MEXC {stage}: ağ/DNS/TLS bağlantısı kurulamadı. API adresini ve sunucu erişimini kontrol et.') from None
+        try:
+            payload=response.json()
+        except ValueError:
+            raise ConnectionIssue(f'MEXC {stage}: API JSON cevabı vermedi (HTTP {response.status_code}). API adresini veya ağ engelini kontrol et.') from None
+        if not isinstance(payload,dict):
+            raise ConnectionIssue(f'MEXC {stage}: beklenmeyen cevap biçimi.')
+        if payload.get('success') is not True or str(payload.get('code',0))!='0':
+            raise exchange_issue(payload.get('code'),stage)
+        if response.is_error:
+            raise ConnectionIssue(f'MEXC {stage}: HTTP {response.status_code}; sunucu erişimi reddedildi.')
+        return payload
+
     def get_futures_account(self):
         from trading.exchange.account import FuturesAccount
-        return FuturesAccount.parse(self.get_account_assets())
+        if not self.api_key or not self.api_secret:
+            raise ConnectionIssue('API key ve secret boş olamaz.')
+        payload=self._private_json('/api/v1/private/account/assets','hesap okuma')
+        try:
+            return FuturesAccount.parse(payload)
+        except (ValueError,KeyError,TypeError):
+            raise ConnectionIssue('MEXC hesap okuma: geçerli USDT Futures varlık kaydı bulunamadı. Futures hesabının açık olduğunu kontrol et; sıfır bakiye tek başına hata değildir.') from None
 
     def get_open_positions(self):
-        path = "/api/v1/private/position/open_positions"
-        response = self.request("GET", path, headers=self.signed_headers())
-        response.raise_for_status()
-        data = response.json()
-        if data.get("success") is not True or data.get("code", 0) != 0 or not isinstance(data.get("data"), list):
-            raise ValueError("MEXC positions response unsuccessful")
-        return data["data"]
+        payload=self._private_json('/api/v1/private/position/open_positions','pozisyon okuma')
+        if not isinstance(payload.get('data'),list):
+            raise ConnectionIssue('MEXC pozisyon okuma: beklenmeyen cevap biçimi.')
+        return payload['data']

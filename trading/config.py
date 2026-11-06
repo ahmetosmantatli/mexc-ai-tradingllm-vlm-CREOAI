@@ -126,7 +126,7 @@ class Settings(BaseSettings):
     # --- MEXC (read-only expected; no order placement in Phase 2) ---
     mexc_api_key: str = Field(default="")
     mexc_api_secret: str = Field(default="")
-    mexc_base_url: str = Field(default="https://contract.mexc.com")
+    mexc_base_url: str = Field(default="https://api.mexc.com")
     mexc_recv_window_ms: int = Field(default=5000, ge=0)
 
     # --- Anthropic (optional; graph falls back to deterministic stub) ---

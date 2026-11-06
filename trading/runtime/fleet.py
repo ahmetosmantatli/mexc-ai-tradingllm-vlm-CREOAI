@@ -15,6 +15,7 @@ from trading.config import Settings
 from trading.control import load_accounts, TelegramController
 from trading.evaluation.service import ContextEvaluator
 from trading.exchange.mexc_public import MexcPublicClient
+from trading.exchange.errors import ConnectionIssue
 from trading.runtime.budget import Budget
 from trading.runtime.protection import PositionProtection
 from trading.runtime.runner import PaperRunner
@@ -85,15 +86,15 @@ class Fleet:
         self.controller.set_control(ident,enabled=False)
         future=self.futures.get(ident)
         if future and not future.done():
-            raise ValueError('Analiz sürüyor; yeni girişler durduruldu. Biraz sonra tekrar dene.')
+            raise ConnectionIssue('Analiz sürüyor; yeni girişler durduruldu. Biraz sonra tekrar dene.')
         for version in ('text','vlm'):
             future=self.funding_futures.get((ident,version))
             if future and not future.done():
-                raise ValueError('Hesap uzlaştırması sürüyor; biraz sonra tekrar dene.')
+                raise ConnectionIssue('Hesap uzlaştırması sürüyor; biraz sonra tekrar dene.')
             runner=self.runners[(ident,version)]
             with runner.lock:
                 if runner.ledger and runner.ledger.positions:
-                    raise ValueError('Önce /closeall ile açık paper pozisyonları kapat; sonra bağlantıyı kaldır.')
+                    raise ConnectionIssue('Önce /closeall ile açık paper pozisyonları kapat; sonra bağlantıyı kaldır.')
 
     def replace_runners(self, ident, key, secret):
         account=next(a for a in self.accounts if a.account_id==ident)
@@ -112,10 +113,10 @@ class Fleet:
 
     def bind_account(self, ident, key, secret):
         if self.vault is None:
-            raise ValueError('Sunucuda şifreleme anahtarı eksik.')
+            raise ConnectionIssue('Sunucuda şifreleme anahtarı eksik.')
         self.idle_account(ident)
         if not isinstance(key,str) or not isinstance(secret,str):
-            raise ValueError('Geçersiz anahtar biçimi.')
+            raise ConnectionIssue('Geçersiz anahtar biçimi.')
         from trading.exchange.mexc_readonly import MexcReadOnlyClient
         client=MexcReadOnlyClient(api_key=key,api_secret=secret,base_url=self.cfg.mexc_base_url)
         try:
