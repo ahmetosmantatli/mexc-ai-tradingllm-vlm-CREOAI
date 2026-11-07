@@ -25,6 +25,8 @@ class ContextEvaluator:
     """
     def __init__(self, llm, store, public, settings):
         self.llm, self.store, self.public, self.cfg = llm, store, public, settings
+        if hasattr(llm, "response_validator"):
+            llm.response_validator = ModelDecision.model_validate
 
     def evaluate_candidates(self, candidates, *, equity, risk_per_trade_pct, target_leverage, **context):
         from trading.analysis import build_bundle, render_bundle

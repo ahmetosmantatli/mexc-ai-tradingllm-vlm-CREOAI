@@ -96,7 +96,8 @@ class TelegramController:
         elif not control['profile_chosen']:
             rows.extend([[{'text':mode['label'], 'callback_data':'control:'+key}] for key,mode in TRADER_MODES.items()])
         else:
-            rows.append([{'text':'✓ Çalışıyor' if control['enabled'] else '▶ Ayarlarla başlat', 'callback_data':'control:status' if control['enabled'] else 'control:start'}, {'text':'⏹ Botu durdur', 'callback_data':'control:stop'}])
+            rows.append([{'text':'✓ Çalışıyor' if control['enabled'] else '▶ Ayarlarla başlat', 'callback_data':'control:status' if control['enabled'] else 'control:start'}])
+            rows.append([{'text':'⏸ İşlem arayışını duraklat', 'callback_data':'control:pause'}, {'text':'⏹ Bot / AI durdur', 'callback_data':'control:stop'}])
             rows.append([{'text':'Ayarları değiştir', 'callback_data':'control:settings'}, {'text':'Kasa seçimini değiştir', 'callback_data':'control:capital'}])
         rows.append([{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':'Pozisyonlar', 'callback_data':'control:positions'}, {'text':'Günlük rapor', 'callback_data':'control:report'}])
         if self.linked(account_id):
@@ -181,10 +182,12 @@ class TelegramController:
         account = self.accounts[account_id]
         control = self.control(account_id)
         snapshot = self.snapshot_provider(account_id)
+        control_note = ('Bot / AI durduruldu: yeni model çağrısı yok. Kod ile SL/TP koruması sürer.\n' if control.get('stopped') else
+                        'İşlem arayışı duraklatıldı: yeni analiz çağrısı yok. Kod ile pozisyon takibi sürer.\n' if not control['enabled'] else '')
         text = (f'Hesap: {account.account_id} | PAPER\n'
                 f"MEXC: {'bağlı' if self.linked(account_id) else 'bağlı değil'}\n{self.capital_text(account_id)}\n"
                 f"Yeni işlem: {'açık' if control['enabled'] else 'duraklatıldı'} | Sürüm: {control['version']}\n"
-                f"Planlanan risk: %{100*control['risk_per_trade_pct']:g}\n")
+                f"{control_note}Planlanan risk: %{100*control['risk_per_trade_pct']:g}\n")
         if not snapshot:
             return text+'Henüz worker gözlemi yok.\nBaşlat düğmesi canlı emri etkinleştirmez.'
         observed = snapshot.get('observed_at', 0)
@@ -200,7 +203,16 @@ class TelegramController:
             text += (f"Paper: {paper['equity']:.4f} USDT | Açık PnL: {paper.get('unrealized',0):+.4f}\n"
                      f"Gerçekleşen: {paper.get('realized',0):+.4f} | Açık pozisyon: {paper.get('open_positions',0)}\n")
         budget = snapshot.get('ai_budget', {})
-        text += f"Ortak AI harcanan/ayrılan tahmini: ${budget.get('total',0):.4f}\n"
+        reserved = sum(float(row.get('amount',0)) for row in budget.get('reservations',{}).values())
+        settled = max(0.,float(budget.get('total',0))-reserved)
+        text += (f"Ortak Claude · yanıt kullanımından hesaplanan tahmini maliyet: ${settled:.4f}\n"
+                 f"Sonucu belirsiz / bekleyen rezervasyon: ${reserved:.4f} (harcama doğrulaması değil)\n"
+                 'Sağlayıcının gerçek bakiyesi/faturası bu ekrandan okunmaz.\n')
+        text += f"AI sağlayıcı: {snapshot.get('ai_provider','henüz çağrılmadı')} | Model: {snapshot.get('ai_model') or 'henüz seçilmedi'}\n"
+        if snapshot.get('ai_fallback'):
+            text += f"Yedek geçiş nedeni: {snapshot['ai_fallback']}\n"
+        usage=snapshot.get('groq_usage',{})
+        text += f"Ortak Groq geçerli yanıt: {usage.get('successful_calls',0)} | Girdi/çıktı tokenı: {usage.get('input_tokens',0)}/{usage.get('output_tokens',0)}\nGroq ücreti burada hesaplanmaz; ücretsiz kota ve limitler hesabına bağlıdır.\n"
         for version, view in snapshot.get('variants', {}).items():
             metric=view.get('paper')
             if metric:
@@ -350,7 +362,12 @@ class TelegramController:
                 message='Seçilen ayarlarla yeni paper girişleri açıldı.\n'+self.settings_text(account_id)
         elif command in ('pause','stop'):
             self.set_control(account_id,enabled=False,stopped=command=='stop')
-            message='Yeni girişler duraklatıldı. Mevcut pozisyon takibi devam eder; pozisyonlar otomatik kapatılmaz.'
+            message=('Bot / AI durduruldu. Bu hesapta yeni model çağrısı ve yeni işlem arayışı yapılmaz. '
+                     'Kod ile mevcut SL/TP koruması ve Telegram kontrolü devam eder; bunlar AI çağırmaz. '
+                     'Açık pozisyonlar otomatik kapatılmaz. Tekrar başlatmak için Başlat düğmesini kullan.' if command=='stop' else
+                     'İşlem arayışı duraklatıldı: yeni giriş analizi ve yeni işlem açılması durdu. '
+                     'Kod ile mevcut pozisyon takibi sürer; pozisyonlar otomatik kapatılmaz. Bu takip AI çağırmaz.')
+            message+=' Daha önce sağlayıcıya gönderilmiş bir istek tamamlanabilir ve ücretlenebilir; durdurma bunu geri alamaz. Sonucu yeni işlem açmak için kullanılmaz.'
         elif command in ('settings','menu'):
             if command=='settings':
                 self.set_control(account_id,enabled=False,version_chosen=False,profile_chosen=False)

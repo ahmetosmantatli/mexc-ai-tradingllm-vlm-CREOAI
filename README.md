@@ -159,3 +159,23 @@ journalctl -u mexc-paper-worker -n 30 --no-pager
 Use `systemctl restart mexc-paper-worker` after a successful code/config update. Do not launch another foreground worker while this service runs. Telegram `/stop` pauses new simulated entries while supervision remains active; `systemctl stop mexc-paper-worker` stops the whole application and all simulated position supervision. This release has no live exchange orders. The service unit has not been executed on Hetzner in this session.
 
 The Fleet worker now logs successful startup and one per-account status heartbeat per minute (account identifier, version and reason; no balances or secrets). An integration test covers Telegram demo selection → plan acceptance → paper entry → tighter stop event → SL close → notification queue/report → restart with preserved balance and paused control, without calling an exchange or AI provider.
+
+## Groq-first evaluation and AI stop
+
+Fleet routes both text and VLM evaluations through Groq first when `GROQ_API_KEY` is configured. Text defaults to `openai/gpt-oss-20b`; vision defaults to `qwen/qwen3.8-27b` (three images). Models and access can change: check [Groq vision](https://console.groq.com/docs/vision), [models](https://console.groq.com/docs/models) and your account's [limits](https://console.groq.com/docs/rate-limits). A free key does not guarantee enough quota for a three-chart prompt. No prompt, memory or image is silently removed to fit quota/context. An over-limit request waits or falls back.
+
+Server `.env` settings:
+
+```dotenv
+GROQ_API_KEY=your_server_only_key
+AI_PRIMARY_PROVIDER=groq
+GROQ_TEXT_MODEL=openai/gpt-oss-20b
+GROQ_VISION_MODEL=qwen/qwen3.8-27b
+AI_CLAUDE_FALLBACK_ENABLED=true
+```
+
+Fallback `true` permits potentially paid Claude calls for Groq rate limits, unavailable models, transport errors or invalid JSON/schema. Valid HOLD/WATCH decisions do not trigger fallback. `false` waits instead. Rate limits create a cooldown shared by the fleet accounts; there is no rapid retry loop. Explicit JSON object output is locally validated for both providers. Context is application-owned: the identical system prompt, market/account snapshot, bounded journal and chart paths are passed to the fallback. This preserves inputs, not equivalence of model judgment. No provider request or rate-limit behavior has been tested against a real key in this session.
+
+Telegram has separate **İşlem arayışını duraklat** and **Bot / AI durdur** controls. Both block new entry-analysis model calls; full AI stop is recorded explicitly and also guards fresh fallback calls. Neither kills the server process or disables deterministic SL/TP price protection. Current stop management uses code, not a model. Already submitted requests can complete and incur usage; their returned proposal still must pass the current control gate. To terminate the application itself, use `systemctl stop mexc-paper-worker`; Telegram control is then unavailable until it is started again.
+
+The cost display separates token-based **Claude estimated settled cost** from **pending/uncertain reservations**; neither is the provider's invoice or remaining credit. Definitively rejected requests release reservations; timeouts/ambiguous failures keep them. Historical uncertain reservations are not automatically erased, and a new demo session does not reset the shared usage record. Groq usage is displayed as token counts/valid response counts, without assuming your account is free or charging Claude rates. Other applications' key usage cannot be observed here.

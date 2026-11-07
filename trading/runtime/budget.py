@@ -35,6 +35,25 @@ class Budget:
             db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', ('ai_budget', json.dumps(state)))
             return ident
 
+    def release(self, ident):
+        """Release only a pending reservation known not to have generated usage.
+
+        Timeouts and server failures remain pending because billing is uncertain.
+        Returns False if already settled/released, so retries cannot subtract twice.
+        """
+        db = self.store.db
+        with self.store.lock, db:
+            db.execute('BEGIN IMMEDIATE')
+            state = self.store.get('ai_budget', {})
+            row = state.get('reservations', {}).pop(ident, None)
+            if row is None:
+                return False
+            state['total'] -= row['amount']
+            state['days'][row['day']] -= row['amount']
+            import json
+            db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', ('ai_budget', json.dumps(state)))
+            return True
+
     def settle(self, ident, input_tokens, output_tokens):
         with self.store.lock:
             self._settle(ident, input_tokens, output_tokens)

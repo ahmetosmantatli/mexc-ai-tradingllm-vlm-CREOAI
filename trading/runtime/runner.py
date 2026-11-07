@@ -108,7 +108,7 @@ class PaperRunner:
         snapshot = dict(mode='PAPER', live_orders_enabled=False, observed_at=time.time(), reason=reason,
             real_account=self.store.get('real_account'), paper=paper_snapshot,
             positions=positions_snapshot,
-            ai_status=self.llm.last_status, ai_budget=self.store.get('ai_budget', {}))
+            ai_status=self.llm.last_status, ai_provider=getattr(self.llm,'last_provider','anthropic'), ai_model=getattr(self.llm,'last_model',''), ai_fallback=getattr(self.llm,'last_fallback_reason',''), ai_budget=self.store.get('ai_budget', {}))
         self.store.put('status', snapshot)
         if self.protection:
             snapshot['protection'] = self.protection.snapshot()
@@ -133,7 +133,12 @@ class PaperRunner:
                      f"Gerçekleşen net PnL: {paper['realized']:+.4f} USDT\n"
                      f"Açık PnL: {paper['unrealized']:+.4f} USDT\n"
                      f"Ücret: {paper['fees']:.4f} | Funding: {paper['funding']:+.4f} USDT\n")
-        text += f"Claude: {s['ai_status']} | Harcanan/ayrılan tahmini: ${s['ai_budget'].get('total',0):.4f}"
+        budget=s.get('ai_budget',{})
+        pending=sum(row.get('amount',0) for row in budget.get('reservations',{}).values())
+        text += f"AI: {s.get('ai_provider','anthropic')} | {s['ai_status']}\n"
+        text += f"Claude yanıt tokenlarına göre tahmini: ${max(0,budget.get('total',0)-pending):.4f} | Sonucu belirsiz rezervasyon: ${pending:.4f}\nSağlayıcı faturası/bakiyesi değildir."
+        if s.get('ai_fallback'):
+            text += f"\nYedek geçiş nedeni: {s['ai_fallback']}"
         return text
 
     def cycle(self):

@@ -160,6 +160,11 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = Field(default=0.02, gt=0, le=0.1)
     drawdown_limit_pct: float = Field(default=0.08, gt=0, le=0.3)
     kill_switch_path: str = "data/STOP"
+    groq_api_key: str = Field(default='', repr=False)
+    ai_primary_provider: str = Field(default='groq', pattern='^(groq|anthropic)$')
+    ai_claude_fallback_enabled: bool = True
+    groq_text_model: str = 'openai/gpt-oss-20b'
+    groq_vision_model: str = 'qwen/qwen3.8-27b'
     anthropic_model: str = "claude-sonnet-4-6"
     anthropic_daily_budget_usd: float = Field(default=3, ge=0)
     anthropic_total_budget_usd: float = Field(default=24, ge=0, le=25)

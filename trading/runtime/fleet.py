@@ -11,7 +11,7 @@ import threading
 import sqlite3
 import time
 
-from trading.agents.anthropic_client import AnthropicClient
+from trading.agents.provider_router import ProviderRouter
 from trading.config import Settings
 from trading.control import load_accounts, TelegramController
 from trading.evaluation.service import ContextEvaluator
@@ -77,10 +77,11 @@ class Fleet:
                 mexc_api_key=account.mexc_api_key, mexc_api_secret=account.mexc_api_secret,
                 telegram_bot_token='', telegram_chat_id='')
             settings = cfg.model_copy(update=overrides)
-            llm = AnthropicClient(settings=settings, budget=Budget(self.budget_store,cfg))
+            llm = ProviderRouter(settings, Budget(self.budget_store,cfg), self.budget_store)
             runner = PaperRunner(settings,llm=llm)
             runner.graph = ContextEvaluator(llm, runner.store, runner.public, settings)
             runner.external_control = lambda aid=account.account_id,v=version:self.entry_control(aid,v)
+            llm.can_call = lambda r=runner: bool(r.external_control().get("enabled"))
             public = MexcPublicClient(base_url=cfg.mexc_base_url,timeout_seconds=2)
             runner.protection = PositionProtection(lambda r=runner:r.ledger,public,lock=runner.lock,
                 poll_seconds=cfg.position_poll_seconds,max_age_seconds=cfg.market_max_age_seconds,
@@ -200,10 +201,14 @@ class Fleet:
                 snapshot['variants'][version] = dict(paper=other.ledger.metrics() if other.ledger else None, positions=copy.deepcopy(other.ledger.positions) if other.ledger else {})
         ai_state=(snapshot.get('ai_status'),snapshot.get('reason'))
         previous=self.control_store.get(f'account:{account.account_id}:ai_notice')
-        if snapshot.get('ai_status') in ('error_or_invalid_output','budget_exhausted','budget_or_interval_hold','provider_credit_exhausted') and previous!=list(ai_state):
+        if snapshot.get('ai_status') in ('error_or_invalid_output','budget_exhausted','budget_or_interval_hold','provider_credit_exhausted','primary_unavailable_fallback_disabled') and previous!=list(ai_state):
             prefix='Claude API bakiyesi yetersiz. ' if snapshot.get('ai_status')=='provider_credit_exhausted' else ''
-            self.controller.enqueue(account.account_id,prefix+'Claude çağrısı başarısız veya bütçe sınırına ulaşıldı. Yeni AI işlemleri bekliyor; açık pozisyon takibi devam ediyor. Sağlayıcı bakiyesi, erişim ve ağ durumunu kontrol et.',event_id='ai:'+str(time.time()))
+            self.controller.enqueue(account.account_id,prefix+'AI çağrısı başarısız veya bütçe sınırına ulaşıldı. Yeni AI işlemleri bekliyor; açık pozisyon takibi devam ediyor. Sağlayıcı bakiyesi, erişim ve ağ durumunu kontrol et.',event_id='ai:'+str(time.time()))
         self.control_store.put(f'account:{account.account_id}:ai_notice',list(ai_state))
+        route=(snapshot.get('ai_provider'),snapshot.get('ai_fallback'))
+        if route[1] and route!=tuple(self.control_store.get(f'account:{account.account_id}:ai_route',[])):
+            self.controller.enqueue(account.account_id,f"AI yönlendirmesi: {route[0]} | Neden: {route[1]}. Claude yedeğine geçilmesi ücretli kullanım oluşturabilir. Aynı analiz bağlamı korunur; karar ayrıca risk/fiyat kontrollerinden geçer.",event_id='ai-route:'+str(time.time()))
+        self.control_store.put(f'account:{account.account_id}:ai_route',list(route))
         if snapshot.get('real_account') and not self.control_store.get(f'account:{account.account_id}:disconnected',False):
             self.control_store.put(f'account:{account.account_id}:linked',True)
         from trading.runtime.reports import daily_trade_report
@@ -229,6 +234,7 @@ class Fleet:
         snapshot['control'] = self.controller.control(account.account_id)
         snapshot['protection'] = runner.protection.snapshot()
         snapshot['ai_budget'] = self.budget_store.get('ai_budget',{})
+        snapshot['groq_usage'] = self.budget_store.get('groq_usage',{})
         active=any(v.get('positions') for v in snapshot['variants'].values())
         last_update=self.control_store.get(f'account:{account.account_id}:position_update_at',0)
         if active and time.time()-last_update>=self.cfg.position_update_seconds:
@@ -427,3 +433,7 @@ class Fleet:
         self.management_pool.shutdown(wait=True,cancel_futures=True)
         for protection in self.protections:
             protection.stop()
+        for runner in self.runners.values():
+            close=getattr(runner.llm,"close",None)
+            if close:
+                close()

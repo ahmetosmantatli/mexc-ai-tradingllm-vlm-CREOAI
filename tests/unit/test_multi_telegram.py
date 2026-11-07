@@ -358,3 +358,27 @@ def test_demo_amount_presets_and_stale_button_guard(tmp_path):
     assert len(commands)==1 and commands[0]['amount']==500
     ctl.dispatch(callback(11,11,'control:demo_amount:500'))
     assert len(ctl.store.get('account:a:commands'))==1
+
+
+def test_pause_and_stop_have_distinct_buttons_and_explain_no_new_ai(tmp_path):
+    ctl,calls=controller(tmp_path)
+    ready(ctl,'a')
+    buttons={b['callback_data']:b['text'] for row in ctl.keyboard('a')['inline_keyboard'] for b in row}
+    assert 'arayışını duraklat' in buttons['control:pause']
+    assert 'AI durdur' in buttons['control:stop']
+    ctl.dispatch(message(11,11,'/stop'))
+    response=next(body['text'] for method,body in reversed(calls) if method=='sendMessage')
+    assert 'yeni model çağrısı' in response and 'bunlar AI çağırmaz' in response
+    assert 'gönderilmiş bir istek' in response
+    assert 'Bot / AI durduruldu' in ctl.status_text('a')
+    ctl.dispatch(message(11,11,'/pause'))
+    assert not ctl.control('a')['stopped'] and not ctl.control('a')['enabled']
+    assert 'İşlem arayışı duraklatıldı' in ctl.status_text('a')
+
+
+def test_budget_status_separates_settled_estimate_from_pending_reservations(tmp_path):
+    ctl,_=controller(tmp_path,{'a':dict(observed_at=1,ai_budget=dict(total=.107,reservations={'pending':dict(amount=.107)}))})
+    text=ctl.status_text('a')
+    assert 'tahmini maliyet: $0.0000' in text
+    assert 'bekleyen rezervasyon: $0.1070' in text
+    assert 'gerçek bakiyesi/faturası' in text

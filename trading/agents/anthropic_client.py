@@ -9,7 +9,7 @@ import sqlite3
 import base64
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from trading.config import Settings, get_settings
 
@@ -25,6 +25,7 @@ class AnthropicClient:
     budget: Any = field(default=None, repr=False)
     last_status: str = "not_called"
     successful_calls: int = 0
+    can_call: Callable[[], bool] | None = field(default=None, repr=False)
     _client: Any = field(default=None, repr=False, init=False)
 
     @property
@@ -60,6 +61,10 @@ class AnthropicClient:
         images: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Ask for JSON. Returns None on missing key / errors (caller uses stub)."""
+        reservation = None
+        if self.can_call is not None and not self.can_call():
+            self.last_status = "stopped"
+            return None
         if not self.available:
             logger.debug("Anthropic stub mode: no ANTHROPIC_API_KEY")
             self.last_status = "missing_key"
@@ -72,10 +77,12 @@ class AnthropicClient:
                 content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png",
                     "data": base64.b64encode(Path(path).read_bytes()).decode("ascii")}})
             arguments = dict(model=model, system=system, messages=[{"role": "user", "content": content}])
-            reservation = None
             if self.budget is not None:
                 if not self.budget.can_spend():
                     self.last_status = "budget_exhausted"
+                    return None
+                if self.can_call is not None and not self.can_call():
+                    self.last_status = "stopped"
                     return None
                 # Count before generating; reserve headroom for provider token accounting.
                 counted = client.messages.count_tokens(**arguments).input_tokens + 1024
@@ -87,9 +94,15 @@ class AnthropicClient:
                 if reservation is None:
                     self.last_status = "budget_or_interval_hold"
                     return None
+            if self.can_call is not None and not self.can_call():
+                if reservation is not None:
+                    self.budget.release(reservation)
+                self.last_status = "stopped"
+                return None
             message = client.messages.create(max_tokens=max_tokens, **arguments)
             if self.budget is not None:
                 self.budget.settle(reservation, message.usage.input_tokens, message.usage.output_tokens)
+                reservation = None
             self.successful_calls += 1
             self.last_status = "success"
             text_parts: list[str] = []
@@ -109,6 +122,11 @@ class AnthropicClient:
         except sqlite3.Error:
             raise
         except Exception as exc:  # noqa: BLE001 — fallback path is intentional
+            # A definitive rejection (including rate limit) did not generate a reply.
+            # Ambiguous timeouts/5xx retain a pending estimate, never reported as billed.
+            status_code = getattr(exc, "status_code", None)
+            if reservation is not None and isinstance(status_code, int) and 400 <= status_code < 500 and status_code not in (408, 499):
+                self.budget.release(reservation)
             self.last_status = "error_or_invalid_output"
             body = getattr(exc, "body", {})
             error = body.get("error", {}) if isinstance(body, dict) else {}

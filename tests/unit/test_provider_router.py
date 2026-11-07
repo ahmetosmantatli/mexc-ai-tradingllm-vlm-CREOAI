@@ -1,0 +1,89 @@
+import base64
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from trading.agents.provider_router import ProviderRouter
+from trading.config import Settings
+from trading.evaluation.service import ModelDecision
+from trading.runtime.budget import Budget
+from trading.runtime.store import RuntimeStore
+
+
+def setup(tmp_path,handler,**overrides):
+    cfg=Settings(_env_file=None,groq_api_key='fake-groq',anthropic_api_key='fake-claude',**overrides)
+    store=RuntimeStore(str(tmp_path/'state'))
+    router=ProviderRouter(cfg,Budget(store,cfg),store,httpx.Client(transport=httpx.MockTransport(handler)))
+    router.response_validator=ModelDecision.model_validate
+    return router
+
+
+def decision(action='hold'):
+    return dict(action=action,signal_id=None,rationale='evidence',invalidation='level',watch_note='wait')
+
+
+def response(payload):
+    import json
+    return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(payload)}}], 'usage':{'prompt_tokens':100,'completion_tokens':20}})
+
+
+def test_groq_success_does_not_call_claude_and_tracks_tokens(tmp_path,monkeypatch):
+    router=setup(tmp_path,lambda request:response(decision()))
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:pytest.fail('Claude should not be called for HOLD'))
+    assert router.complete_json(system='JSON rules',user='all context')==decision()
+    assert router.last_provider=='groq' and router.last_status=='success'
+    assert router.store.get('groq_usage')['input_tokens']==100
+    assert router.store.get('ai_budget') is None
+
+
+def test_rate_limit_preserves_complete_context_and_images_in_fallback(tmp_path,monkeypatch):
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(429,headers={'retry-after':'120'},json={'error':{'message':'limit'}})
+    router=setup(tmp_path,handler)
+    charts=[]
+    for index in range(3):
+        path=tmp_path/f'{index}.png';path.write_bytes(b'PNG'+bytes([index]));charts.append(str(path))
+    forwarded=[]
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:forwarded.append(kw) or decision())
+    assert router.complete_json(system='rules',user='memory and all candles',images=charts)==decision()
+    assert forwarded[0]==dict(system='rules',user='memory and all candles',max_tokens=800,images=charts)
+    assert router.last_fallback_reason=='groq_http_429'
+    import json
+    envelope=json.loads(calls[0].content)
+    images=envelope['messages'][1]['content'][1:]
+    assert len(images)==3
+    assert base64.b64decode(images[2]['image_url']['url'].split(',')[1])==Path(charts[2]).read_bytes()
+    router.complete_json(system='rules',user='next context',images=charts)
+    assert len(calls)==1 # shared cooldown avoids hammering Groq
+
+
+from pathlib import Path
+
+
+def test_stop_during_primary_prevents_new_paid_fallback(tmp_path,monkeypatch):
+    active=[True]
+    def handler(request):
+        active[0]=False
+        return httpx.Response(429)
+    router=setup(tmp_path,handler)
+    router.can_call=lambda:active[0]
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:pytest.fail('paid fallback after stop'))
+    assert router.complete_json(system='JSON',user='context') is None
+    assert router.last_status=='stopped'
+
+
+def test_invalid_decision_falls_back_but_opt_out_never_spends(tmp_path,monkeypatch):
+    router=setup(tmp_path,lambda request:response({'action':'invented'}),ai_claude_fallback_enabled=False)
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:pytest.fail('fallback disabled'))
+    assert router.complete_json(system='JSON',user='context') is None
+    assert router.last_status=='primary_unavailable_fallback_disabled'
+
+
+def test_invalid_groq_schema_can_fall_back_to_valid_claude(tmp_path,monkeypatch):
+    router=setup(tmp_path,lambda request:response({'action':'invented'}))
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:decision())
+    assert router.complete_json(system='JSON',user='context')==decision()
+    assert router.last_provider=='anthropic'
