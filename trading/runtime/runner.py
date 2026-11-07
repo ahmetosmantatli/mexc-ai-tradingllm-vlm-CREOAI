@@ -286,6 +286,8 @@ class PaperRunner:
                 return self.status('HOLD_RISK_CHANGED')
             opened = ledger.open(proposal, rules, ticker.bid1, ticker.ask1, signal.features['dedup_key'], risk_pct, self.cfg.liquidation_buffer_pct)
             if opened:
+                opened['decision_ai'] = copy.deepcopy(result.metadata.get('decision_ai',dict(provider='unknown',model='unknown',fallback_reason='')))
+                ledger.state['events'][-1]['decision_ai'] = copy.deepcopy(opened['decision_ai'])
                 opened['charts'] = result.metadata.get('charts', [])
                 opened['analysis_version'] = self.cfg.analysis_version
                 opened['rationale'] = proposal.rationale

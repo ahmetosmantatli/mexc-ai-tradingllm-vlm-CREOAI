@@ -264,6 +264,19 @@ class Fleet:
                     text += f"Stop güncellendi: {event['old_stop']:.6g} → {event['new_stop']:.6g}\nGiriş {event['entry']:.6g} | TP {event['target']:.6g}\n{event['reason']}\n"
                 else:
                     text += f"Funding düzeltmesi: {event.get('charge',0):+.4f} USDT\n"
+                if event['kind'] in ('OPEN','CLOSE','STOP_UPDATED'):
+                    origin=event.get('decision_ai') or {}
+                    provider=origin.get('provider') or 'kayıtlı değil'
+                    model=origin.get('model') or 'kayıtlı değil'
+                    text += f"Giriş kararını veren AI: {provider} | {model}\n"
+                    if origin.get('fallback_reason'):
+                        text += f"Yedek geçiş nedeni: {origin['fallback_reason']}\n"
+                    if event['kind']=='OPEN':
+                        text += 'Uygulama: risk motoru + PAPER broker (simülasyon)\n'
+                    elif event['kind']=='STOP_UPDATED':
+                        text += 'Stop aksiyonu: kod tabanlı yönetim; yeni AI kararı değil.\n'
+                    else:
+                        text += 'Kapanış: SL/TP veya manuel kontrol; yeni AI kararı değil.\n'
                 with r.lock:
                     metric=r.ledger.metrics()
                 text += (f"Olay bakiyesi {event['equity']:.4f} USDT\n"

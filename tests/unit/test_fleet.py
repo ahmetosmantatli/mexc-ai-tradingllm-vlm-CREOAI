@@ -204,11 +204,14 @@ def test_telegram_demo_to_trade_stop_update_close_report_and_restart(tmp_path,mo
         runner.public=Public()
         monkeypatch.setattr('trading.runtime.runner.MarketScanner.scan',lambda *a,**kw:ScanResult(1,1,candidates=[signal]))
         proposal=size_proposal_from_signal(signal,equity=500,risk_per_trade_pct=.01,target_leverage=5)
-        monkeypatch.setattr(runner.graph,'evaluate_candidates',lambda *a,**kw:EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=signal,market=MarketAnalystNote(mode='llm'),strategy=StrategyReviewNote(mode='llm'),portfolio=PortfolioAnalystNote(mode='llm')))
+        monkeypatch.setattr(runner.graph,'evaluate_candidates',lambda *a,**kw:EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=signal,market=MarketAnalystNote(mode='llm'),strategy=StrategyReviewNote(mode='llm'),portfolio=PortfolioAnalystNote(mode='llm'),metadata={'decision_ai':{'provider':'anthropic','model':'claude-sonnet-4-6','fallback_reason':'groq_http_429'}}))
         runner.store.put('last_scan_at',0)
         runner.store.put('last_evaluation_at',0)
         assert runner.cycle()['reason']=='PAPER_OPENED'
         p=runner.ledger.positions['BTC_USDT']
+        assert p['decision_ai']['model']=='claude-sonnet-4-6'
+        runner.llm.last_provider='groq'
+        runner.llm.last_model='a-later-model'
         assert runner.ledger.update_stop('BTC_USDT',100.5,102,102.01,p['opened_at'],'confirmed structure',time.time()-1)
         runner.ledger.mark('BTC_USDT',100.4,100.41,100.4)
         runner.status('HOLD_TEST_COMPLETE')
@@ -219,6 +222,10 @@ def test_telegram_demo_to_trade_stop_update_close_report_and_restart(tmp_path,mo
         assert report['closed_trades']==1 and report['net_pnl']>0
         texts='\n'.join(body.get('text','') for method,body in calls if method=='sendMessage')
         assert 'İşlem açıldı' in texts and 'Stop güncellendi' in texts and 'İşlem kapandı: SL' in texts
+        assert 'Giriş kararını veren AI: anthropic | claude-sonnet-4-6' in texts
+        assert 'Yedek geçiş nedeni: groq_http_429' in texts
+        assert 'a-later-model' not in texts
+        assert runner.ledger.state['closed_positions'][-1]['decision_ai']['model']=='claude-sonnet-4-6'
         message('/stop')
         assert not fleet.controller.control('demo')['enabled']
         ending=runner.ledger.equity

@@ -67,13 +67,16 @@ class ContextEvaluator:
                 raise ValueError('unknown signal')
         except Exception:
             return EvaluationResult(action=GraphAction.HOLD, hold_reason='invalid_or_unavailable_model')
-        record=dict(at=time.time(), action=decision.action, rationale=decision.rationale,
+        decision_ai=dict(provider=getattr(self.llm,'last_provider','unknown'),
+            model=getattr(self.llm,'last_model','unknown'),
+            fallback_reason=getattr(self.llm,'last_fallback_reason',''))
+        record=dict(at=time.time(), action=decision.action, rationale=decision.rationale, decision_ai=decision_ai,
                     invalidation=decision.invalidation, charts=paths, fingerprint=fingerprint)
         memory.update(watch_note=decision.watch_note, last_fingerprint=fingerprint,
                       history=(memory['history']+[record])[-6:])
         self.store.put(key, memory)
         self.store.put('last_analysis', record)
-        metadata=dict(charts=paths, analysis_version=self.cfg.analysis_version,
+        metadata=dict(charts=paths, analysis_version=self.cfg.analysis_version, decision_ai=decision_ai,
                       decision_created_at=time.time(), decision_started_at=started,
                       fingerprint=fingerprint, invalidation=decision.invalidation)
         if time.time()-started > self.cfg.decision_ttl_seconds:

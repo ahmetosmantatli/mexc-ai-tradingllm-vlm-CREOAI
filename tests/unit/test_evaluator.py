@@ -20,7 +20,7 @@ def test_variant_same_policy_bounded_memory_and_exact_charts(tmp_path,monkeypatc
     def complete(**kw):
         calls.append(kw)
         return dict(action='trade',signal_id=candidate.signal_id,rationale='confirmed setup',invalidation='break level',watch_note='track structure')
-    llm=SimpleNamespace(budget=None,complete_json=complete)
+    llm=SimpleNamespace(budget=None,complete_json=complete,last_provider='anthropic',last_model='claude-sonnet-4-6',last_fallback_reason='groq_http_429')
     settings=Settings(_env_file=None,analysis_version=version,analysis_chart_dir=str(tmp_path))
     store=RuntimeStore(str(tmp_path/'memory'))
     service=ContextEvaluator(llm,store,None,settings)
@@ -28,6 +28,8 @@ def test_variant_same_policy_bounded_memory_and_exact_charts(tmp_path,monkeypatc
     first=service.evaluate_candidates([candidate],**kwargs)
     assert first.action==GraphAction.TRADE
     assert first.metadata['charts']==paths
+    assert first.metadata['decision_ai']==dict(provider='anthropic',model='claude-sonnet-4-6',fallback_reason='groq_http_429')
+    assert store.get('memory:BTC_USDT')['history'][-1]['decision_ai']==first.metadata['decision_ai']
     assert calls[0]['images']==(paths if version=='vlm' else None)
     assert store.get('memory:BTC_USDT')['watch_note']=='track structure'
     assert ContextEvaluator(llm,store,None,settings).evaluate_candidates([candidate],**kwargs).hold_reason=='unchanged_closed_candles'

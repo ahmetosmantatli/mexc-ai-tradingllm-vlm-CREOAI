@@ -162,7 +162,7 @@ class PaperLedger:
             self.state.setdefault('closed_positions', []).append(dict(p))
             del self.positions[symbol]
             self.event('CLOSE', symbol=symbol, side=p['side'], reason='LIQ' if liquidated else 'SL' if stop else 'TP',
-                       price=exit_price, net_pnl=net, equity=self.equity)
+                       price=exit_price, net_pnl=net, equity=self.equity, decision_ai=p.get('decision_ai',{}))
         self.state['peak'] = max(self.state['peak'], self.equity)
         self.save()
 
@@ -205,7 +205,7 @@ class PaperLedger:
         position['close_reason']='MANUAL'
         self.state.setdefault('closed_positions',[]).append(dict(position))
         del self.positions[symbol]
-        self.event('CLOSE',symbol=symbol,side=position['side'],reason='MANUAL',price=price,net_pnl=net,equity=self.equity)
+        self.event('CLOSE',symbol=symbol,side=position['side'],reason='MANUAL',price=price,net_pnl=net,equity=self.equity,decision_ai=position.get('decision_ai',{}))
         self.save()
 
     @synchronized
@@ -252,7 +252,7 @@ class PaperLedger:
         p['last_management_evidence_at']=evidence_at
         self.event('STOP_UPDATED',symbol=symbol,old_stop=old,new_stop=new_stop,reason=reason,
                    evidence_at=evidence_at,entry=p['entry'],target=p['target'],
-                   unrealized=p['unrealized'],equity=self.equity,side=p['side'])
+                   unrealized=p['unrealized'],equity=self.equity,side=p['side'],decision_ai=p.get('decision_ai',{}))
         self.save()
         return True
 
