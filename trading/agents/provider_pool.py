@@ -215,7 +215,11 @@ class ProviderPool:
                     cooldown_seconds=max(0,state.get('retry_at',0)-now,self._cooldown(slot,images)-now),
                     in_flight=bool(state.get('lease') and state['lease']['until']>now),
                     local_estimate=True))
-        return dict(groups=rows,quota_window='rolling_24h',provider_reported=False)
+        paid=self.store.get(self._paid_guard_key(),{})
+        return dict(groups=rows,quota_window='rolling_24h',provider_reported=False,
+            paid_guard=dict(model=self.settings.anthropic_model,operational_guard=True,
+                max_in_flight=1,in_flight=(paid.get('lease') or {}).get('until',0)>now,
+                cooldown_seconds=max(0,paid.get('retry_at',0)-now)))
 
     def _notify(self):
         self.last_trace.update(status=self.last_status,provider=self.last_provider,
@@ -308,7 +312,75 @@ class ProviderPool:
         # Do not bypass a provider's Retry-After. Longer delays use future cycles.
         return status!=429 or self._cooldown(slot,images)<=time.time()+seconds
 
+    def _paid_guard_key(self):
+        # Scope to model and shared budget DB, not account/fork or API key.
+        return 'pool:paid:guard:'+hashlib.sha256(self.settings.anthropic_model.encode()).hexdigest()
+
+    def _claim_paid(self):
+        now=time.time()
+        with self.store.lock,self.store.db:
+            self.store.db.execute('BEGIN IMMEDIATE')
+            key=self._paid_guard_key()
+            state=self.store.get(key,{})
+            if state.get('retry_at',0)>now:
+                return None,'cooldown_skipped',state['retry_at']-now
+            if (state.get('lease') or {}).get('until',0)>now:
+                return None,'paid_in_flight',0
+            ident=uuid4().hex
+            # Count and generation are two sequential HTTP operations. This is
+            # crash recovery for the local mutex, not a provider rate allowance.
+            state['lease']=dict(id=ident,until=now+2*self.settings.ai_provider_timeout_seconds+30)
+            self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(key,json.dumps(state)))
+            return ident,'',0
+
+    def _release_paid(self,ident,result):
+        attempt=self.last_trace['attempts'][-1] if self.last_trace.get('attempts') else {}
+        category=attempt.get('error_category','')
+        status=attempt.get('http_status')
+        delay=0
+        if result is None:
+            if status==429 or category=='rate_limit':
+                raw=attempt.get('retry_after_seconds',60)
+                delay=max(1,float(raw)) if isinstance(raw,(int,float)) and math.isfinite(raw) else 60
+            elif status in (401,403) or category in ('authentication_or_permission','credit_exhausted') or self.last_status=='provider_credit_exhausted':
+                delay=300
+            elif (attempt.get('generation_requests',0) or attempt.get('count_requests',0)) and self.last_status not in (
+                    'stopped','missing_key','budget_exhausted','budget_or_interval_hold','context_too_large'):
+                delay=30
+        with self.store.lock,self.store.db:
+            self.store.db.execute('BEGIN IMMEDIATE')
+            key=self._paid_guard_key()
+            state=self.store.get(key,{})
+            if (state.get('lease') or {}).get('id')==ident:
+                state['lease']=None
+                if delay:
+                    state['retry_at']=max(state.get('retry_at',0),time.time()+delay)
+                self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(key,json.dumps(state)))
+
     def _paid(self,system,user,max_tokens,images):
+        self.last_provider='anthropic'
+        self.last_model=self.settings.anthropic_model
+        self.last_credential_id='anthropic-1'
+        self.last_quota_group='paid-shared'
+        if not self._allowed():
+            self.last_status='stopped'
+            return None
+        ident,skip,remaining=self._claim_paid()
+        if ident is None:
+            self.last_status=skip
+            self.last_trace['attempts'].append(dict(provider='anthropic',model=self.last_model,
+                credential_id=self.last_credential_id,quota_group=self.last_quota_group,
+                status=skip,error_category=skip,generation_requests=0,count_requests=0,
+                retry_after_seconds=remaining,operational_guard=True))
+            return None
+        result=None
+        try:
+            result=self._paid_request(system,user,max_tokens,images)
+            return result
+        finally:
+            self._release_paid(ident,result)
+
+    def _paid_request(self,system,user,max_tokens,images):
         self.last_credential_id='anthropic-1'
         self.last_quota_group='paid-shared'
         self.last_provider='anthropic'

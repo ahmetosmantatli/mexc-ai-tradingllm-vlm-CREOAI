@@ -254,3 +254,111 @@ def test_busy_free_group_waits_briefly_before_paid_fallback(tmp_path):
     assert p.complete_json(system='s',user='u')=={'action':'hold'}
     assert waits==[5]
     assert p.last_provider=='groq'
+
+
+def paid_pool(tmp_path):
+    return pool(tmp_path,settings(groq_api_key='',anthropic_api_key='paid',
+        ai_primary_provider='anthropic',ai_vision_primary_provider='anthropic'))
+
+
+def paid_response(client, *, status='success', code=None, category='', retry=None):
+    def complete(**kwargs):
+        client.last_status=status
+        client.last_attempt=dict(provider='anthropic',model='test',status=status,http_status=code,
+            error_category=category,generation_requests=1,count_requests=1)
+        if retry is not None:
+            client.last_attempt['retry_after_seconds']=retry
+        return {'action':'hold'} if status=='success' else None
+    client.complete_json=complete
+
+
+@pytest.mark.parametrize('status,code,category,retry,expected',[
+    ('error_or_invalid_output',429,'rate_limit',123,123),
+    ('error_or_invalid_output',429,'rate_limit',None,60),
+    ('error_or_invalid_output',401,'authentication_or_permission',None,300),
+    ('provider_credit_exhausted',400,'credit_exhausted',None,300),
+    ('error_or_invalid_output',None,'ambiguous_timeout',None,30),
+    ('error_or_invalid_output',503,'provider_server_error',None,30),
+    ('output_truncated',200,'output_truncated',None,30),
+])
+def test_paid_failure_cooldown_persists_across_clients_without_http_retry(tmp_path,status,code,category,retry,expected):
+    p,store=paid_pool(tmp_path)
+    paid_response(p.claude,status=status,code=code,category=category,retry=retry)
+    before=time.time()
+    assert p.complete_json(system='s',user='u') is None
+    state=store.get(p._paid_guard_key())
+    assert state['lease'] is None
+    assert before+expected<=state['retry_at']<=time.time()+expected
+    # Another account/process using the same shared DB sees this cooldown too.
+    restarted=ProviderPool(p.settings,p._paid_budget,RuntimeStore(str(tmp_path/'state')),p.client)
+    restarted.claude.complete_json=lambda **kw:pytest.fail('no HTTP during shared cooldown')
+    assert restarted.complete_json(system='s',user='u') is None
+    assert restarted.last_status=='cooldown_skipped'
+    attempt=restarted.last_trace['attempts'][-1]
+    assert attempt['generation_requests']==attempt['count_requests']==0
+    assert attempt['operational_guard'] is True
+    assert restarted.snapshot()['paid_guard']['cooldown_seconds']>0
+
+
+def test_paid_valid_hold_releases_lease_without_cooldown(tmp_path):
+    p,store=paid_pool(tmp_path)
+    paid_response(p.claude)
+    assert p.complete_json(system='s',user='u')=={'action':'hold'}
+    assert p.complete_json(system='s',user='u')=={'action':'hold'}
+    state=store.get(p._paid_guard_key())
+    assert state.get('retry_at',0)==0
+    assert state['lease'] is None
+    assert p.successful_calls==2
+
+
+def test_paid_parallel_forks_single_inflight_does_not_block_free_routes(tmp_path):
+    p,store=paid_pool(tmp_path)
+    entered=threading.Event();release=threading.Event()
+    child=p.fork()
+    def complete(**kwargs):
+        entered.set()
+        assert release.wait(3)
+        child.claude.last_status='success'
+        child.claude.last_attempt=dict(provider='anthropic',model='test',status='success',generation_requests=1,count_requests=1)
+        return {'action':'hold'}
+    child.claude.complete_json=complete
+    with ThreadPoolExecutor(1) as executor:
+        future=executor.submit(child.complete_json,system='s',user='u')
+        assert entered.wait(3)
+        assert p.snapshot()['paid_guard']['in_flight'] is True
+        p.claude.complete_json=lambda **kw:pytest.fail('second paid call must not run')
+        assert p.complete_json(system='s',user='u') is None
+        assert p.last_status=='paid_in_flight'
+        assert p.last_trace['attempts'][-1]['generation_requests']==0
+        free=ProviderPool(settings(),p._paid_budget,store,p.client)
+        assert free.complete_json(system='s',user='u')=={'action':'hold'}
+        assert free.last_provider=='groq'
+        release.set()
+        assert future.result(3)=={'action':'hold'}
+    assert p.snapshot()['paid_guard']['in_flight'] is False
+
+
+def test_paid_stopped_no_lease_or_count_http(tmp_path):
+    p,store=paid_pool(tmp_path)
+    p.can_call=lambda:False
+    p.claude.complete_json=lambda **kw:pytest.fail('stopped request')
+    assert p.complete_json(system='s',user='u') is None
+    assert store.get(p._paid_guard_key()) is None
+
+
+@pytest.mark.parametrize('header,expected',[('125',125),('garbage',None),('nan',None)])
+def test_anthropic_safe_retry_after_parsed_without_raw_header_or_body(tmp_path,header,expected):
+    p,_=paid_pool(tmp_path)
+    class RateLimited(Exception):
+        status_code=429
+        body={'error':{'message':'private provider body'}}
+        response=SimpleNamespace(headers={'retry-after':header,'authorization':'private-secret'})
+    def reject(**kwargs):
+        raise RateLimited()
+    p.claude._client=SimpleNamespace(messages=SimpleNamespace(count_tokens=reject))
+    assert p.complete_json(system='private prompt',user='private user') is None
+    attempt=p.claude.last_attempt
+    assert attempt.get('retry_after_seconds')==expected
+    assert 'private' not in str(attempt)
+    state=p.store.get(p._paid_guard_key())
+    assert state['retry_at']>time.time()+ (expected or 60)-1

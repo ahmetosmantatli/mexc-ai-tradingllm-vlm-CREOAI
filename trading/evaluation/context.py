@@ -243,3 +243,29 @@ def account_research_context(store,equity,settings=None,now=None):
         if stretch is not None and stretch>1:
             result['objective'].update(stretch_multiple=stretch,stretch_target_usdt=reference*stretch)
         return result
+
+
+def economic_review_key(account,positions):
+    """Project review triggers onto account events, not every quote movement.
+
+    The model still receives the complete fresh snapshot. Mark-to-market equity,
+    floating PnL/R/excursions and countdowns do not independently justify another
+    model call on identical closed bars. Realized cash/costs, positions, stops,
+    risk settings and objective policy changes do.
+    """
+    stable={key:value for key,value in account.items() if key not in ('equity','operating_context')}
+    operating=account.get('operating_context') or {}
+    if not operating.get('ledger_available'):
+        # A caller without a persisted paper basis may be supplying actual new
+        # capital. Do not silently suppress those externally observed changes.
+        stable['equity']=account.get('equity')
+    else:
+        stable['operating_context']={key:value for key,value in operating.items() if key not in (
+            'equity_snapshot_usdt','ledger_equity_usdt','available_usdt','open_unrealized_usdt',
+            'current_return_pct','daily_loss_pct','drawdown_pct','daily_equity_change_usdt','objective')}
+        objective=operating.get('objective') or {}
+        stable['operating_context']['objective']={key:value for key,value in objective.items() if key not in (
+            'remaining_usdt','remaining_multiple','progress_fraction','remaining_seconds','target_reached')}
+    ignored=('unrealized','current_r','mfe_r','mae_r')
+    position_basis=[{key:value for key,value in row.items() if key not in ignored} for row in position_cards(positions)]
+    return dict(account=stable,positions=position_basis)

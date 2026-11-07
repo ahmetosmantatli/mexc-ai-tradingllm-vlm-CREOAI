@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+from email.utils import parsedate_to_datetime
 import os
 import sqlite3
 import base64
@@ -197,6 +199,19 @@ class AnthropicClient:
                 attempt['error_category'] = 'credit_exhausted'
             elif status_code == 429:
                 attempt['error_category'] = 'rate_limit'
+                # Preserve only a parsed delay, never headers or provider body.
+                headers = getattr(getattr(exc, 'response', None), 'headers', {})
+                raw_retry = headers.get('retry-after') if headers else None
+                if raw_retry is not None:
+                    try:
+                        delay = float(raw_retry)
+                    except (TypeError, ValueError):
+                        try:
+                            delay = parsedate_to_datetime(raw_retry).timestamp()-time.time()
+                        except (TypeError, ValueError, OverflowError):
+                            delay = None
+                    if delay is not None and math.isfinite(delay):
+                        attempt['retry_after_seconds'] = max(1., delay)
             elif status_code in (401, 403):
                 attempt['error_category'] = 'authentication_or_permission'
             elif status_code in (408, 499) or isinstance(exc,httpx.TimeoutException) or type(exc).__name__=="APITimeoutError":

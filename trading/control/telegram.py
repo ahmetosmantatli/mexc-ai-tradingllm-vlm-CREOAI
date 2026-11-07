@@ -149,7 +149,8 @@ class TelegramController:
         stage=snapshot.get('stage')
         label={'fetching_multitimeframe_context':'4 saat / 15 dakika / 5 dakika verileri hazırlanıyor',
                'scanning_market':'Pariteler taranıyor', 'model_evaluation':'AI yanıtı bekleniyor',
-               'unchanged_closed_candles':'Mumlar değişmedi; gereksiz AI çağrısı yapılmıyor',
+               'unchanged_closed_candles':'Kurulum değişmedi; gereksiz AI çağrısı yapılmıyor',
+               'analysis_error_backoff':'Bu analizde hata alındı; kısa hata beklemesi sürüyor',
                'candidates_filtered':'Aday filtreleri tamamlandı', 'model_completed':'AI analizi tamamlandı',
                'model_invalid_or_unavailable_model':'AI analizi sonuçlanmadı', 'awaiting_scan':'İlk tarama bekleniyor'}.get(stage,'Piyasa ve işlem durumu izleniyor')
         text=f"Şu an: {label}\n"
@@ -171,6 +172,11 @@ class TelegramController:
             text+='Yeni tarama arka planda sürüyor; AI bekleme aralığından bağımsız.\n'
         if snapshot.get('parallel_candidates'):
             text+=f"Aynı anda en fazla {snapshot['parallel_candidates']} farklı aday analizi. İşlem açılışları ortak risk kontrolünden geçer.\n"
+        if snapshot.get('ai_schedule_mode')=='quota':
+            text+='AI zamanlaması: kota ve uygun aday odaklı; sabit tur beklemesi yok.\n'
+            wait=max(0,snapshot.get('provider_wait_until',0)-time.time())
+            if wait:
+                text+=f"Sağlayıcı/hata beklemesi: yaklaşık {wait:.0f} sn; pozisyon koruması sürüyor.\n"
         next_at=snapshot.get('next_evaluation_at')
         if next_at:
             text += f"Sonraki AI değerlendirmesine en az {max(0,next_at-time.time()):.0f} sn; uygun yeni aday gerekir.\n"

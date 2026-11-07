@@ -6,7 +6,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 from trading.agents.schemas import EvaluationResult, GraphAction, MarketAnalystNote, StrategyReviewNote, PortfolioAnalystNote
 from trading.evaluation.planning import PlanSizing, PlanSizingError, apply_decision_sizing
-from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context
+from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context, economic_review_key
 
 
 class ModelDecision(BaseModel):
@@ -136,15 +136,17 @@ class ContextEvaluator:
             exchange_cap=self.public.get_contract_rules(symbol).max_leverage
         account['sizing_limits']=dict(max_risk_fraction=risk_per_trade_pct,policy_max_leverage=target_leverage,exchange_max_leverage=exchange_cap)
         account['operating_context']=account_research_context(self.store,equity,self.cfg)
-        stable_account=copy.deepcopy(account)
-        # A ticking research deadline is not new market evidence or permission
-        # to burn another model call. The current countdown still reaches the model.
-        stable_account['operating_context'].get('objective',{}).pop('remaining_seconds',None)
-        evaluation_key=digest(dict(market=fingerprint,scope=scope,account=stable_account,positions=position_cards(positions)))
+        economic_basis=economic_review_key(account,positions)
+        evaluation_key=digest(dict(market=fingerprint,scope=scope,economic_basis=economic_basis))
         if memory.get('last_evaluation_key')==evaluation_key:
             self.store.put('stage','unchanged_closed_candles')
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='unchanged_closed_candles',
                 metadata={'provider_called':False,'fingerprint':fingerprint})
+        failure=memory.get('last_failure') or {}
+        if failure.get('evaluation_key')==evaluation_key and failure.get('retry_at',0)>time.time():
+            self.store.put('stage','analysis_error_backoff')
+            return EvaluationResult(action=GraphAction.HOLD,hold_reason='analysis_error_backoff',
+                metadata={'provider_called':False,'fingerprint':fingerprint,'retry_at':failure['retry_at']})
         if self.llm.budget is not None and not self.llm.budget.can_spend():
             self.llm.last_status='budget_exhausted'
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='shared_budget_exhausted',metadata={'provider_called':False})
@@ -185,8 +187,15 @@ class ContextEvaluator:
         try:
             decision=validate(payload)
         except Exception:
+            metadata['provider_busy']=getattr(self.llm,'last_status','')=='paid_in_flight'
             trace.update(status='invalid_or_unavailable_model',action='hold',execution_status='not_opened')
             self._save_trace(trace)
+            if provider_called:
+                # This is an error retry delay for identical inputs, never an
+                # interval imposed on valid HOLD/WATCH or newly changed evidence.
+                memory['last_failure']=dict(evaluation_key=evaluation_key,retry_at=time.time()+60)
+                self.store.put(key,memory)
+                metadata['retry_at']=memory['last_failure']['retry_at']
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_or_unavailable_model',metadata=metadata)
         trace.update(status='completed',action=decision.action,rationale=decision.rationale,
             invalidation=decision.invalidation,watch_note=decision.watch_note,
@@ -201,6 +210,7 @@ class ContextEvaluator:
         card.update(first_reason=card.get('first_reason') or decision.rationale,last_reason=decision.rationale,
             last_action=decision.action,invalidation=decision.invalidation,watch_note=decision.watch_note,
             strategy=candidate.strategy.value,side=candidate.side.value,last_review_at=time.time())
+        memory.pop('last_failure',None)
         memory.update(scope=scope,setup_card=card,watch_note=decision.watch_note,last_fingerprint=fingerprint,
             last_evaluation_key=evaluation_key,last_market=chart_context,
             history=(memory['history']+[record])[-6:])

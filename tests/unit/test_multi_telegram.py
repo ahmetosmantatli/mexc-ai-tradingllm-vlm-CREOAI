@@ -470,3 +470,11 @@ def test_scan_and_queue_progress_show_independent_refresh_and_elapsed_time():
     assert 'Kuyruktaki güncel aday: 19' in text
     assert 'Sıradaki aday: ONE_USDT' in text
     assert 'AI bekleme aralığından bağımsız' in text
+
+
+def test_quota_progress_has_no_fake_fixed_tour_countdown():
+    text=TelegramController.progress_text(dict(stage='model_completed',ai_schedule_mode='quota',
+        parallel_candidates=4,next_evaluation_at=None))
+    assert 'sabit tur beklemesi yok' in text
+    assert 'en az' not in text
+    assert '4 farklı aday' in text

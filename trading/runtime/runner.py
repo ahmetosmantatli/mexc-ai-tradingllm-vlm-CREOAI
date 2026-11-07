@@ -306,7 +306,8 @@ class PaperRunner:
             self.scan_market()
         if self.cfg.ai_provider_pool_enabled and time.time()<self.store.get('provider_defer_until',0):
             return self.status('HOLD_PROVIDER_POOL_WAIT',finalize_latest=False)
-        if time.time()-self.store.get('last_evaluation_at',0)<self.cfg.anthropic_min_interval_seconds:
+        if (self.cfg.ai_schedule_mode=='interval'
+                and time.time()-self.store.get('last_evaluation_at',0)<self.cfg.anthropic_min_interval_seconds):
             return self.status('HOLD_EVALUATION_INTERVAL')
         with self.lock:
             open_symbols=set(ledger.positions)
@@ -393,7 +394,8 @@ class PaperRunner:
                 and result.hold_reason=='invalid_or_unavailable_model'):
             # Quota/cooldown without any HTTP is not a new paid attempt. Avoid
             # re-rendering and notifying every worker tick while scans continue.
-            self.store.put('provider_defer_until',time.time()+60)
+            delay=5 if result.metadata.get('provider_busy') else 60
+            self.store.put('provider_defer_until',time.time()+delay)
         if result.metadata.get('provider_called') is not False:
             self.store.put('last_evaluation_at',evaluation_started)
             queue.evaluated(selected)

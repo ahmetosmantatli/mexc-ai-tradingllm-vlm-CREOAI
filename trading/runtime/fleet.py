@@ -229,7 +229,10 @@ class Fleet:
         next_row=min(queue_rows,key=lambda row:(row.get('last_considered_at',0),row.get('first_seen',0),-row.get('signal',{}).get('confidence',0),row.get('key',''))) if queue_rows else None
         snapshot['queue_status']=dict(size=len(queue_rows),next_symbol=next_row['signal']['symbol'] if next_row else None)
         snapshot['stage']=runner.store.get('stage','awaiting_scan')
-        snapshot['next_evaluation_at']=runner.store.get('last_evaluation_at',0)+self.cfg.anthropic_min_interval_seconds
+        snapshot['ai_schedule_mode']=getattr(self.cfg,'ai_schedule_mode','interval')
+        snapshot['next_evaluation_at']=(runner.store.get('last_evaluation_at',0)+self.cfg.anthropic_min_interval_seconds
+            if snapshot['ai_schedule_mode']=='interval' else None)
+        snapshot['provider_wait_until']=runner.store.get('provider_defer_until',0)
         snapshot['analysis_trace']=runner.store.get('analysis_trace',{})
         snapshot['analysis_history']=runner.store.get('analysis_history',[])
         snapshot['ai_request_stats']=self.budget_store.get('ai_request_stats',{})
