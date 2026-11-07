@@ -36,11 +36,18 @@ def main():
                 from trading.runtime.fleet import Fleet
                 fleet = Fleet(cfg)
                 fleet.start()
+                logger.info("Telegram PAPER worker started | accounts=%s | real orders disabled", len(fleet.accounts))
+                last_heartbeat = 0.0
                 signal.signal(signal.SIGINT, _stop)
                 signal.signal(signal.SIGTERM, _stop)
                 try:
                     while _RUNNING:
                         fleet.tick()
+                        if time.monotonic()-last_heartbeat>=60:
+                            for account in fleet.accounts:
+                                snapshot=fleet.control_store.get(f"account:{account.account_id}:status",{})
+                                logger.info("paper status | account=%s version=%s reason=%s",account.account_id,snapshot.get('version','pending'),snapshot.get('reason','awaiting_setup'))
+                            last_heartbeat=time.monotonic()
                         time.sleep(1)
                 finally:
                     fleet.stop()

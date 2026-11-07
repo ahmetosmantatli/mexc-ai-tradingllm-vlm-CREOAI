@@ -154,3 +154,73 @@ def test_management_persistence_failure_latches_new_entry_gate(tmp_path,monkeypa
     fleet.cfg=Settings(_env_file=None)
     fleet.manage_positions(('a','text'),runner)
     assert runner.management_fatal
+
+
+def test_telegram_demo_to_trade_stop_update_close_report_and_restart(tmp_path,monkeypatch):
+    """Entire paper lifecycle without a real wallet or provider call."""
+    import time,httpx,json
+    from trading.agents.schemas import EvaluationResult,GraphAction,MarketAnalystNote,StrategyReviewNote,PortfolioAnalystNote
+    from trading.exchange.mexc_public import TickerSnapshot
+    from trading.quant.scanner import ScanResult
+    monkeypatch.setattr('trading.runtime.fleet.PositionProtection.start',lambda self:self)
+    account=Account('demo',7,7,'','')
+    monkeypatch.setattr('trading.runtime.fleet.load_accounts',lambda *a,**kw:[account])
+    cfg=Settings(_env_file=None,runtime_db_path=str(tmp_path/'runtime'),shared_budget_db_path=str(tmp_path/'budget'),telegram_bot_token='fake',anthropic_api_key='fake')
+    fleet=Fleet(cfg)
+    calls=[]
+    def transport(req):
+        body=json.loads(req.content)
+        calls.append((req.url.path.rsplit('/',1)[-1],body))
+        return httpx.Response(200,json={'ok':True,'result':[] if req.url.path.endswith('getUpdates') else {'message_id':1}})
+    fleet.controller.client=httpx.Client(transport=httpx.MockTransport(transport))
+    def message(text):
+        fleet.controller.dispatch({'message':{'chat':{'id':7,'type':'private'},'from':{'id':7},'text':text}})
+    try:
+        message('/demo 500')
+        assert fleet.controller.control('demo')['capital_pending']
+        fleet.execute_commands(account)
+        message('/version text')
+        fleet.controller._command('demo','trader_balanced')
+        message('/run')
+        assert fleet.controller.control('demo')['enabled']
+        runner=fleet.runners[('demo','text')]
+        Fleet.apply_trader_mode(runner,fleet.controller.control('demo'))
+        fleet.funding_health[('demo','text')]=True
+        control_provider=runner.external_control
+        runner.external_control=lambda:{'enabled':False}
+        runner.cycle() # Seed without network or model calls.
+        runner.external_control=control_provider
+        runner.protection.tick()
+        signal=CandidateSignal(symbol='BTC_USDT',side=Side.LONG,strategy=StrategyName.TREND,entry_price=100,stop_loss_price=98,take_profit_price=104,confidence=.8)
+        class Public:
+            use_fixtures=True
+            def get_ticker(self,symbol):return TickerSnapshot(symbol,100,99.99,100.01,1e6,raw={'timestamp':time.time()*1000,'fairPrice':100})
+            def get_klines(self,*a,**kw):return {'candles':[[int(time.time())-1000,100,101,99,100,1]]}
+            def get_contract_rules(self,symbol):return ContractRules(.001,1,1,1e8,5,.005,.01)
+        runner.public=Public()
+        monkeypatch.setattr('trading.runtime.runner.MarketScanner.scan',lambda *a,**kw:ScanResult(1,1,candidates=[signal]))
+        proposal=size_proposal_from_signal(signal,equity=500,risk_per_trade_pct=.01,target_leverage=5)
+        monkeypatch.setattr(runner.graph,'evaluate_candidates',lambda *a,**kw:EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=signal,market=MarketAnalystNote(mode='llm'),strategy=StrategyReviewNote(mode='llm'),portfolio=PortfolioAnalystNote(mode='llm')))
+        runner.store.put('last_scan_at',0)
+        runner.store.put('last_evaluation_at',0)
+        assert runner.cycle()['reason']=='PAPER_OPENED'
+        p=runner.ledger.positions['BTC_USDT']
+        assert runner.ledger.update_stop('BTC_USDT',100.5,102,102.01,p['opened_at'],'confirmed structure',time.time()-1)
+        runner.ledger.mark('BTC_USDT',100.4,100.41,100.4)
+        runner.status('HOLD_TEST_COMPLETE')
+        fleet.last_publish['demo']=time.time()
+        fleet.publish(account)
+        fleet.controller.flush()
+        report=fleet.control_store.get('account:demo:status')['reports'][0]
+        assert report['closed_trades']==1 and report['net_pnl']>0
+        texts='\n'.join(body.get('text','') for method,body in calls if method=='sendMessage')
+        assert 'İşlem açıldı' in texts and 'Stop güncellendi' in texts and 'İşlem kapandı: SL' in texts
+        message('/stop')
+        assert not fleet.controller.control('demo')['enabled']
+        ending=runner.ledger.equity
+    finally:fleet.stop()
+    restarted=Fleet(cfg)
+    try:
+        assert restarted.runners[('demo','text')].ledger.equity==ending
+        assert not restarted.controller.control('demo')['enabled']
+    finally:restarted.stop()

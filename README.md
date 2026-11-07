@@ -141,3 +141,21 @@ A separate management job checks completed 15m candles. Experimental `paper-stru
 This management is **deterministic research policy, not a Claude-selected stop move** and not a validated ICT system. The +1R, two-pivot, ATR14/0.25 parameters are experimental constants. No partial TP, automatic breakeven solely on a percent move, fixed one-hour exit or runtime strategy learning is implemented. Original stop remains active while waiting for structural evidence. Users should compare management-enabled/disabled results in replay before concluding it improves expectancy.
 
 Price supervision is not delayed by candle/model/Telegram calls. Management errors leave the existing stop unchanged; quote outages block new risk. The system does not place exchange stops, so no execution guarantee is implied. Screenshot interpretation alone cannot establish historical fills or confirm ICT causality; exchange-specific OHLCV and timestamped decisions are needed.
+
+## Persistent Ubuntu service
+
+A service template is included at `infrastructure/mexc-paper-worker.service` for the existing `/opt/mexc-ai-trading` installation. It reads `.env` through the application's settings; do not put secrets in the service unit. The template runs as the service manager's default system user (root); it matches the current root-owned installation. A dedicated service user can be configured separately after assigning directory/secret permissions.
+
+Stop the foreground worker with Ctrl+C first. Then, on the server:
+
+```sh
+cp infrastructure/mexc-paper-worker.service /etc/systemd/system/mexc-paper-worker.service
+systemctl daemon-reload
+systemctl enable --now mexc-paper-worker
+systemctl status mexc-paper-worker --no-pager
+journalctl -u mexc-paper-worker -n 30 --no-pager
+```
+
+Use `systemctl restart mexc-paper-worker` after a successful code/config update. Do not launch another foreground worker while this service runs. Telegram `/stop` pauses new simulated entries while supervision remains active; `systemctl stop mexc-paper-worker` stops the whole application and all simulated position supervision. This release has no live exchange orders. The service unit has not been executed on Hetzner in this session.
+
+The Fleet worker now logs successful startup and one per-account status heartbeat per minute (account identifier, version and reason; no balances or secrets). An integration test covers Telegram demo selection → plan acceptance → paper entry → tighter stop event → SL close → notification queue/report → restart with preserved balance and paused control, without calling an exchange or AI provider.

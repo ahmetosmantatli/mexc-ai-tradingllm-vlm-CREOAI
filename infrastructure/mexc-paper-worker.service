@@ -1,0 +1,20 @@
+[Unit]
+Description=MEXC Telegram paper trading worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mexc-ai-trading
+ExecStart=/opt/mexc-ai-trading/.venv/bin/python -m apps.worker.main
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+KillSignal=SIGTERM
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
