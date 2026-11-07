@@ -88,15 +88,68 @@ def proposal():
         expected_edge=.8, fee_free_pair=False, rationale='Live path test proposal')
 
 
-def build(tmp_path, *, command_source=None, store=None):
+def build(tmp_path, *, command_source=None, store=None, operator_ids=('11',)):
     private = Fake()
     public = SimpleNamespace(
         get_contract_rules=lambda symbol: ContractRules(1, 1, 1, 1000, 10, .005, .01, 1000),
         get_ticker=lambda symbol: SimpleNamespace(bid1=100., ask1=100., raw={'timestamp': time()*1000}))
     cfg = settings()
     runner = LiveRunner(cfg, store=store or RuntimeStore(str(tmp_path/'live.sqlite3')), private=private, public=public,
-        account_id='ahmet', binding_id='connection1', operator_ids=('11',), command_source=command_source)
+        account_id='ahmet', binding_id='connection1', operator_ids=operator_ids, command_source=command_source)
     return runner, private, cfg
+
+
+class Inbox:
+    """Fake Telegram getUpdates. No socket and no token in the payload."""
+
+    def __init__(self, batches):
+        self.batches = [list(batch) for batch in batches]
+        self.sent = []
+
+    def call(self, method, **kwargs):
+        assert method == 'getUpdates'
+        if not self.batches:
+            return []
+        return self.batches.pop(0)
+
+    def send(self, text):
+        self.sent.append(text)
+
+
+def telegram_update(text, user_id, *, chat_id=900, update_id=1):
+    sender = {} if user_id is None else {'id': user_id, 'is_bot': False}
+    return {'update_id': update_id, 'message': {
+        'message_id': update_id, 'from': sender, 'chat': {'id': chat_id, 'type': 'private'}, 'text': text}}
+
+
+def attach(runner, batches, chat_id='900'):
+    runner.cfg.telegram_bot_token = 'test-token-not-real'
+    runner.cfg.telegram_chat_id = str(chat_id)
+    inbox = Inbox(batches)
+    runner._telegram = inbox
+    return inbox
+
+
+def test_compose_reads_live_gates_from_env_and_publishes_no_extra_ports():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    text = (root / 'infrastructure' / 'docker-compose.yml').read_text()
+    image = (root / 'Dockerfile').read_text()
+    assignments = []
+    ports = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if stripped.startswith(('LIVE_TRADING_ENABLED:', 'BROKER_MODE:')):
+            assignments.append(stripped)
+        if stripped.startswith('- "') or stripped.startswith("- '"):
+            ports.append(stripped)
+    assert assignments == []
+    assert ports == ['- "127.0.0.1:8080:8080"']
+    assert text.count('env_file:') == 2 and '../.env' in text
+    assert '["python", "-m", "apps.worker.main"]' in text
+    assert 'LIVE_TRADING_ENABLED=false' in image and 'BROKER_MODE=paper' in image
 
 
 def test_defaults_stay_paper_and_live_runner_refuses_them(tmp_path):
@@ -259,3 +312,105 @@ def test_restart_reconciles_the_same_external_id_without_a_second_open(tmp_path)
     blocked = restarted.consider(proposal())
     assert blocked['reason'] == 'live_halt_latched'
     assert len(private.submits) == 1
+
+
+def test_telegram_arm_opens_entries_and_stop_still_blocks_them(tmp_path):
+    runner, private, _cfg = build(tmp_path)
+    runner.store.put('account:ahmet:control', dict(enabled=False, stopped=True))
+    inbox = attach(runner, [
+        [telegram_update('/arm@LiveBot', 11, update_id=1)],
+        [telegram_update('/stop', 11, update_id=2)],
+        [telegram_update('/start', 11, update_id=3)],
+    ])
+    armed = runner.cycle()
+    assert armed['reason'] == 'LIVE_ENTRIES_OPEN'
+    assert armed['armed'] is True and armed['running'] is True and armed['entries_open'] is True
+    assert runner.last_arm_result == 'armed'
+    assert runner.permission.view()['armed_by'] == '11'
+    assert inbox.sent[-1] == 'Live generation armed. New entries can run. /stop still blocks new entries.'
+    assert 'test-token' not in inbox.sent[-1]
+    opened = runner.consider(proposal())
+    assert opened['accepted'] is True and len(private.submits) == 1
+    stopped = runner.cycle()
+    assert stopped['reason'] == 'HOLD_ENTRIES_STOPPED'
+    assert stopped['armed'] is True and stopped['running'] is False and stopped['entries_open'] is False
+    assert runner.consider(proposal())['reason'] == 'entries_blocked'
+    assert len(private.submits) == 1
+    resumed = runner.cycle()
+    assert resumed['reason'] == 'LIVE_ENTRIES_OPEN'
+    assert runner.last_arm_result == 'armed'
+
+
+def test_telegram_arm_rejects_unauthorized_operators(tmp_path):
+    runner, private, _cfg = build(tmp_path)
+    inbox = attach(runner, [
+        [telegram_update('/arm', 22, update_id=1)],
+        [telegram_update('/arm 11', 22, update_id=2)],
+        [telegram_update('/arm', 11, chat_id=111, update_id=3)],
+        [telegram_update('/arm', None, update_id=4)],
+    ])
+    refused = runner.cycle()
+    assert refused['reason'] == 'LIVE_DISARMED' and refused['armed'] is False
+    assert runner.last_arm_result == 'operator_not_allowed'
+    assert inbox.sent == ['Arm refused. This Telegram user cannot arm live entries.']
+    assert private.submits == []
+    assert runner.cycle()['armed'] is False
+    assert runner.cycle()['armed'] is False and len(inbox.sent) == 1
+    missing = runner.cycle()
+    assert missing['armed'] is False and runner.last_arm_result == 'operator_not_allowed'
+    assert runner.consider(proposal())['reason'] == 'entries_blocked'
+    assert private.submits == []
+
+    nobody_dir = tmp_path/'nobody'
+    nobody_dir.mkdir()
+    nobody, other, _cfg = build(nobody_dir, operator_ids=())
+    assert nobody.operator_ids == ()
+    attach(nobody, [[telegram_update('/arm', 11, update_id=1)]])
+    blocked = nobody.cycle()
+    assert blocked['reason'] == 'LIVE_DISARMED' and blocked['armed'] is False
+    assert nobody.last_arm_result == 'operator_not_allowed'
+    assert other.submits == []
+
+
+def test_first_boot_and_live_paper_live_stay_disarmed_until_telegram_arm(tmp_path):
+    runner, private, _cfg = build(tmp_path)
+    attach(runner, [
+        [telegram_update('/start', 11, update_id=1)],
+        [telegram_update('/arm', 11, update_id=2)],
+        [telegram_update('/arm', 11, update_id=3)],
+        [],
+        [telegram_update('/arm', 11, update_id=4)],
+    ])
+    first = runner.cycle()
+    assert first['reason'] == 'LIVE_DISARMED' and first['armed'] is False
+    assert runner.permission.view()['generation'] == 1
+    assert runner.last_arm_result is None
+    assert runner.consider(proposal())['reason'] == 'entries_blocked'
+    assert private.submits == []
+
+    armed = runner.cycle()
+    assert armed['reason'] == 'LIVE_ENTRIES_OPEN' and armed['armed'] is True
+    assert runner.permission.view()['generation'] == 1
+
+    runner.cfg.broker_mode = BrokerMode.PAPER
+    runner.cfg.live_trading_enabled = False
+    paper = runner.cycle()
+    assert paper['armed'] is False and paper['running'] is False
+    assert runner.last_arm_result == 'live_gates_required'
+    assert runner.permission.view()['generation'] == 2
+    assert runner.entries_open() is False and private.submits == []
+
+    runner.cfg.broker_mode = BrokerMode.LIVE
+    runner.cfg.live_trading_enabled = True
+    restored = runner.cycle()
+    assert restored['reason'] == 'LIVE_DISARMED' and restored['armed'] is False
+    assert runner.permission.view()['generation'] == 3
+    assert runner.permission.view()['armed_by'] is None
+    assert runner.consider(proposal())['reason'] == 'entries_blocked'
+    assert private.submits == []
+
+    again = runner.cycle()
+    assert again['reason'] == 'LIVE_ENTRIES_OPEN' and again['armed'] is True
+    assert runner.permission.view()['armed_generation'] == 3
+    opened = runner.consider(proposal())
+    assert opened['accepted'] is True and len(private.submits) == 1
