@@ -344,3 +344,17 @@ def test_report_command_renders_only_owner_reports(tmp_path):
     output=calls[-1][1]['text']
     assert '2026-11-07' in output and '+3.4000' in output
     assert 'PRIVATE B REPORT' not in output
+
+
+def test_demo_amount_presets_and_stale_button_guard(tmp_path):
+    ctl,calls=controller(tmp_path)
+    ctl.dispatch(callback(11,11,'control:capital_demo'))
+    body=calls[-1][1] if calls[-1][0]=='sendMessage' else next(body for method,body in reversed(calls) if method=='sendMessage')
+    assert 'yazarak gönder' in body['text']
+    actions={b['callback_data'] for row in body['reply_markup']['inline_keyboard'] for b in row}
+    assert {'control:demo_amount:100','control:demo_amount:500','control:demo_amount:1000'} <= actions
+    ctl.dispatch(callback(11,11,'control:demo_amount:500'))
+    commands=ctl.store.get('account:a:commands')
+    assert len(commands)==1 and commands[0]['amount']==500
+    ctl.dispatch(callback(11,11,'control:demo_amount:500'))
+    assert len(ctl.store.get('account:a:commands'))==1

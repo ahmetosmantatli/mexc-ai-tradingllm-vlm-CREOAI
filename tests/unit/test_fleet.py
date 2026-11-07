@@ -179,6 +179,10 @@ def test_telegram_demo_to_trade_stop_update_close_report_and_restart(tmp_path,mo
         message('/demo 500')
         assert fleet.controller.control('demo')['capital_pending']
         fleet.execute_commands(account)
+        fleet.controller.flush()
+        setup_message=next(body for method,body in calls if method=='sendMessage' and 'PAPER kasası hazır' in body.get('text',''))
+        assert '2/4' in setup_message['text']
+        assert {b['callback_data'] for row in setup_message['reply_markup']['inline_keyboard'] for b in row} >= {'control:text','control:vlm'}
         message('/version text')
         fleet.controller._command('demo','trader_balanced')
         message('/run')

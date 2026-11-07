@@ -322,7 +322,7 @@ class Fleet:
             version_chosen=False,profile_chosen=False)
         self.control_store.put(f'account:{account.account_id}:session',uuid4().hex)
         self.replace_runners(account.account_id,old.cfg.mexc_api_key,old.cfg.mexc_api_secret)
-        self.controller.enqueue(account.account_id,f'PAPER kasası hazır: {amount:g} USDT. Gerçek emir yok. Şimdi VLM/görselsiz, sonra trader modunu seç.',event_id='capital-ready:'+command['id'])
+        self.controller.enqueue(account.account_id,f'PAPER kasası hazır: {amount:g} USDT. Gerçek emir yok.\n'+self.controller.settings_text(account.account_id),event_id='capital-ready:'+command['id'],buttons=True)
 
     def manage_positions(self,key,runner):
         from trading.runtime.management import propose_management

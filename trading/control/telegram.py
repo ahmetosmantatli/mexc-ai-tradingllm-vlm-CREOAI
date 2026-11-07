@@ -84,6 +84,8 @@ class TelegramController:
         rows=[]
         if not self.capital_ready(account_id):
             if not control['capital_pending']:
+                if control['capital_mode']=='demo' and control['capital_input']:
+                    rows.append([{'text':f'{amount} USDT sanal', 'callback_data':f'control:demo_amount:{amount}'} for amount in (100,500,1000)])
                 rows.append([{'text':'Demo · Para yatırmadan', 'callback_data':'control:capital_demo'}, {'text':'MEXC bakiyesinden Paper', 'callback_data':'control:capital_account'}])
                 if control['capital_mode']=='account' and self.linked(account_id):
                     rows.append([{'text':'Tüm kullanılabilir bakiyeyi seç', 'callback_data':'control:capital_full'}, {'text':'Tutarı elle yaz', 'callback_data':'control:capital_amount'}])
@@ -296,6 +298,14 @@ class TelegramController:
             self._command(account.account_id, mapping.get(name, 'unknown'))
 
     def _command(self, account_id, command):
+        if command.startswith('demo_amount:'):
+            state=self.control(account_id)
+            amount=command.split(':',1)[1]
+            if state['capital_mode']=='demo' and state['capital_input'] and amount in ('100','500','1000'):
+                self.request_capital(account_id,'demo',float(amount))
+            else:
+                self.send(account_id,'Bu tutar düğmesi artık geçerli değil. Kasa seçimini aşağıdaki düğmelerle yenile.',buttons=True)
+            return
         if command.startswith('confirmclose:'):
             self.confirm_close(account_id, command.split(':',1)[1])
             return
@@ -328,8 +338,8 @@ class TelegramController:
                 if command=='capital_amount':
                     mode=self.control(account_id)['capital_mode'] or 'account'
                 self.set_control(account_id,capital_mode=mode,capital_input=True,capital_chosen=False)
-                message=('Sanal demo kasayı USDT olarak yaz. Örnek: 1000. Para yatırılmaz, MEXC anahtarı gerekmez.' if mode=='demo' else
-                         'MEXC hesabındaki bakiyeden PAPER için ayıracağın USDT tutarını yaz. Örnek: 1000. Ya da tam kullanılabilir bakiye düğmesini seç. Gerçek emir açılmaz.')
+                message=('Aşağıdaki 100 / 500 / 1000 USDT sanal kasa düğmelerinden birini seç. Farklı tutar için Telegram’a yalnız sayıyı yazarak gönder. Örnek: 250. Birim USDT, TL değil. Para yatırılmaz, MEXC anahtarı gerekmez.' if mode=='demo' else
+                         'Tam kullanılabilir bakiye düğmesini seç veya PAPER için ayıracağın tutarı Telegram’a yalnız sayı olarak yazarak gönder. Örnek: 1000. Birim USDT, TL değil. Gerçek emir açılmaz.')
         elif command=='start':
             state=self.control(account_id)
             if not (self.capital_ready(account_id) and state['version_chosen'] and state['profile_chosen']):
@@ -422,7 +432,7 @@ class TelegramController:
         self.set_control(account_id,enabled=False)
         self.send(account_id,'Manuel kapatma isteği kaydedildi; yeni girişler duraklatıldı. Sonuç ayrıca bildirilecek.')
 
-    def enqueue(self, account_id, text, photos=(), event_id=None):
+    def enqueue(self, account_id, text, photos=(), event_id=None, buttons=False):
         """Persist a private notification. Caller supplies trusted local chart paths.
 
         Reuse stable event_id to avoid duplicate enqueue after an orchestrator restart.
@@ -436,7 +446,7 @@ class TelegramController:
         ident = event_id or uuid4().hex
         if any(row['id']==ident for row in rows):
             return ident
-        rows.append(dict(id=ident, text=text[:4000], photos=[str(p) for p in photos], sent=False))
+        rows.append(dict(id=ident, text=text[:4000], photos=[str(p) for p in photos], sent=False, buttons=buttons))
         self.store.put(key, rows)
         return ident
 
@@ -465,7 +475,7 @@ class TelegramController:
                 continue
             # Persist each delivery stage; ambiguous API timeout can duplicate a stage.
             if not row.get('text_sent'):
-                self.send(account_id, row['text'])
+                self.send(account_id, row['text'], buttons=row.get('buttons',False))
                 row['text_sent'] = True
                 self.store.put(key, rows)
             if row['photos'] and not row.get('photos_sent'):
