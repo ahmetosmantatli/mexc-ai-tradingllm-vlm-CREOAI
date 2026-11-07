@@ -5,12 +5,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from trading.agents.schemas import EvaluationResult, GraphAction, MarketAnalystNote, StrategyReviewNote, PortfolioAnalystNote
-from trading.agents.graph import size_proposal_from_signal
-from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card
+from trading.evaluation.planning import PlanSizing, PlanSizingError, apply_decision_sizing
+from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context
 
 
 class ModelDecision(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
+    sizing_plan: PlanSizing | None = None
     action: str = Field(pattern='^(trade|watch|hold)$')
     signal_id: str | None
     rationale: str = Field(max_length=1200)
@@ -24,9 +25,13 @@ SYSTEM_POLICY = (
     'Tables use explicit column names. What_changed explains why this review was scheduled; do not assume hidden chat memory. '
     'Treat confirmed swing/BOS/sweep/FVG evidence as hypotheses, never guaranteed edge. HOLD is normal. '
     'Never force a weekly return, raise risk after losses, invent prices/IDs, or place orders. '
+    'Account operating_context describes observed paper balance, closed outcomes and an optional research objective. '
+    'A research objective is reporting context only, never a reason to force a trade or exceed risk limits. '
     'Only the supplied candidate may be traded and only when cross-timeframe evidence is coherent. '
     'Return exactly JSON: action (trade/watch/hold), signal_id (supplied candidate ID or null), '
-    'rationale, invalidation, watch_note. Write concise Turkish rationale explaining the concrete missing confirmation '
+    'rationale, invalidation, watch_note, sizing_plan. For trade choose sizing_plan with integer leverage and '
+    'risk_per_trade_pct as an account fraction (.01 means 1%), within supplied limits; null retains policy sizing. '
+    'Entry/SL/TP remain the candidate levels; never invent a different setup. Write concise Turkish rationale explaining the concrete missing confirmation '
     'or rejection, and a watch_note describing what would justify reconsideration. Do not just say insufficient evidence. '
     'Keep rationale within1200 characters, invalidation within500 and watch_note within1000. '
     'VLM annotations are deterministic observations, not proof of profit.'
@@ -126,7 +131,16 @@ class ContextEvaluator:
             memory['last_outcome']=copy.deepcopy(legacy['last_outcome'])
         positions = self.store.get('paper', {}).get('positions', {})
         account=dict(equity=equity,risk_per_trade_pct=risk_per_trade_pct,leverage=target_leverage,**context)
-        evaluation_key=digest(dict(market=fingerprint,scope=scope,account=account,positions=position_cards(positions)))
+        exchange_cap=target_leverage
+        if callable(getattr(self.public,'get_contract_rules',None)):
+            exchange_cap=self.public.get_contract_rules(symbol).max_leverage
+        account['sizing_limits']=dict(max_risk_fraction=risk_per_trade_pct,policy_max_leverage=target_leverage,exchange_max_leverage=exchange_cap)
+        account['operating_context']=account_research_context(self.store,equity,self.cfg)
+        stable_account=copy.deepcopy(account)
+        # A ticking research deadline is not new market evidence or permission
+        # to burn another model call. The current countdown still reaches the model.
+        stable_account['operating_context'].get('objective',{}).pop('remaining_seconds',None)
+        evaluation_key=digest(dict(market=fingerprint,scope=scope,account=stable_account,positions=position_cards(positions)))
         if memory.get('last_evaluation_key')==evaluation_key:
             self.store.put('stage','unchanged_closed_candles')
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='unchanged_closed_candles',
@@ -195,12 +209,15 @@ class ContextEvaluator:
         self.store.put('memory:'+symbol,memory)
         self.store.put('last_analysis',record)
         metadata.update(decision_ai=decision_ai,invalidation=decision.invalidation,rationale=decision.rationale,
-            watch_note=decision.watch_note)
+            watch_note=decision.watch_note,sizing_plan=decision.sizing_plan.model_dump() if decision.sizing_plan else None)
         if time.time()-started>self.cfg.decision_ttl_seconds:
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='decision_expired',metadata=metadata)
         if decision.action!='trade':
             return EvaluationResult(action=GraphAction.HOLD,hold_reason=decision.action,metadata=metadata)
-        proposal=size_proposal_from_signal(candidate,equity=equity,risk_per_trade_pct=risk_per_trade_pct,target_leverage=target_leverage)
+        try:
+            proposal=apply_decision_sizing(candidate,decision.sizing_plan,equity,risk_per_trade_pct,target_leverage,exchange_cap)
+        except PlanSizingError:
+            return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_model_sizing',metadata=metadata)
         proposal.rationale=decision.rationale
         return EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=candidate,
             market=MarketAnalystNote(mode='llm'),strategy=StrategyReviewNote(mode='llm'),

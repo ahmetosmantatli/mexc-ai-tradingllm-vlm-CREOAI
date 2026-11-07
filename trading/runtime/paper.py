@@ -120,6 +120,9 @@ class PaperLedger:
             notional=notional, leverage=proposal.leverage, margin=margin, liquidation=liq,
             stop_loss_estimate=stop_loss_estimate, stop_risk_pct=stop_loss_estimate/risk_basis,
             candidate_score=proposal.metadata.get('confidence'), risk_basis=risk_basis,
+            sizing_source=proposal.metadata.get('sizing_source','policy'),
+            sizing_risk_fraction=proposal.metadata.get('risk_per_trade_pct',max_risk_pct),
+            sizing_plan=proposal.metadata.get('sizing_plan'),
             initial_stop=sl, initial_risk_price=abs(entry-sl), entry_timeframe_seconds=900, price_step=rules.price_step, strategy=proposal.metadata.get('strategy','unknown'), management_policy='structure-v1', opened_at=int(time()*1000), unrealized=0., risk=budget, entry_fee=entry_fee, funding=0., funding_time=None)
         self.state['seen'].append(signal_key)
         self.event('OPEN', **self.positions[proposal.symbol], equity=self.equity)

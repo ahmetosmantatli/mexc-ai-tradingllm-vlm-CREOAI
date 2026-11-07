@@ -163,6 +163,10 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = Field(default=0.02, gt=0, le=0.1)
     drawdown_limit_pct: float = Field(default=0.08, gt=0, le=0.3)
     kill_switch_path: str = "data/STOP"
+    research_goal_enabled: bool = False
+    research_goal_multiple: float = Field(default=14, gt=1)
+    research_goal_days: float = Field(default=7, gt=0)
+    research_goal_stretch_multiple: float = Field(default=200, gt=1)
     ai_provider_pool_enabled: bool = False
     ai_parallel_candidates: int = Field(default=2,ge=1,le=4)
     ai_pool_retry_seconds: float = Field(default=5,ge=0,le=10)

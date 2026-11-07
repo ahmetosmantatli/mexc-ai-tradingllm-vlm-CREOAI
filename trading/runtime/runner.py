@@ -9,7 +9,8 @@ import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from trading.agents.anthropic_client import AnthropicClient
-from trading.agents.graph import EvaluationGraph, size_proposal_from_signal
+from trading.agents.graph import EvaluationGraph
+from trading.evaluation.planning import apply_decision_sizing, PlanSizingError
 from trading.agents.schemas import GraphAction
 from trading.config import BrokerMode
 from trading.exchange.mexc_public import MexcPublicClient
@@ -414,8 +415,15 @@ class PaperRunner:
             if account.available <= 0 or time.time()-account.observed_at > self.cfg.market_max_age_seconds:
                 return finish('HOLD_ACCOUNT_STALE_OR_NO_MARGIN')
         rules = self.public.get_contract_rules(signal.symbol)
-        proposal = size_proposal_from_signal(signal, equity=ledger.equity, risk_per_trade_pct=risk_pct,
-            target_leverage=min(self.cfg.paper_max_leverage, self.cfg.default_target_leverage, rules.max_leverage))
+        def fresh_proposal():
+            proposal=apply_decision_sizing(signal,result.metadata.get('sizing_plan'),ledger.equity,risk_pct,
+                min(self.cfg.paper_max_leverage,self.cfg.default_target_leverage),rules.max_leverage)
+            proposal.rationale=result.metadata.get('rationale',signal.rationale)
+            return proposal
+        try:
+            proposal=fresh_proposal()
+        except PlanSizingError:
+            return finish('HOLD_INVALID_MODEL_SIZING')
         context = RiskContext(equity=analysis_equity, starting_capital=ledger.state['initial'], capital_floor=0,
             open_risk=sum(p['risk'] for p in risk_positions.values()), open_positions=len(risk_positions),
             daily_loss_pct=metrics['daily_loss_pct'], drawdown_pct=metrics['drawdown_pct'])
@@ -445,12 +453,16 @@ class PaperRunner:
             if current['liquidation_count'] or current['daily_loss_pct'] >= self.cfg.daily_loss_limit_pct or current['drawdown_pct'] >= self.cfg.drawdown_limit_pct:
                 return finish('HOLD_LOSS_CIRCUIT_BREAKER')
             # Recheck risk against fresh equity after AI, not the original snapshot.
+            try:
+                proposal=fresh_proposal()
+            except PlanSizingError:
+                return finish('HOLD_INVALID_MODEL_SIZING')
             context.equity = ledger.equity
             context.open_risk = sum(p['risk'] for p in ledger.positions.values())
             context.open_positions = len(ledger.positions)
             if context.open_positions >= self.cfg.paper_max_positions or not self.risk.evaluate(proposal, context).accepted:
                 return finish('HOLD_RISK_CHANGED')
-            opened = ledger.open(proposal, rules, ticker.bid1, ticker.ask1, signal.features['dedup_key'], risk_pct, self.cfg.liquidation_buffer_pct)
+            opened = ledger.open(proposal, rules, ticker.bid1, ticker.ask1, signal.features['dedup_key'], proposal.metadata['risk_per_trade_pct'], self.cfg.liquidation_buffer_pct)
             if opened is None:
                 return finish('HOLD_DUPLICATE_OR_ALREADY_OPEN')
             if opened:

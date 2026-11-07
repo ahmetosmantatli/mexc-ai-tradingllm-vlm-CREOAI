@@ -10,7 +10,7 @@ import json
 
 POLICY_VERSION = 'pa-context-v2'
 POSITION_FIELDS = ('symbol','side','entry','stop','target','quantity','leverage','risk',
-                   'opened_at','initial_stop','current_r','mfe_r','mae_r','unrealized')
+                   'opened_at','initial_stop','current_r','mfe_r','mae_r','unrealized','margin','notional','stop_loss_estimate','stop_risk_pct')
 
 
 def canonical(value):
@@ -103,3 +103,143 @@ def build_prompt(candidate, market, memory, positions, account, version, changes
         version=version,candidate=data,market=compact_market(market),account=account,
         setup_card=card,what_changed=changes,open_positions=position_cards(positions))
     return canonical(prompt)
+
+
+def _finite(value):
+    from math import isfinite
+    if isinstance(value,bool):
+        return None
+    try:
+        number=float(value)
+        return number if isfinite(number) else None
+    except (TypeError,ValueError,OverflowError):
+        return None
+
+
+def _timestamp(value,now):
+    value=_finite(value)
+    if value is None or value<=0:
+        return None
+    if value>=100_000_000_000:
+        value/=1000
+    return value if value<=now else None
+
+
+def account_research_context(store,equity,settings=None,now=None):
+    """Describe measured PAPER operation and an optional research objective.
+
+    This never reads env seed values as a wallet, converts TRY, changes risk, or
+    claims a target is attainable. Unknown legacy fields stay explicitly unknown.
+    The deadline anchor is persisted in the same per-session ledger database.
+    """
+    import copy
+    from datetime import datetime
+    from time import time
+    from zoneinfo import ZoneInfo
+    from trading.runtime.reports import daily_trade_report,_net
+    now=time() if now is None else float(now)
+    with store.lock:
+        state=copy.deepcopy(store.get('paper'))
+        if not isinstance(state,dict):
+            return dict(mode='PAPER',ledger_available=False,equity_snapshot_usdt=_finite(equity),
+                objective={'enabled':False,'status':'paper_ledger_not_initialized'})
+        currency=state.get('currency')
+        if currency!='USDT':
+            return dict(mode='PAPER',ledger_available=True,currency=currency,
+                objective={'enabled':False,'status':'unsupported_or_unknown_ledger_currency'},
+                data_note='No currency conversion or legacy seed reconstruction was performed.')
+        current=_finite(equity)
+        initial=_finite(state.get('initial'))
+        positions=state.get('positions') or {}
+        positions=positions if isinstance(positions,dict) else {}
+        margins=[_finite(p.get('margin')) for p in positions.values() if isinstance(p,dict)]
+        unrealized=[_finite(p.get('unrealized')) for p in positions.values() if isinstance(p,dict)]
+        margin=sum(margins) if len(margins)==len(positions) and all(v is not None for v in margins) else None
+        open_pnl=sum(unrealized) if len(unrealized)==len(positions) and all(v is not None for v in unrealized) else None
+        peak=_finite(state.get('peak'))
+        day_start=_finite(state.get('day_start'))
+        day=datetime.fromtimestamp(now,ZoneInfo('Europe/Istanbul')).date().isoformat()
+        report=daily_trade_report(state,day=day,max_rows=5)
+        closed=[]
+        seen=set()
+        for index,row in enumerate(state.get('closed_positions') or []):
+            if not isinstance(row,dict):
+                continue
+            identity=(row.get('symbol'),row.get('opened_at'),row.get('closed_at'))
+            if identity[1] is None or identity[2] is None:
+                identity=('legacy_index',index)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            net,complete=_net(row)
+            closed.append(dict(symbol=row.get('symbol'),side=row.get('side'),strategy=row.get('strategy'),
+                reason=row.get('close_reason') or row.get('reason') or 'UNKNOWN',
+                leverage=_finite(row.get('leverage')),closed_at=_timestamp(row.get('closed_at'),now),
+                net_pnl_usdt=net,net_complete=complete))
+        counts={reason:sum(row['reason']==reason for row in closed) for reason in ('TP','SL','MANUAL','LIQ')}
+        counts['UNKNOWN']=sum(row['reason'] not in counts for row in closed)
+        closed.sort(key=lambda row:row.get('closed_at') or 0,reverse=True)
+        today_start_matches=state.get('day')==day
+        cash=_finite(state.get('cash'))
+        result=dict(schema='paper-account-v1',mode='PAPER',ledger_available=True,currency='USDT',
+            balance_source='Persisted per-session paper ledger; not the real MEXC wallet and not a TRY conversion.',
+            initial_usdt=initial,equity_snapshot_usdt=current,cash_usdt=cash,
+            ledger_equity_usdt=cash+open_pnl if cash is not None and open_pnl is not None else None,
+            open_margin_usdt=margin,available_usdt=max(0,current-margin) if current is not None and margin is not None else None,
+            open_unrealized_usdt=open_pnl,realized_net_total_usdt=_finite(state.get('realized')),
+            fees_total_usdt=_finite(state.get('fees')),funding_total_usdt=_finite(state.get('funding')),
+            current_return_pct=(current/initial-1)*100 if current is not None and initial is not None and initial>0 else None,
+            day=day,day_start_usdt=day_start if today_start_matches else None,
+            daily_loss_pct=max(0,1-current/day_start) if current is not None and day_start is not None and day_start>0 and today_start_matches else None,
+            drawdown_pct=max(0,1-current/peak) if current is not None and peak is not None and peak>0 else None,
+            daily_equity_change_usdt=current-day_start if current is not None and day_start is not None and today_start_matches else None,
+            daily_closed_realized_net_usdt=report['net_pnl'],daily_pnl_complete=report['pnl_complete'] and not report['unassigned_legacy_records'],
+            daily_closed_trade_fees_usdt=report['closed_trade_entry_fees']+report['closed_trade_exit_fees'],
+            daily_closed_trade_funding_usdt=report['closed_trade_funding'],
+            open_position_count=len(positions),closed_position_count=len(closed),close_reason_counts=counts,
+            recent_closed=closed[:5],objective={'enabled':False,'status':'not_configured'})
+        if not getattr(settings,'research_goal_enabled',False):
+            return result
+        multiple=_finite(getattr(settings,'research_goal_multiple',14))
+        days=_finite(getattr(settings,'research_goal_days',7))
+        stretch=_finite(getattr(settings,'research_goal_stretch_multiple',200))
+        if initial is None or initial<=0 or current is None or multiple is None or multiple<=1 or days is None or days<=0:
+            result['objective']={'enabled':False,'status':'invalid_or_missing_research_basis'}
+            return result
+        anchor=store.get('research_objective_start')
+        if not isinstance(anchor,dict) or _timestamp(anchor.get('started_at'),now) is None:
+            candidates=[]
+            created=_timestamp(state.get('created_at'),now)
+            if created is not None:
+                candidates.append((created,'paper_created_at'))
+            for event in state.get('events') or []:
+                if isinstance(event,dict):
+                    stamp=_timestamp(event.get('event_at'),now)
+                    if stamp is not None:
+                        candidates.append((stamp,'earliest_recorded_paper_event'))
+            for row in [*(state.get('closed_positions') or []),*positions.values()]:
+                if isinstance(row,dict):
+                    stamp=_timestamp(row.get('opened_at'),now)
+                    if stamp is not None:
+                        candidates.append((stamp,'earliest_recorded_position_open'))
+            started,source=min(candidates) if candidates else (now,'first_goal_context_observation; original_session_start_unknown')
+            anchor=dict(started_at=started,source=source,initial_usdt=initial)
+            store.put('research_objective_start',anchor)
+        reference=_finite(anchor.get('initial_usdt'))
+        if reference is None or reference<=0:
+            result['objective']={'enabled':False,'status':'invalid_persisted_research_basis'}
+            return result
+        started=anchor['started_at']
+        deadline=started+days*86400
+        target=reference*multiple
+        result['objective']=dict(enabled=True,kind='paper_research_only',
+            policy='Reporting objective only: never force entries, increase risk after losses, or override any risk limit to chase the target.',
+            unit_note='USDT target is initial paper seed times configured multiple. No TRY/USDT conversion or guaranteed outcome.',
+            reference_initial_usdt=reference,target_multiple=multiple,target_usdt=target,
+            remaining_usdt=max(0,target-current),remaining_multiple=target/current if current>0 else None,
+            progress_fraction=(current-reference)/(target-reference),
+            started_at=started,start_source=anchor['source'],deadline_at=deadline,
+            remaining_seconds=max(0,deadline-now),deadline_passed=now>=deadline,target_reached=current>=target)
+        if stretch is not None and stretch>1:
+            result['objective'].update(stretch_multiple=stretch,stretch_target_usdt=reference*stretch)
+        return result

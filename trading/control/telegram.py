@@ -303,6 +303,9 @@ class TelegramController:
             text+=f"Sürüm: {label}\n"
             text+=f"Giriş: {p.get('entry',0):.6g}\nZarar durdur (SL): {p.get('stop',0):.6g} | Kâr al (TP): {p.get('target',0):.6g}\n"
             text+=f"Şu anki kâr/zarar: {p.get('unrealized',0):+.4f} USDT\n"
+            if p.get('sizing_risk_fraction') is not None:
+                source='AI seçimi' if p.get('sizing_source')=='model' else 'profil ayarı'
+                text+=f"Kaldıraç/risk: {source} | Planlanan kasa riski: %{p['sizing_risk_fraction']*100:g}\n"
             origin=p.get('decision_ai') or {}
             provider={'groq':'Groq','gemini':'Gemini','anthropic':'Claude'}.get(origin.get('provider'),'Kayıtlı değil')
             text+=f"Giriş kararını veren: {provider} / {origin.get('model') or 'model bilgisi yok'}\n"
