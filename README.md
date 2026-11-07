@@ -159,7 +159,7 @@ systemctl status mexc-paper-worker --no-pager
 journalctl -u mexc-paper-worker -n 30 --no-pager
 ```
 
-Use `systemctl restart mexc-paper-worker` after a successful code/config update. Do not launch another foreground worker while this service runs. Telegram `/stop` pauses new simulated entries while supervision remains active; `systemctl stop mexc-paper-worker` stops the whole application and all simulated position supervision. This release has no live exchange orders. The service unit has not been executed on Hetzner in this session.
+Use `systemctl restart mexc-paper-worker` after a successful code/config update. That unit is the only `getUpdates` poller for this bot token. When `.env` has `BROKER_MODE=live` and `LIVE_TRADING_ENABLED=true`, it is the live runner (Arm / Durdur); it does not start the paper menu. Do not launch another foreground worker or the compose `worker` service beside it. If that compose service is still up, stop it with `docker compose --env-file .env -f infrastructure/docker-compose.yml -p mexc-ai stop worker` from `/opt/mexc-ai-trading` before expecting Arm to be seen. `systemctl stop mexc-paper-worker` stops the whole worker.
 
 The Fleet worker now logs successful startup and one per-account status heartbeat per minute (account identifier, version and reason; no balances or secrets). An integration test covers Telegram demo selection → plan acceptance → paper entry → tighter stop event → SL close → notification queue/report → restart with preserved balance and paused control, without calling an exchange or AI provider.
 

@@ -3,19 +3,24 @@
 Constructed only when BROKER_MODE=live and LIVE_TRADING_ENABLED=true.
 The first boot of a live generation is disarmed: equity, margin, positions,
 and already-sent orders are still reconciled, but a model TradeProposal is
-not handed to the executor until an allowlisted operator sends /arm.
+not handed to the executor until an allowlisted operator arms it.
 
+Arm is the Arm button or /arm. The sender is message.from.id (callback
+from.id for the button). Durdur and /stop block new entries only.
 /start only resumes entries for a generation that is already armed.
-/stop and /pause block new entries only. Reconciliation and native protection
-of an order that was already sent keep running. live → paper → live clears
-the arm until a new /arm.
+Reconciliation and native protection of an order that was already sent keep
+running. live → paper → live clears the arm until a new arm.
 
+This process is the only getUpdates poller while the live gates are on.
 Equity, available margin, and positions come from the authenticated exchange
 snapshot. Paper cash and STARTING_CAPITAL_TRY are not read.
 """
 import hashlib
 import json
+import logging
 import sqlite3
+
+logger = logging.getLogger(__name__)
 
 from trading.brokers.live.execution import ApprovedLiveExecutor, LiveExecutionError, LiveExecutionGates
 from trading.config import BrokerMode
@@ -56,6 +61,11 @@ class LiveRunner:
         self._telegram = None
         self.last_arm_result = None
 
+    CONTROLS = {'inline_keyboard': [[
+        {'text': 'Arm', 'callback_data': 'live:arm'},
+        {'text': 'Durdur', 'callback_data': 'live:stop'},
+    ]]}
+
     def _control_key(self):
         return f'account:{self.account_id}:control'
 
@@ -91,6 +101,7 @@ class LiveRunner:
         return self.permission.view()
 
     _COMMANDS = frozenset({'/stop', '/pause', '/start', '/arm'})
+    _BUTTONS = {'live:arm': '/arm', 'live:stop': '/stop'}
 
     @staticmethod
     def _command_text(text):
@@ -106,63 +117,131 @@ class LiveRunner:
             if self._telegram is None:
                 self._telegram = Telegram(self.cfg, self.store)
             offset = self.store.get('live_telegram_offset', 0)
-            updates = self._telegram.call('getUpdates', offset=offset, timeout=0, allowed_updates=['message'])
+            updates = self._telegram.call(
+                'getUpdates', offset=offset, timeout=0, allowed_updates=['message', 'callback_query'])
             commands = []
             for update in updates:
-                message = update.get('message') or {}
-                chat = message.get('chat') or {}
-                if str(chat.get('id')) == str(self.cfg.telegram_chat_id):
-                    text = self._command_text(message.get('text'))
-                    if text in self._COMMANDS:
-                        sender = message.get('from') or {}
-                        commands.append({'command': text, 'operator_id': sender.get('id')})
+                parsed = self._parse_update(update)
+                if parsed:
+                    commands.append(parsed)
                 if 'update_id' in update:
                     self.store.put('live_telegram_offset', update['update_id']+1)
             return commands
-        except Exception:
+        except Exception as exc:
+            status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            if status == 409:
+                logger.warning('live telegram poll conflict; another process is calling getUpdates')
+            else:
+                logger.warning('live telegram poll failed (%s)', type(exc).__name__)
             return []
+
+    def _parse_update(self, update):
+        callback = update.get('callback_query')
+        if isinstance(callback, dict):
+            message = callback.get('message') or {}
+            chat = message.get('chat') or {}
+            sender = callback.get('from') or {}
+            callback_id = callback.get('id')
+            if str(chat.get('id')) != str(self.cfg.telegram_chat_id):
+                self._answer_callback(callback_id, 'Yetkisiz.')
+                return None
+            command = self._BUTTONS.get(str(callback.get('data') or ''))
+            if command is None:
+                self._answer_callback(callback_id, 'Silahsız. Bilinmeyen düğme.')
+                return None
+            # Button actor is callback_query.from.id. message.from is the bot.
+            return {'command': command, 'operator_id': sender.get('id'), 'callback_id': callback_id}
+        message = update.get('message') or {}
+        chat = message.get('chat') or {}
+        if str(chat.get('id')) != str(self.cfg.telegram_chat_id):
+            return None
+        text = self._command_text(message.get('text'))
+        if text not in self._COMMANDS:
+            return None
+        sender = message.get('from') or {}
+        return {'command': text, 'operator_id': sender.get('id')}
 
     def _apply_commands(self):
         for raw in self._commands():
+            callback_id = None
             if isinstance(raw, str):
                 command, operator_id = self._command_text(raw), None
             elif isinstance(raw, dict):
                 command = self._command_text(raw.get('command'))
                 operator_id = raw.get('operator_id')
+                callback_id = raw.get('callback_id')
             else:
                 continue
             if command in ('/stop', '/pause', 'stop', 'pause'):
                 self.stop_new_entries()
+                reply, result = self._stopped_text(), 'entries_stopped'
             elif command in ('/start', 'start'):
                 self.resume_entries()
+                reply, result = self._state_text(), 'resume'
             elif command in ('/arm', 'arm'):
-                self._arm_command(operator_id)
+                reply = self._arm_command(operator_id)
+                result = self.last_arm_result
+            else:
+                continue
+            logger.info('live telegram command=%s result=%s', command, result)
+            if reply:
+                self._control_reply(reply, callback_id)
 
     def _arm_command(self, operator_id):
         """Arm only from the Telegram sender id. The message text is not an identity."""
         if operator_id is None or str(operator_id).strip() == '':
-            self._arm_reply('operator_not_allowed')
-            return self.permission.view()
+            self.last_arm_result = 'operator_not_allowed'
+            return self._arm_text('operator_not_allowed')
         try:
-            view = self.arm(str(operator_id).strip())
+            self.arm(str(operator_id).strip())
         except LivePermissionError as exc:
-            self._arm_reply(str(exc))
-            return self.permission.view()
+            self.last_arm_result = str(exc)
+            return self._arm_text(str(exc))
         control = dict(self.store.get(self._control_key()) or {})
         control.update(enabled=True, stopped=False)
         self.store.put(self._control_key(), control)
-        self._arm_reply('armed')
-        return view
+        self.last_arm_result = 'armed'
+        return self._arm_text('armed')
 
-    def _arm_reply(self, code):
-        self.last_arm_result = code
-        text = {
-            'armed': 'Live generation armed. New entries can run. /stop still blocks new entries.',
-            'operator_not_allowed': 'Arm refused. This Telegram user cannot arm live entries.',
-            'live_gates_required': 'Arm refused. BROKER_MODE=live and LIVE_TRADING_ENABLED=true are still required.',
-        }.get(code)
-        if text:
-            self._deliver(text)
+    @staticmethod
+    def _arm_text(code):
+        return {
+            'armed': 'Silahlı. İzinli operatör, canlı kapılar açık.',
+            'operator_not_allowed': 'Silahsız. Bu Telegram kimliği izinli değil.',
+            'live_gates_required': 'Silahsız. BROKER_MODE=live ve LIVE_TRADING_ENABLED=true gerekli.',
+        }.get(code, 'Silahsız. Arm reddedildi.')
+
+    def _stopped_text(self):
+        if self.permission.view().get('armed'):
+            return 'Silahlı, yeni girişler kapalı. Durdur /stop ile aynı.'
+        return 'Silahsız. Yeni giriş zaten kapalı.'
+
+    def _state_text(self):
+        view = self.permission.view()
+        if self.cfg.live_trading_enabled is not True or self.cfg.broker_mode != BrokerMode.LIVE:
+            return 'Silahsız. BROKER_MODE=live ve LIVE_TRADING_ENABLED=true gerekli.'
+        if view.get('armed') and self.entries_open():
+            return 'Silahlı. Yeni canlı girişler açık.'
+        if view.get('armed'):
+            return 'Silahlı, yeni girişler kapalı. Durdur /stop ile aynı.'
+        return 'Silahsız. İzinli operatör Arm veya /arm göndermeden yeni giriş yok.'
+
+    def present_controls(self):
+        """One startup message with Arm and Durdur. Not sent on every cycle."""
+        self._control_reply(self._state_text())
+
+    def _control_reply(self, text, callback_id=None):
+        self._deliver(text, reply_markup=self.CONTROLS)
+        if callback_id:
+            self._answer_callback(callback_id, text)
+
+    def _answer_callback(self, callback_id, text):
+        if not callback_id or self._telegram is None:
+            return
+        try:
+            self._telegram.call('answerCallbackQuery', callback_query_id=callback_id, text=str(text)[:180])
+        except Exception as exc:
+            logger.warning('live telegram callback ack failed (%s)', type(exc).__name__)
 
     def _intents(self):
         with self.store.lock:
@@ -244,15 +323,16 @@ class LiveRunner:
         return (f"Exchange reported partial fill {symbol} filled {row.get('filled_contracts')} of {row.get('contracts')}. "
                 f"The original order id was kept and no second entry was sent."+tail)
 
-    def _deliver(self, text):
+    def _deliver(self, text, reply_markup=None):
         if not text or not (self.cfg.telegram_bot_token and self.cfg.telegram_chat_id):
             return
         try:
             from trading.runtime.telegram import Telegram
             if self._telegram is None:
                 self._telegram = Telegram(self.cfg, self.store)
-            self._telegram.send(text)
-        except Exception:
+            self._telegram.send(text, reply_markup=reply_markup)
+        except Exception as exc:
+            logger.warning('live telegram send failed (%s)', type(exc).__name__)
             return
 
     def cycle(self):

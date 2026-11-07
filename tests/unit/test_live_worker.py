@@ -105,21 +105,35 @@ class Inbox:
     def __init__(self, batches):
         self.batches = [list(batch) for batch in batches]
         self.sent = []
+        self.keyboards = []
+        self.answers = []
 
     def call(self, method, **kwargs):
+        if method == 'answerCallbackQuery':
+            self.answers.append(kwargs.get('text'))
+            return True
         assert method == 'getUpdates'
         if not self.batches:
             return []
         return self.batches.pop(0)
 
-    def send(self, text):
+    def send(self, text, reply_markup=None):
         self.sent.append(text)
+        self.keyboards.append(reply_markup)
 
 
 def telegram_update(text, user_id, *, chat_id=900, update_id=1):
     sender = {} if user_id is None else {'id': user_id, 'is_bot': False}
     return {'update_id': update_id, 'message': {
         'message_id': update_id, 'from': sender, 'chat': {'id': chat_id, 'type': 'private'}, 'text': text}}
+
+
+def callback_update(data, user_id, *, chat_id=900, update_id=1, message_from=1):
+    """Button press. message.from is the bot; the operator is callback_query.from."""
+    return {'update_id': update_id, 'callback_query': {
+        'id': 'cb'+str(update_id), 'from': {'id': user_id, 'is_bot': False}, 'data': data,
+        'message': {'message_id': 10, 'from': {'id': message_from, 'is_bot': True},
+                    'chat': {'id': chat_id, 'type': 'private'}}}}
 
 
 def attach(runner, batches, chat_id='900'):
@@ -327,7 +341,9 @@ def test_telegram_arm_opens_entries_and_stop_still_blocks_them(tmp_path):
     assert armed['armed'] is True and armed['running'] is True and armed['entries_open'] is True
     assert runner.last_arm_result == 'armed'
     assert runner.permission.view()['armed_by'] == '11'
-    assert inbox.sent[-1] == 'Live generation armed. New entries can run. /stop still blocks new entries.'
+    assert inbox.sent[-1] == 'Silahlı. İzinli operatör, canlı kapılar açık.'
+    assert inbox.keyboards[-1]['inline_keyboard'][0][0]['text'] == 'Arm'
+    assert inbox.keyboards[-1]['inline_keyboard'][0][1]['text'] == 'Durdur'
     assert 'test-token' not in inbox.sent[-1]
     opened = runner.consider(proposal())
     assert opened['accepted'] is True and len(private.submits) == 1
@@ -352,7 +368,7 @@ def test_telegram_arm_rejects_unauthorized_operators(tmp_path):
     refused = runner.cycle()
     assert refused['reason'] == 'LIVE_DISARMED' and refused['armed'] is False
     assert runner.last_arm_result == 'operator_not_allowed'
-    assert inbox.sent == ['Arm refused. This Telegram user cannot arm live entries.']
+    assert inbox.sent == ['Silahsız. Bu Telegram kimliği izinli değil.']
     assert private.submits == []
     assert runner.cycle()['armed'] is False
     assert runner.cycle()['armed'] is False and len(inbox.sent) == 1
@@ -414,3 +430,67 @@ def test_first_boot_and_live_paper_live_stay_disarmed_until_telegram_arm(tmp_pat
     assert runner.permission.view()['armed_generation'] == 3
     opened = runner.consider(proposal())
     assert opened['accepted'] is True and len(private.submits) == 1
+
+
+def test_arm_and_durdur_buttons_allowlist_wrong_id_and_stop(tmp_path, caplog):
+    import logging
+    caplog.set_level(logging.INFO)
+    runner, private, _cfg = build(tmp_path)
+    inbox = attach(runner, [
+        [callback_update('live:arm', 22, update_id=1, message_from=999)],
+        [callback_update('live:arm', 11, update_id=2, message_from=999)],
+        [callback_update('live:stop', 11, update_id=3)],
+        [telegram_update('/arm', 11, update_id=4)],
+        [telegram_update('/stop', 11, update_id=5)],
+    ])
+    refused = runner.cycle()
+    assert refused['reason'] == 'LIVE_DISARMED' and refused['armed'] is False
+    assert runner.last_arm_result == 'operator_not_allowed'
+    assert inbox.sent[-1] == 'Silahsız. Bu Telegram kimliği izinli değil.'
+    assert inbox.answers[-1] == inbox.sent[-1]
+    assert private.submits == []
+    assert 'live telegram command=/arm result=operator_not_allowed' in caplog.text
+
+    armed = runner.cycle()
+    assert armed['reason'] == 'LIVE_ENTRIES_OPEN' and armed['armed'] is True
+    assert runner.permission.view()['armed_by'] == '11'
+    assert inbox.sent[-1] == 'Silahlı. İzinli operatör, canlı kapılar açık.'
+    buttons = inbox.keyboards[-1]['inline_keyboard'][0]
+    assert [button['text'] for button in buttons] == ['Arm', 'Durdur']
+    assert [button['callback_data'] for button in buttons] == ['live:arm', 'live:stop']
+    assert 'live telegram command=/arm result=armed' in caplog.text
+    opened = runner.consider(proposal())
+    assert opened['accepted'] is True and len(private.submits) == 1
+
+    stopped = runner.cycle()
+    assert stopped['reason'] == 'HOLD_ENTRIES_STOPPED'
+    assert stopped['armed'] is True and stopped['entries_open'] is False
+    assert inbox.sent[-1] == 'Silahlı, yeni girişler kapalı. Durdur /stop ile aynı.'
+    assert runner.consider(proposal())['reason'] == 'entries_blocked'
+    assert len(private.submits) == 1
+    assert 'live telegram command=/stop result=entries_stopped' in caplog.text
+
+    runner.cycle()
+    assert runner.entries_open() is True
+    runner.cycle()
+    assert runner.entries_open() is False
+    assert runner.consider(proposal())['reason'] == 'entries_blocked'
+    assert len(private.submits) == 1
+    assert 'test-token' not in ' '.join(inbox.sent)
+
+
+def test_paper_telegram_poll_is_off_when_the_process_is_live(tmp_path):
+    from trading.runtime.telegram import Telegram, paper_updates_allowed
+    assert paper_updates_allowed(settings()) is False
+    assert paper_updates_allowed(Settings(_env_file=None)) is True
+    called = []
+
+    class Client:
+        def post(self, *args, **kwargs):
+            called.append(args)
+            raise AssertionError('live process must not call getUpdates')
+
+    telegram = Telegram(settings(telegram_bot_token='tok', telegram_chat_id='1'),
+        RuntimeStore(str(tmp_path/'tg.sqlite3')), Client())
+    telegram.tick(None, 'paper status')
+    assert called == []
