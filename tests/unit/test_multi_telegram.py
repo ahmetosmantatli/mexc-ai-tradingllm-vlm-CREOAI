@@ -29,6 +29,7 @@ def controller(tmp_path, snapshots=None):
 
 def ready(ctl, ident):
     ctl.store.put(f'account:{ident}:linked',True)
+    ctl.set_control(ident,capital_mode='account',capital_amount=1000.,allocation_mode='fixed',capital_chosen=True)
     ctl._command(ident,'vlm')
     ctl._command(ident,'trader_balanced')
 
@@ -236,11 +237,14 @@ def test_wizard_requires_verified_link_then_version_then_mode(tmp_path):
     ctl,calls=controller(tmp_path)
     ctl.dispatch(message(11,11,'/run'))
     assert not ctl.control('a')['enabled']
-    assert 'MEXC hesabını bağla' in str(calls[-1][1]['reply_markup'])
+    assert 'Demo' in str(calls[-1][1]['reply_markup'])
+    ctl.dispatch(callback(11,11,'control:capital_account'))
+    assert 'MEXC hesabını bağla' in str(calls[-2][1]['reply_markup'])
     # Neither arbitrary snapshot nor an old profile callback bypasses linking.
     ctl.dispatch(callback(11,11,'control:trader_aggressive'))
     assert not ctl.control('a')['profile_chosen']
     ctl.store.put('account:a:linked',True)
+    ctl.set_control('a',capital_mode='account',capital_amount=1000.,allocation_mode='fixed',capital_chosen=True)
     ctl.dispatch(message(11,11,'/start'))
     keyboard=str(calls[-1][1]['reply_markup'])
     assert 'MEXC hesabını bağla' not in keyboard
@@ -284,3 +288,59 @@ def test_legacy_risk_callback_cannot_override_mode(tmp_path):
     ctl.dispatch(callback(11,11,'control:risk005'))
     assert ctl.control('a')['risk_per_trade_pct']==before
     assert not ctl.control('a')['enabled']
+
+
+def test_demo_capital_queues_without_mexc_and_start_requires_applied_reset(tmp_path):
+    ctl,calls=controller(tmp_path)
+    ctl.dispatch(message(11,11,'/demo 1000'))
+    request=ctl.store.get('account:a:commands')[0]
+    assert request['kind']=='capital_reset' and request['mode']=='demo' and request['amount']==1000
+    assert not ctl.control('a')['enabled'] and not ctl.control('a')['capital_chosen']
+    assert ctl.control('a')['capital_pending']==request['id']
+    ctl.dispatch(callback(11,11,'control:start'))
+    assert not ctl.control('a')['enabled']
+    # Fleet confirms application; demo then needs no linked MEXC account.
+    ctl.set_control('a',capital_mode='demo',capital_amount=1000.,allocation_mode='fixed',capital_chosen=True,capital_pending=None)
+    ctl.dispatch(callback(11,11,'control:vlm'))
+    ctl.dispatch(callback(11,11,'control:trader_balanced'))
+    ctl.dispatch(message(11,11,'/run'))
+    assert ctl.control('a')['enabled'] and not ctl.linked('a')
+    assert not ctl.control('b')['enabled']
+
+
+@pytest.mark.parametrize('amount',['0','-1','nan','inf','1,000','abc'])
+def test_invalid_demo_amount_does_not_enqueue(tmp_path,amount):
+    ctl,_=controller(tmp_path)
+    ctl.dispatch(message(11,11,'/demo '+amount))
+    assert ctl.store.get('account:a:commands') is None
+    assert not ctl.control('a')['capital_chosen']
+
+
+def test_account_allocation_requires_link_and_supports_full_and_fixed(tmp_path):
+    ctl,_=controller(tmp_path)
+    ctl.dispatch(message(11,11,'/capital full'))
+    assert ctl.store.get('account:a:commands') is None
+    ctl.store.put('account:a:linked',True)
+    ctl.dispatch(message(11,11,'/capital full'))
+    request=ctl.store.get('account:a:commands')[0]
+    assert request['mode']=='account' and request['allocation_mode']=='full' and request['amount'] is None
+    ctl.dispatch(message(11,11,'/capital 500'))
+    assert len(ctl.store.get('account:a:commands'))==1  # pending request cannot be replaced silently
+
+
+def test_capital_button_accepts_manual_amount_in_private_owner_chat(tmp_path):
+    ctl,_=controller(tmp_path)
+    ctl.dispatch(callback(11,11,'control:capital_demo'))
+    ctl.dispatch(message(22,22,'1234'))
+    assert ctl.store.get('account:a:commands') is None
+    ctl.dispatch(message(11,11,'1234'))
+    request=ctl.store.get('account:a:commands')[0]
+    assert request['amount']==1234 and request['mode']=='demo'
+
+
+def test_report_command_renders_only_owner_reports(tmp_path):
+    ctl,calls=controller(tmp_path,{'a':{'reports':[{'date':'2026-11-07','version':'vlm','trades':2,'realized_pnl':3.4,'fees':.1,'types':{'long':2},'leverages':[3]}]},'b':{'reports':'PRIVATE B REPORT'}})
+    ctl.dispatch(message(11,11,'/report'))
+    output=calls[-1][1]['text']
+    assert '2026-11-07' in output and '+3.4000' in output
+    assert 'PRIVATE B REPORT' not in output

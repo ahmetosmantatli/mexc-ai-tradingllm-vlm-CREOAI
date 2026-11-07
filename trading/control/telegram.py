@@ -6,6 +6,7 @@ position protection's hot path. Account status is supplied by the orchestrator.
 from contextlib import ExitStack
 import json
 import logging
+from math import isfinite
 from pathlib import Path
 import time
 from uuid import uuid4
@@ -48,7 +49,7 @@ class TelegramController:
     def control(self, account_id):
         if account_id not in self.accounts:
             raise ValueError('unknown account')
-        defaults=dict(enabled=False, version='text', version_chosen=False, profile_chosen=False, risk_profile=None, risk_per_trade_pct=.01)
+        defaults=dict(enabled=False, version='text', version_chosen=False, profile_chosen=False, risk_profile=None, risk_per_trade_pct=.01, capital_mode=None, capital_amount=None, allocation_mode='fixed', capital_chosen=False, capital_pending=None, capital_input=False)
         return {**defaults, **self.store.get(f'account:{account_id}:control', {})}
 
     def set_control(self, account_id, **updates):
@@ -62,42 +63,111 @@ class TelegramController:
         return (self.store.get(f'account:{account_id}:linked', False) is True
                 and not self.store.get(f'account:{account_id}:disconnected', False))
 
+    def capital_ready(self, account_id):
+        state=self.control(account_id)
+        return (state['capital_chosen'] and not state['capital_pending']
+                and (state['capital_mode']=='demo' or (state['capital_mode']=='account' and self.linked(account_id))))
+
+    def capital_text(self, account_id):
+        state=self.control(account_id)
+        if state['capital_pending']:
+            return 'Sermaye değişikliği bekliyor. Açık pozisyon/analiz varsa önce güvenli biçimde tamamlanmalı; henüz yeni kasa uygulanmadı.'
+        if state['capital_mode']=='demo':
+            return f"Demo kasa: {state['capital_amount']:g} USDT (sanal)" if state['capital_amount'] else 'Demo kasa tutarını USDT olarak yaz. Örnek: /demo 1000'
+        if state['capital_mode']=='account':
+            allocation='son doğrulanan kullanılabilir USDT bakiyesinin tamamı' if state['allocation_mode']=='full' else f"{state['capital_amount']:g} USDT" if state['capital_amount'] else 'seçilmedi'
+            return f"MEXC hesabına referanslı PAPER kasa: {allocation}. Gerçek emir açılmaz."
+        return 'Önce para yatırmadan Demo veya MEXC bakiyesine referanslı Paper seç.'
+
     def keyboard(self, account_id):
         control=self.control(account_id)
         rows=[]
-        if not self.linked(account_id):
-            rows.append([{'text':'1 · MEXC hesabını bağla', 'callback_data':'control:connect'}])
+        if not self.capital_ready(account_id):
+            if not control['capital_pending']:
+                rows.append([{'text':'Demo · Para yatırmadan', 'callback_data':'control:capital_demo'}, {'text':'MEXC bakiyesinden Paper', 'callback_data':'control:capital_account'}])
+                if control['capital_mode']=='account' and self.linked(account_id):
+                    rows.append([{'text':'Tüm kullanılabilir bakiyeyi seç', 'callback_data':'control:capital_full'}, {'text':'Tutarı elle yaz', 'callback_data':'control:capital_amount'}])
+                if control['capital_mode']=='account' and not self.linked(account_id):
+                    rows.append([{'text':'MEXC hesabını bağla', 'callback_data':'control:connect'}])
         elif not control['version_chosen']:
-            rows.append([{'text':'2 · Görselsiz', 'callback_data':'control:text'}, {'text':'2 · VLM (grafikli)', 'callback_data':'control:vlm'}])
+            rows.append([{'text':'Görselsiz', 'callback_data':'control:text'}, {'text':'VLM (grafikli)', 'callback_data':'control:vlm'}])
         elif not control['profile_chosen']:
             rows.extend([[{'text':mode['label'], 'callback_data':'control:'+key}] for key,mode in TRADER_MODES.items()])
         else:
             rows.append([{'text':'✓ Çalışıyor' if control['enabled'] else '▶ Ayarlarla başlat', 'callback_data':'control:status' if control['enabled'] else 'control:start'}, {'text':'⏹ Botu durdur', 'callback_data':'control:stop'}])
-            rows.append([{'text':'Ayarları değiştir', 'callback_data':'control:settings'}])
-        rows.append([{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':'Pozisyonlar', 'callback_data':'control:positions'}])
+            rows.append([{'text':'Ayarları değiştir', 'callback_data':'control:settings'}, {'text':'Kasa seçimini değiştir', 'callback_data':'control:capital'}])
+        rows.append([{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':'Pozisyonlar', 'callback_data':'control:positions'}, {'text':'Günlük rapor', 'callback_data':'control:report'}])
         if self.linked(account_id):
             rows.append([{'text':'✓ MEXC bağlı', 'callback_data':'control:status'}, {'text':'Bağlantıyı kaldır', 'callback_data':'control:disconnect'}])
         return {'inline_keyboard':rows}
 
     def settings_text(self, account_id):
         state=self.control(account_id)
-        if not self.linked(account_id):
-            return '1/4 · MEXC bağlantısı\nÖnce MEXC hesabını bağla. Bağlantı doğrulanmadan işlem başlatılmaz.'
+        if not self.capital_ready(account_id):
+            return '1/4 · İşlem yapılacak PAPER kasa\n'+self.capital_text(account_id)+'\nDemo için MEXC bağlantısı veya gerçek para gerekmez. Tüm seçenekler paper simülasyondur.'
         if not state['version_chosen']:
-            return '2/4 · Analiz sürümü\nGörselsiz: sayısal mum/strateji verileri.\nVLM: aynı veriler + 4s/15dk/5dk grafikleri. Birini seç.'
+            return '2/4 · Analiz sürümü\n'+self.capital_text(account_id)+'\nGörselsiz: sayısal mum/strateji verileri.\nVLM: aynı veriler + 4s/15dk/5dk grafikleri. Birini seç.'
         if not state['profile_chosen']:
             return f"3/4 · Trader modu\nAnaliz: {'VLM (grafikli)' if state['version']=='vlm' else 'Görselsiz'}\nSermayeyi koru, Dengeli veya Agresif seç. Modlar kazanç garantisi değildir."
         mode=next((m for m in TRADER_MODES.values() if m['risk_profile']==state['risk_profile']),None)
         if mode is None:
             return 'Trader modu yeniden seçilmeli. /settings'
         risk=state['risk_per_trade_pct']*100
-        return (f"4/4 · Ayar özeti | PAPER\nMEXC: bağlı\nAnaliz: {'VLM (grafikli)' if state['version']=='vlm' else 'Görselsiz'}\n"
+        return (f"4/4 · Ayar özeti | PAPER\n{self.capital_text(account_id)}\nAnaliz: {'VLM (grafikli)' if state['version']=='vlm' else 'Görselsiz'}\n"
                 f"Trader modu: {mode['label']}\nİşlem başına planlanan azami stop kaybı: %{risk:g}\n"
                 f"Örnek: 500 TL eşdeğeri kasada yaklaşık {500*state['risk_per_trade_pct']:g} TL planlanan risk. Bu, yatırılacak teminat yüzdesi değildir.\n"
                 f"Kaldıraç üst sınırı: {state['max_leverage']:g}x; parite/teminat/stop koşulları daha düşük değer gerektirebilir.\n"
                 f"Azami açık pozisyon: {state['max_positions']}\nGünlük kayıp eşiği: %{state['daily_loss_limit_pct']*100:g} | Zirveden düşüş: %{state['drawdown_limit_pct']*100:g}\n"
                 'Fiyat boşluklarında kayıp planı aşabilir. Uygun fırsatta işlem açılır; işlem zorunlu değil. '
                 + ('Bot bu ayarlarla çalışıyor.' if state['enabled'] else 'Başlat ile onayla.'))
+
+    def request_capital(self, account_id, mode, amount=None, allocation_mode='fixed'):
+        if mode not in ('demo','account') or allocation_mode not in ('fixed','full'):
+            raise ValueError('invalid capital mode')
+        if mode=='account' and not self.linked(account_id):
+            self.set_control(account_id,enabled=False,capital_mode='account',capital_input=False,capital_chosen=False)
+            self.send(account_id,'Önce MEXC hesabını bağla; sonra ayıracağın USDT tutarını veya tam bakiyeyi seç.',buttons=True)
+            return
+        if allocation_mode=='full' and mode!='account':
+            raise ValueError('full allocation requires account')
+        if allocation_mode=='fixed':
+            try:
+                amount=float(amount)
+            except (ValueError,TypeError):
+                amount=0
+            if not isfinite(amount) or amount<=0 or amount>1e12:
+                self.send(account_id,'Pozitif ve sonlu bir USDT tutarı yaz. Örnek: /demo 1000 veya /capital 1000. Nokta kullan; bu tutar gerçek emir açmaz.')
+                return
+        else:
+            amount=None
+        state=self.control(account_id)
+        if state['capital_pending']:
+            self.send(account_id,'Önceki kasa değişikliği henüz tamamlanmadı. /status ile kontrol et.')
+            return
+        command=dict(id=uuid4().hex,kind='capital_reset',status='pending',created_at=time.time(),mode=mode,amount=amount,allocation_mode=allocation_mode)
+        key=f'account:{account_id}:commands'
+        queue=self.store.get(key,[])
+        queue.append(command)
+        self.store.put(key,queue)
+        self.set_control(account_id,enabled=False,capital_chosen=False,capital_pending=command['id'],capital_input=False,version_chosen=False,profile_chosen=False)
+        self.send(account_id,'Kasa değişikliği istendi. Açık pozisyonlar veya analiz bitmeden uygulanmaz. Onaylanan yeni PAPER kasa ayrıca bildirilecek.',buttons=True)
+
+    def report_text(self, account_id):
+        snapshot=self.snapshot_provider(account_id) or {}
+        reports=snapshot.get('reports')
+        if isinstance(reports,str):
+            return reports
+        if not reports:
+            return 'Henüz günlük işlem raporu yok. Bu bir PAPER raporudur; gerçek hesap hareketi değildir.'
+        text='Günlük PAPER raporu | Net sonuçlar USDT\n'
+        for row in reports[-14:]:
+            if 'net_pnl' in row and 'pnl_complete' in row:
+                from trading.runtime.reports import format_daily_report
+                text += '\n'+row.get('version','')+'\n'+format_daily_report(row)+'\n'
+                continue
+            text+=(f"{row.get('date','?')} | {row.get('version','')} | İşlem {row.get('trades',0)} | Net PnL {float(row.get('realized_pnl',0)):+.4f} | Ücret {float(row.get('fees',0)):.4f}\n"
+                   f"Türler: {row.get('types',{})} | Kaldıraçlar: {row.get('leverages',[])}\n")
+        return text
 
     def send(self, account_id, text, buttons=False, keyboard=None):
         data = dict(chat_id=self.accounts[account_id].telegram_chat_id, text=text[:4000])
@@ -110,7 +180,7 @@ class TelegramController:
         control = self.control(account_id)
         snapshot = self.snapshot_provider(account_id)
         text = (f'Hesap: {account.account_id} | PAPER\n'
-                f"MEXC: {'bağlı' if self.linked(account_id) else 'bağlı değil'}\n"
+                f"MEXC: {'bağlı' if self.linked(account_id) else 'bağlı değil'}\n{self.capital_text(account_id)}\n"
                 f"Yeni işlem: {'açık' if control['enabled'] else 'duraklatıldı'} | Sürüm: {control['version']}\n"
                 f"Planlanan risk: %{100*control['risk_per_trade_pct']:g}\n")
         if not snapshot:
@@ -140,7 +210,8 @@ class TelegramController:
                         text += f"{version} {symbol} {p['side']} | PnL {p.get('unrealized',0):+.4f} | SL {p.get('stop')} TP {p.get('target')}\n"
             for symbol, p in snapshot.get('positions', {}).items():
                 text += (f"{symbol} {p['side']} | Giriş {p['entry']:.6g} | SL {p['stop']:.6g} | TP {p['target']:.6g}\n"
-                         f"Açık PnL {p.get('unrealized',0):+.4f} USDT\n")
+                         f"Açık PnL {p.get('unrealized',0):+.4f} USDT | {p.get('leverage','?')}x\n"
+                         f"İlk risk bazında R: {p.get('current_r',0):+.2f} | Gözlenen en iyi {p.get('mfe_r',0):.2f}R | En kötü {p.get('mae_r',0):.2f}R\n")
         return text
 
     def _authorize(self, message, user):
@@ -172,9 +243,42 @@ class TelegramController:
         parts = text.split()
         name = parts[0].split('@')[0].lower() if parts else ''
         mapping = {'/start':'menu', '/help':'menu', '/status':'status', '/durum':'status', '/balance':'status',
-                   '/bakiye':'status', '/settings':'settings', '/ayarlar':'settings', '/positions':'positions', '/pozisyonlar':'positions',
+                   '/bakiye':'status', '/report':'report', '/history':'report', '/rapor':'report', '/settings':'settings', '/ayarlar':'settings', '/positions':'positions', '/pozisyonlar':'positions',
                    '/run':'start', '/baslat':'start', '/pause':'pause', '/durdur':'stop', '/stop':'stop'}
         if self.command_handler and self.command_handler(account.account_id, text, message):
+            return
+        if name in ('/demo','/capital'):
+            if len(parts)!=2:
+                self.send(account.account_id,'Kullanım: /demo 1000 (sanal USDT), /capital 1000 veya /capital full (MEXC referanslı paper).')
+            elif name=='/capital' and parts[1].lower()=='full':
+                self.request_capital(account.account_id,'account',allocation_mode='full')
+            else:
+                self.request_capital(account.account_id,'demo' if name=='/demo' else 'account',parts[1])
+            return
+        if self.control(account.account_id)['capital_input'] and name not in mapping and not text.startswith('/'):
+            self.request_capital(account.account_id,self.control(account.account_id)['capital_mode'],text)
+            return
+        if name in ('/report','/rapor') and len(parts)==2:
+            from datetime import date
+            try:
+                day=date.fromisoformat(parts[1]).isoformat()
+            except ValueError:
+                self.send(account.account_id,'Tarih biçimi: /report 2026-11-07')
+                return
+            rows=(self.snapshot_provider(account.account_id) or {}).get('reports_by_day',{}).get(day,[])
+            if not rows:
+                self.send(account.account_id,'Bu gün için rapor yok. Son 7 gün için /history kullan.')
+                return
+            from trading.runtime.reports import format_daily_report
+            self.send(account.account_id,'\n'.join(row.get('version','')+'\n'+format_daily_report(row) for row in rows))
+            return
+        if name=='/history':
+            history=(self.snapshot_provider(account.account_id) or {}).get('reports_by_day',{})
+            text='Son 7 gün PAPER sonuçları (USDT)\n'
+            for day,rows in sorted(history.items(),reverse=True):
+                for row in rows:
+                    text+=f"{day} | {row.get('version')} | Kapanan {row['closed_trades']} | Net {row['net_pnl']:+.4f}\n"
+            self.send(account.account_id,text if history else 'Henüz günlük geçmiş yok.')
             return
         if name == '/close':
             if len(parts)==3:
@@ -208,11 +312,29 @@ class TelegramController:
             return
         if self.action_handler and self.action_handler(account_id, command):
             return
-        if command=='start':
+        if command in ('capital','capital_demo','capital_account','capital_amount','capital_full'):
+            if self.control(account_id)['capital_pending']:
+                self.send(account_id,'Önceki kasa değişikliği henüz tamamlanmadı. /status ile kontrol et.',buttons=True)
+                return
+            self.set_control(account_id,enabled=False)
+            if command=='capital':
+                self.set_control(account_id,capital_chosen=False,capital_input=False)
+                message='Kasa seçimini değiştir. Mevcut pozisyonlar kapanmadan yeni kasa uygulanmaz. Demo veya MEXC referanslı Paper seç.'
+            elif command=='capital_full':
+                self.request_capital(account_id,'account',allocation_mode='full')
+                return
+            else:
+                mode='demo' if command=='capital_demo' else 'account'
+                if command=='capital_amount':
+                    mode=self.control(account_id)['capital_mode'] or 'account'
+                self.set_control(account_id,capital_mode=mode,capital_input=True,capital_chosen=False)
+                message=('Sanal demo kasayı USDT olarak yaz. Örnek: 1000. Para yatırılmaz, MEXC anahtarı gerekmez.' if mode=='demo' else
+                         'MEXC hesabındaki bakiyeden PAPER için ayıracağın USDT tutarını yaz. Örnek: 1000. Ya da tam kullanılabilir bakiye düğmesini seç. Gerçek emir açılmaz.')
+        elif command=='start':
             state=self.control(account_id)
-            if not (self.linked(account_id) and state['version_chosen'] and state['profile_chosen']):
+            if not (self.capital_ready(account_id) and state['version_chosen'] and state['profile_chosen']):
                 self.set_control(account_id,enabled=False)
-                message='Başlatılmadı: önce bağlantı, analiz sürümü ve trader modu seçilmeli.\n'+self.settings_text(account_id)
+                message='Başlatılmadı: önce paper kasa, analiz sürümü ve trader modu seçilmeli.\n'+self.settings_text(account_id)
             else:
                 self.set_control(account_id,enabled=True,stopped=False)
                 message='Seçilen ayarlarla yeni paper girişleri açıldı.\n'+self.settings_text(account_id)
@@ -224,13 +346,13 @@ class TelegramController:
                 self.set_control(account_id,enabled=False,version_chosen=False,profile_chosen=False)
             message=self.settings_text(account_id)
         elif command in ('text','vlm'):
-            if not self.linked(account_id):
+            if not self.capital_ready(account_id):
                 message=self.settings_text(account_id)
             else:
                 self.set_control(account_id,version=command,version_chosen=True,profile_chosen=False,enabled=False)
                 message=self.settings_text(account_id)
         elif command in TRADER_MODES:
-            if not self.linked(account_id) or not self.control(account_id)['version_chosen']:
+            if not self.capital_ready(account_id) or not self.control(account_id)['version_chosen']:
                 message='Önce analiz sürümünü seç.\n'+self.settings_text(account_id)
             else:
                 mode={k:v for k,v in TRADER_MODES[command].items() if k!='label'}
@@ -239,6 +361,8 @@ class TelegramController:
         elif command in ('risk005','risk01'):
             self.set_control(account_id,enabled=False)
             message='Eski risk düğmesi kullanılmıyor. /settings ile analiz sürümü ve trader modunu sırayla seç.'
+        elif command=='report':
+            message=self.report_text(account_id)
         elif command in ('status','positions'):
             message=self.status_text(account_id,command=='positions')
         else:

@@ -74,3 +74,83 @@ def test_trader_profiles_change_effective_engine_and_limits():
     assert runner.cfg.risk_per_trade_pct==.005
     assert runner.cfg.paper_max_positions==2
     assert runner.cfg.daily_loss_limit_pct==.02
+
+
+def test_demo_capital_no_mexc_credentials_or_deposit(tmp_path,monkeypatch):
+    account=Account('demo',1,1,'','')
+    monkeypatch.setattr('trading.runtime.fleet.load_accounts',lambda *a,**kw:[account])
+    cfg=Settings(_env_file=None,runtime_db_path=str(tmp_path/'runtime'),shared_budget_db_path=str(tmp_path/'budget'),telegram_bot_token='fake',anthropic_api_key='')
+    fleet=Fleet(cfg)
+    try:
+        fleet.apply_capital(account,dict(id='seed',mode='demo',amount=1000,allocation_mode='fixed'))
+        runner=fleet.runners[('demo','text')]
+        assert not runner.cfg.require_mexc_balance
+        assert runner.cfg.paper_seed_usdt==1000
+        runner.account_client.get_futures_account=lambda:(_ for _ in ()).throw(AssertionError('must not fetch real account'))
+        result=runner.cycle()
+        assert result['paper']['equity']==1000
+        assert result['real_account'] is None
+        assert not result['live_orders_enabled']
+    finally:fleet.stop()
+
+
+def test_account_capital_fixed_slice_and_reject_excess(tmp_path,monkeypatch):
+    import time
+    from trading.exchange.account import FuturesAccount
+    account=Account('slice',1,1,'key','secret')
+    monkeypatch.setattr('trading.runtime.fleet.load_accounts',lambda *a,**kw:[account])
+    cfg=Settings(_env_file=None,runtime_db_path=str(tmp_path/'runtime'),shared_budget_db_path=str(tmp_path/'budget'),telegram_bot_token='fake')
+    fleet=Fleet(cfg)
+    try:
+        old=fleet.runners[('slice','text')]
+        old.account_client.get_futures_account=lambda:FuturesAccount(10000,9000,1000,0,time.time())
+        import pytest
+        with pytest.raises(ValueError,match='aşıyor'):
+            fleet.apply_capital(account,dict(id='bad',mode='account',amount=10000,allocation_mode='fixed'))
+        fleet.apply_capital(account,dict(id='good',mode='account',amount=1000,allocation_mode='fixed'))
+        for version in ('text','vlm'):
+            assert fleet.runners[('slice',version)].cfg.paper_allocation_usdt==1000
+        assert fleet.controller.control('slice')['capital_chosen']
+        assert not fleet.controller.control('slice')['enabled']
+    finally:fleet.stop()
+
+
+def test_stop_updates_tighten_only_and_queue_notification(tmp_path):
+    book=PaperLedger(RuntimeStore(str(tmp_path/'p')),500)
+    signal=CandidateSignal(symbol='BTC_USDT',side=Side.LONG,strategy=StrategyName.TREND,entry_price=100,stop_loss_price=98,take_profit_price=104,confidence=.8)
+    proposal=size_proposal_from_signal(signal,equity=500,risk_per_trade_pct=.01,target_leverage=3)
+    book.open(proposal,ContractRules(.001,1,1,1e8,5,.005,.01),99.99,100.01,'one',.01,.02)
+    p=book.positions['BTC_USDT'];opened=p['opened_at']
+    assert not book.update_stop('BTC_USDT',97,102,102.01,opened,'widen',1)
+    assert book.update_stop('BTC_USDT',100.5,102,102.01,opened,'confirmed structure',2)
+    assert book.positions['BTC_USDT']['initial_stop']==98
+    assert book.state['events'][-1]['kind']=='STOP_UPDATED'
+    assert not book.update_stop('BTC_USDT',101,102,102.01,opened,'duplicate evidence',2)
+
+
+def test_invalid_management_evidence_never_mutates_stop(tmp_path):
+    import pytest
+    book=PaperLedger(RuntimeStore(str(tmp_path/'p')),500)
+    signal=CandidateSignal(symbol='BTC_USDT',side=Side.LONG,strategy=StrategyName.TREND,entry_price=100,stop_loss_price=98,take_profit_price=104,confidence=.8)
+    proposal=size_proposal_from_signal(signal,equity=500,risk_per_trade_pct=.01,target_leverage=3)
+    book.open(proposal,ContractRules(.001,1,1,1e8,5,.005,.01),99.99,100.01,'one',.01,.02)
+    p=book.positions['BTC_USDT']
+    with pytest.raises(ValueError):
+        book.update_stop('BTC_USDT',100.5,102,102.01,p['opened_at'],'bad evidence',float('nan'))
+    assert p['stop']==98
+    assert book.store.get('paper')['positions']['BTC_USDT']['stop']==98
+
+
+def test_management_persistence_failure_latches_new_entry_gate(tmp_path,monkeypatch):
+    import sqlite3,time
+    from types import SimpleNamespace
+    store=RuntimeStore(str(tmp_path/'p'))
+    book=SimpleNamespace(positions={'BTC_USDT':{'opened_at':1}},update_stop=lambda *a:(_ for _ in ()).throw(sqlite3.OperationalError('disk')))
+    runner=SimpleNamespace(lock=store.lock,ledger=book)
+    public=SimpleNamespace(get_klines=lambda *a,**kw:{'candles':[]},get_ticker=lambda *a:SimpleNamespace(bid1=102,ask1=102.01,raw={'timestamp':time.time()*1000}),close=lambda:None)
+    monkeypatch.setattr('trading.runtime.fleet.MexcPublicClient',lambda **kw:public)
+    monkeypatch.setattr('trading.runtime.management.propose_management',lambda *a,**kw:dict(action='tighten_stop',new_stop=100.5,evidence_at=time.time()-1))
+    fleet=Fleet.__new__(Fleet)
+    fleet.cfg=Settings(_env_file=None)
+    fleet.manage_positions(('a','text'),runner)
+    assert runner.management_fatal

@@ -156,6 +156,10 @@ class PaperRunner:
             return self.status('HOLD_ACCOUNT_UNAVAILABLE')
         if self.ledger is None:
             seed = account.available if account else self.cfg.paper_seed_usdt
+            if account and self.cfg.paper_allocation_usdt is not None:
+                if self.cfg.paper_allocation_usdt > account.available:
+                    return self.status('HOLD_ALLOCATION_EXCEEDS_AVAILABLE')
+                seed = self.cfg.paper_allocation_usdt
             # Wait for a positive observed deposit; never fall back to 700 TRY.
             if seed <= 0:
                 return self.status('HOLD_WAITING_FOR_FUNDS')
@@ -170,6 +174,8 @@ class PaperRunner:
 
     def _entries(self, account):
         ledger = self.ledger
+        if getattr(self,'management_fatal',False):
+            return self.status('HOLD_MANAGEMENT_PERSISTENCE_FAILURE')
         evaluation_control = self.external_control() if self.external_control else None
         if evaluation_control and not evaluation_control.get('enabled'):
             return self.status('HOLD_TELEGRAM_PAUSED')
@@ -262,6 +268,8 @@ class PaperRunner:
                     return self.status('HOLD_SETTINGS_CHANGED')
             if self.protection:
                 self.protection.assert_ready()
+            if getattr(self,'management_fatal',False):
+                return self.status('HOLD_MANAGEMENT_PERSISTENCE_FAILURE')
             current = ledger.metrics()
             if current['liquidation_count'] or current['daily_loss_pct'] >= self.cfg.daily_loss_limit_pct or current['drawdown_pct'] >= self.cfg.drawdown_limit_pct:
                 return self.status('HOLD_LOSS_CIRCUIT_BREAKER')

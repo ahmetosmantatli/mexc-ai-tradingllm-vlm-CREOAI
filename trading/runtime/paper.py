@@ -32,6 +32,16 @@ class PaperLedger:
                               events=[], fees=0., funding=0., peak=seed, day=day_key(), day_start=seed,
                               realized=0., liquidation_count=0)
             self.save()
+        migrated=False
+        for position in self.positions.values():
+            if 'initial_stop' not in position and 'last_management_at' not in position:
+                position['initial_stop']=position['stop']
+                position['initial_risk_price']=abs(position['entry']-position['stop'])
+                position['entry_timeframe_seconds']=900
+                position['risk_basis_migrated']=True
+                migrated=True
+        if migrated:
+            self.save()
 
     @synchronized
     def save(self):
@@ -65,7 +75,7 @@ class PaperLedger:
     @synchronized
     def event(self, kind, **data):
         from uuid import uuid4
-        self.state['events'].append(dict(id=uuid4().hex, kind=kind, sent=False, **data))
+        self.state['events'].append(dict(id=uuid4().hex, kind=kind, sent=False, event_at=int(time()*1000), **data))
 
     @synchronized
     def open(self, proposal, rules, bid, ask, signal_key, max_risk_pct, liquidation_buffer):
@@ -106,7 +116,7 @@ class PaperLedger:
         self.positions[proposal.symbol] = dict(symbol=proposal.symbol, side=proposal.side.value,
             entry=entry, stop=sl, target=tp, quantity=quantity, contracts=contracts,
             notional=notional, leverage=proposal.leverage, margin=margin, liquidation=liq,
-            opened_at=int(time()*1000), unrealized=0., risk=budget, entry_fee=entry_fee, funding=0., funding_time=None)
+            initial_stop=sl, initial_risk_price=abs(entry-sl), entry_timeframe_seconds=900, price_step=rules.price_step, strategy=proposal.metadata.get('strategy','unknown'), management_policy='structure-v1', opened_at=int(time()*1000), unrealized=0., risk=budget, entry_fee=entry_fee, funding=0., funding_time=None)
         self.state['seen'].append(signal_key)
         self.event('OPEN', **self.positions[proposal.symbol], equity=self.equity)
         self.save()
@@ -119,6 +129,11 @@ class PaperLedger:
         p = self.positions[symbol]
         long = p['side'] == 'long'
         price = bid if long else ask
+        from trading.runtime.management import measure_excursions
+        try:
+            p.update(measure_excursions(p,bid,ask))
+        except (ValueError,KeyError,TypeError):
+            p['r_metrics_unavailable']=True
         p['unrealized'] = (price-p['entry'])*p['quantity']*(1 if long else -1)
         # Liquidation wins over stop on a gap through both levels.
         liquidated = fair <= p['liquidation'] if long else fair >= p['liquidation']
@@ -138,6 +153,12 @@ class PaperLedger:
             self.state['realized'] += net
             p['closed_at'] = int(time()*1000)
             p['close_net'] = net
+            p['gross_pnl'] = pnl
+            p['funding_at_close'] = p['funding']
+            p['exit_fee'] = fee
+            p['close_price'] = exit_price
+            p['exit_price'] = exit_price
+            p['close_reason'] = 'LIQ' if liquidated else 'SL' if stop else 'TP'
             self.state.setdefault('closed_positions', []).append(dict(p))
             del self.positions[symbol]
             self.event('CLOSE', symbol=symbol, side=p['side'], reason='LIQ' if liquidated else 'SL' if stop else 'TP',
@@ -176,6 +197,12 @@ class PaperLedger:
         self.state['realized']+=net
         position['closed_at']=int(time()*1000)
         position['close_net']=net
+        position['gross_pnl']=pnl
+        position['funding_at_close']=position['funding']
+        position['exit_fee']=fee
+        position['close_price']=price
+        position['exit_price']=price
+        position['close_reason']='MANUAL'
         self.state.setdefault('closed_positions',[]).append(dict(position))
         del self.positions[symbol]
         self.event('CLOSE',symbol=symbol,side=position['side'],reason='MANUAL',price=price,net_pnl=net,equity=self.equity)
@@ -196,9 +223,38 @@ class PaperLedger:
         self.state['funding'] += charge
         self.state['realized'] -= charge
         position['funding'] += charge
+        position['close_net'] = position.get('close_net',0)-charge
         position['funding_time'] = timestamp
         self.event('FUNDING_ADJUSTMENT', symbol=symbol, charge=charge, equity=self.equity)
         self.save()
+
+    @synchronized
+    def update_stop(self,symbol,new_stop,bid,ask,opened_at,reason,evidence_at):
+        p=self.positions.get(symbol)
+        if not p or p['opened_at']!=opened_at:
+            return False
+        if not all(isfinite(float(v)) and float(v)>0 for v in (new_stop,bid,ask)) or ask<bid:
+            raise ValueError('invalid stop update')
+        long=p['side']=='long'
+        if not isfinite(float(evidence_at)) or evidence_at<=0 or evidence_at>time():
+            raise ValueError('invalid management evidence time')
+        if evidence_at<=p.get('last_management_evidence_at',0):
+            return False
+        from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
+        step=Decimal(str(p.get('price_step',0)))
+        if step>0:
+            new_stop=float((Decimal(str(new_stop))/step).to_integral_value(rounding=ROUND_FLOOR if long else ROUND_CEILING)*step)
+        if not (p['stop']<new_stop<bid if long else ask<new_stop<p['stop']):
+            return False
+        old=p['stop']
+        p['stop']=new_stop
+        p['last_management_at']=evidence_at
+        p['last_management_evidence_at']=evidence_at
+        self.event('STOP_UPDATED',symbol=symbol,old_stop=old,new_stop=new_stop,reason=reason,
+                   evidence_at=evidence_at,entry=p['entry'],target=p['target'],
+                   unrealized=p['unrealized'],equity=self.equity,side=p['side'])
+        self.save()
+        return True
 
     @synchronized
     def roll_day(self):

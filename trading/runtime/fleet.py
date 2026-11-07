@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import threading
+import sqlite3
 import time
 
 from trading.agents.anthropic_client import AnthropicClient
@@ -51,6 +52,9 @@ class Fleet:
         self.last_funding = {}
         self.funding_health = {}
         self.last_status = {}
+        self.management_futures = {}
+        self.management_pool = ThreadPoolExecutor(max_workers=len(self.accounts)*2,thread_name_prefix="management")
+        self.last_management = {}
         self.budget_store = RuntimeStore(cfg.shared_budget_db_path)
         self.last_publish = {}
         for account in self.accounts:
@@ -66,7 +70,9 @@ class Fleet:
         for version in ('text','vlm'):
             session = self.control_store.get(f'account:{account.account_id}:session')
             directory = self.root/account.account_id/(session or 'initial')/version
-            overrides = dict(runtime_db_path=str(directory/'runtime.sqlite3'),
+            control=self.controller.control(account.account_id)
+            demo=control.get('capital_mode')=='demo'
+            overrides = dict(require_mexc_balance=not demo, paper_seed_usdt=control.get('capital_amount') or 0 if demo else 0, paper_allocation_usdt=control.get('capital_amount') if not demo else None, runtime_db_path=str(directory/'runtime.sqlite3'),
                 analysis_chart_dir=str(directory/'charts'), analysis_version=version,
                 mexc_api_key=account.mexc_api_key, mexc_api_secret=account.mexc_api_secret,
                 telegram_bot_token='', telegram_chat_id='')
@@ -91,6 +97,9 @@ class Fleet:
             future=self.funding_futures.get((ident,version))
             if future and not future.done():
                 raise ConnectionIssue('Hesap uzlaştırması sürüyor; biraz sonra tekrar dene.')
+            management=self.management_futures.get((ident,version))
+            if management and not management.done():
+                raise ConnectionIssue('Pozisyon yönetimi sürüyor; biraz sonra tekrar dene.')
             runner=self.runners[(ident,version)]
             with runner.lock:
                 if runner.ledger and runner.ledger.positions:
@@ -141,7 +150,7 @@ class Fleet:
     def entry_control(self, account_id, version):
         control = self.controller.control(account_id)
         result = dict(control)
-        result['enabled'] = (self.control_store.get(f'account:{account_id}:linked',False) and control.get('version_chosen',False) and control.get('profile_chosen',False) and control['enabled'] and not control.get('stopped',False) and not self.control_store.get(f'account:{account_id}:disconnected',False) and control['version']==version
+        result['enabled'] = ((control.get('capital_mode')=='demo' or self.control_store.get(f'account:{account_id}:linked',False)) and control.get('capital_chosen',False) and not control.get('capital_pending') and control.get('version_chosen',False) and control.get('profile_chosen',False) and control['enabled'] and not control.get('stopped',False) and (control.get('capital_mode')=='demo' or not self.control_store.get(f'account:{account_id}:disconnected',False)) and control['version']==version
                              and self.funding_health.get((account_id,version),False))
         return result
 
@@ -197,6 +206,25 @@ class Fleet:
         self.control_store.put(f'account:{account.account_id}:ai_notice',list(ai_state))
         if snapshot.get('real_account') and not self.control_store.get(f'account:{account.account_id}:disconnected',False):
             self.control_store.put(f'account:{account.account_id}:linked',True)
+        from trading.runtime.reports import daily_trade_report
+        snapshot['reports']=[]
+        snapshot['reports_by_day']={}
+        for version in ('text','vlm'):
+            r=self.runners[(account.account_id,version)]
+            with r.lock:
+                if r.ledger:
+                    report=daily_trade_report(copy.deepcopy(r.ledger.state),max_rows=5)
+                    report['version']=version
+                    snapshot['reports'].append(report)
+                    from datetime import datetime,timedelta
+                    from zoneinfo import ZoneInfo
+                    for offset in range(7):
+                        day=(datetime.now(ZoneInfo('Europe/Istanbul')).date()-timedelta(days=offset)).isoformat()
+                        history=daily_trade_report(copy.deepcopy(r.ledger.state),day=day,max_rows=5)
+                        history['version']=version
+                        snapshot['reports_by_day'].setdefault(day,[]).append(history)
+        snapshot['capital_mode']=self.controller.control(account.account_id).get('capital_mode')
+        snapshot['capital_amount']=self.controller.control(account.account_id).get('capital_amount')
         snapshot['version'] = selected
         snapshot['control'] = self.controller.control(account.account_id)
         snapshot['protection'] = runner.protection.snapshot()
@@ -226,6 +254,8 @@ class Fleet:
                              f"Büyüklük {event['notional']:.4f} USDT\n{event.get('rationale','')}\n")
                 elif event['kind']=='CLOSE':
                     text += f"İşlem kapandı: {event['reason']} | Net sonuç {event['net_pnl']:+.4f} USDT\n"
+                elif event['kind']=='STOP_UPDATED':
+                    text += f"Stop güncellendi: {event['old_stop']:.6g} → {event['new_stop']:.6g}\nGiriş {event['entry']:.6g} | TP {event['target']:.6g}\n{event['reason']}\n"
                 else:
                     text += f"Funding düzeltmesi: {event.get('charge',0):+.4f} USDT\n"
                 with r.lock:
@@ -270,11 +300,75 @@ class Fleet:
         runner.cfg.drawdown_limit_pct=drawdown
         runner.risk=RiskEngine(settings=runner.cfg)
 
+    def apply_capital(self,account,command):
+        import math
+        self.idle_account(account.account_id)
+        mode=command['mode']
+        if mode not in ('demo','account'):
+            raise ConnectionIssue('Geçersiz kasa türü.')
+        amount=command.get('amount')
+        selected=self.controller.control(account.account_id)['version']
+        old=self.runners[(account.account_id,selected)]
+        if mode=='account':
+            observed=old.account_client.get_futures_account()
+            if command.get('allocation_mode')=='full':
+                amount=observed.available
+            if amount is None or amount>observed.available:
+                raise ConnectionIssue('Seçilen tutar kullanılabilir Futures USDT bakiyesini aşıyor.')
+        if amount is None or not math.isfinite(float(amount)) or float(amount)<=0:
+            raise ConnectionIssue('Kasa tutarı pozitif USDT olmalı.')
+        self.controller.set_control(account.account_id,enabled=False,capital_mode=mode,capital_amount=float(amount),
+            allocation_mode=command.get('allocation_mode','fixed'),capital_chosen=True,capital_pending=None,
+            version_chosen=False,profile_chosen=False)
+        self.control_store.put(f'account:{account.account_id}:session',uuid4().hex)
+        self.replace_runners(account.account_id,old.cfg.mexc_api_key,old.cfg.mexc_api_secret)
+        self.controller.enqueue(account.account_id,f'PAPER kasası hazır: {amount:g} USDT. Gerçek emir yok. Şimdi VLM/görselsiz, sonra trader modunu seç.',event_id='capital-ready:'+command['id'])
+
+    def manage_positions(self,key,runner):
+        from trading.runtime.management import propose_management
+        public=MexcPublicClient(base_url=self.cfg.mexc_base_url,timeout_seconds=3)
+        try:
+            with runner.lock:
+                positions=copy.deepcopy(runner.ledger.positions) if runner.ledger else {}
+            for symbol,p in positions.items():
+                try:
+                    candles=public.get_klines(symbol,interval='Min15',limit=100)['candles']
+                    action=propose_management(p,candles,timeframe_seconds=900)
+                    if action.get('action')!='tighten_stop':
+                        continue
+                    quote=public.get_ticker(symbol)
+                    stamp=float(quote.raw['timestamp'])/1000
+                    if not -5<=time.time()-stamp<=self.cfg.market_max_age_seconds:
+                        continue
+                    with runner.lock:
+                        runner.ledger.update_stop(symbol,action['new_stop'],quote.bid1,quote.ask1,p['opened_at'],'Kapanmış mumlarda teyitli yapı ve ATR tamponu (deneysel)',action['evidence_at'])
+                except sqlite3.Error:
+                    runner.management_fatal=True
+                    logger.error('management persistence failure; entries blocked account=%s version=%s',*key)
+                    break
+                except Exception as exc:
+                    logger.warning('management skipped symbol=%s (%s)',symbol,type(exc).__name__)
+        finally:
+            public.close()
+
     def execute_commands(self, account):
         key=f'account:{account.account_id}:commands'
         commands=self.control_store.get(key,[])
         for command in commands:
             if command.get('status')!='pending':
+                continue
+            if command.get('kind')=='capital_reset':
+                jobs=[self.futures.get(account.account_id)]+[self.funding_futures.get((account.account_id,v)) for v in ('text','vlm')]+[self.management_futures.get((account.account_id,v)) for v in ('text','vlm')]
+                if any(job and not job.done() for job in jobs):
+                    continue
+                try:
+                    self.apply_capital(account,command)
+                    command['status']='done'
+                except Exception as exc:
+                    command['status']='failed'
+                    self.controller.set_control(account.account_id,enabled=False,capital_pending=None,capital_chosen=False)
+                    self.controller.enqueue(account.account_id,str(exc) if isinstance(exc,ConnectionIssue) else 'Kasa seçimi uygulanamadı; hesap ve açık pozisyon durumunu kontrol et.',event_id='capital-error:'+command['id'])
+                self.control_store.put(key,commands)
                 continue
             runner=self.runners[(account.account_id,command['version'])]
             try:
@@ -301,9 +395,16 @@ class Fleet:
         for account in self.accounts:
             self.execute_commands(account)
             control = self.controller.control(account.account_id)
+            if control.get('capital_pending'):
+                self.publish(account)
+                continue
             for version in ('text','vlm'):
                 key=(account.account_id,version)
                 runner=self.runners[key]
+                management=self.management_futures.get(key)
+                if (management is None or management.done()) and time.time()-self.last_management.get(key,0)>=self.cfg.management_interval_seconds:
+                    self.last_management[key]=time.time()
+                    self.management_futures[key]=self.management_pool.submit(self.manage_positions,key,runner)
                 future=self.funding_futures.get(key)
                 if (future is None or future.done()) and time.time()-self.last_funding.get(key,0)>60:
                     self.last_funding[key]=time.time()
@@ -323,5 +424,6 @@ class Fleet:
     def stop(self):
         self.pool.shutdown(wait=True,cancel_futures=True)
         self.funding_pool.shutdown(wait=True,cancel_futures=True)
+        self.management_pool.shutdown(wait=True,cancel_futures=True)
         for protection in self.protections:
             protection.stop()

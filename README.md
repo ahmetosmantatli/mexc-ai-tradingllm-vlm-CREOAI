@@ -121,3 +121,23 @@ Profiles are effective paper risk presets, not promised returns:
 Exchange contract limits, margin availability and stop-to-liquidation checks may reduce size or reject the setup. Profiles share the same candidate strategies and typed analysis pipeline; aggressive is a risk posture, not a new proven strategy. No settings enable live orders. Existing positions retain their recorded SL/TP/leverage when changing settings; newly proposed risk uses the new profile. A settings change while AI runs invalidates that in-flight entry.
 
 Messages resembling API credentials sent without a live `/connect` session are best-effort deleted and explicitly reported as **not saved**. The bot no longer responds to such input with a misleading generic menu. Do not post keys in screenshots; revoke/replace any exposed key on MEXC.
+
+## Demo capital, account allocation and management reports
+
+Telegram now starts with a PAPER capital choice, before analysis version/trader profile:
+
+- `/demo 1000`: create a 1,000 virtual USDT session. No MEXC link or deposit is required; public market data and a working AI key are still required for AI-selected trades.
+- `/capital 1000`: after MEXC link, seed an independent 1,000 USDT paper session from the account reference; reject if this exceeds observed available Futures USDT.
+- `/capital full`: snapshot the currently observed available Futures USDT as the paper seed. This does not transfer funds or continuously copy wallet changes.
+
+All amounts are **USDT**, not TRY. Both text/VLM variants receive the same chosen starting seed for a session. The choice is a simulation budget, not per-order notional or exchange margin. Existing paper PnL evolves independently. Capital changes pause entries, require no open positions and wait for in-flight jobs; each confirmed change creates a new session rather than rewriting old outcomes. Old sessions remain on disk for audit. Legacy accounts must choose capital explicitly before restarting entries. There is no live toggle or live order broker in this release.
+
+`/report` shows today's closed-trade results for both variants, trade direction/strategy/leverage, costs, reasons and observed R excursions. `/history` summarizes the latest seven days; `/report YYYY-MM-DD` selects a cached day within that window. Current equity and open PnL are separate from realized daily net PnL. Reports use Europe/Istanbul closure dates, include delayed funding corrections and label incomplete legacy records. Previous capital sessions are retained but not combined into current-session reports.
+
+New positions store immutable initial stop/risk and entry timeframe (currently 15m). Every supervised fresh quote updates observed gross-price R, MFE and MAE; these are samples, not reconstructed intracycle extrema. Leverage ROI is not R. Protection still checks current SL/TP independently of AI.
+
+A separate management job checks completed 15m candles. Experimental `paper-structure-trail-v1` requires at least +1 initial R at a closed candle and two confirmed post-entry higher lows (long) or lower highs (short); the latest pivot plus/minus 0.25 ATR14 buffer proposes a tighter stop. Confirmation radius is two candles. The ledger checks position identity, newer evidence, exchange price step, monotonic tightening and a fresh executable quote. It never widens stops or moves them every tick. Every accepted change queues a Telegram `STOP_UPDATED` notification containing old/new stop, reason, entry, TP and balance.
+
+This management is **deterministic research policy, not a Claude-selected stop move** and not a validated ICT system. The +1R, two-pivot, ATR14/0.25 parameters are experimental constants. No partial TP, automatic breakeven solely on a percent move, fixed one-hour exit or runtime strategy learning is implemented. Original stop remains active while waiting for structural evidence. Users should compare management-enabled/disabled results in replay before concluding it improves expectancy.
+
+Price supervision is not delayed by candle/model/Telegram calls. Management errors leave the existing stop unchanged; quote outages block new risk. The system does not place exchange stops, so no execution guarantee is implied. Screenshot interpretation alone cannot establish historical fills or confirm ICT causality; exchange-specific OHLCV and timestamped decisions are needed.

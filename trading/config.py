@@ -148,6 +148,8 @@ class Settings(BaseSettings):
     position_poll_seconds: float = Field(default=5, ge=1, le=60)
     runtime_db_path: str = "data/runtime.sqlite3"
     require_mexc_balance: bool = True
+    paper_allocation_usdt: float | None = Field(default=None, gt=0)
+    management_interval_seconds: float = Field(default=30, ge=5)
     paper_seed_usdt: float = Field(default=0, ge=0)
     paper_fee_rate: float = Field(default=0.0006, ge=0, le=0.01)
     paper_slippage_bps: float = Field(default=5, ge=0, le=100)
