@@ -188,6 +188,7 @@ def test_telegram_demo_to_trade_stop_update_close_report_and_restart(tmp_path,mo
         message('/run')
         assert fleet.controller.control('demo')['enabled']
         runner=fleet.runners[('demo','text')]
+        runner.external_scan=False  # Exercise the standalone synchronous test path.
         Fleet.apply_trader_mode(runner,fleet.controller.control('demo'))
         fleet.funding_health[('demo','text')]=True
         control_provider=runner.external_control
@@ -237,3 +238,41 @@ def test_telegram_demo_to_trade_stop_update_close_report_and_restart(tmp_path,mo
         assert restarted.runners[('demo','text')].ledger.equity==ending
         assert not restarted.controller.control('demo')['enabled']
     finally:restarted.stop()
+
+
+def test_fleet_scanning_continues_while_model_is_blocked_and_pause_stops_new_scans(tmp_path,monkeypatch):
+    import threading,time
+    monkeypatch.setattr('trading.runtime.fleet.PositionProtection.start',lambda self:self)
+    account=Account('demo',7,7,'','')
+    monkeypatch.setattr('trading.runtime.fleet.load_accounts',lambda *a,**kw:[account])
+    cfg=Settings(_env_file=None,runtime_db_path=str(tmp_path/'runtime'),shared_budget_db_path=str(tmp_path/'budget'),telegram_bot_token='fake')
+    fleet=Fleet(cfg)
+    entered=threading.Event();release=threading.Event();scanned=threading.Event()
+    runner=fleet.runners[('demo','text')]
+    fleet.controller.tick=lambda:None
+    fleet.publish=lambda account:None
+    fleet.controller.set_control('demo',enabled=True,stopped=False,capital_mode='demo',capital_amount=500,capital_chosen=True,version='text',version_chosen=True,profile_chosen=True)
+    fleet.last_scan_schedule[('demo','text')]=time.time()
+    def analysis():
+        entered.set()
+        assert release.wait(5)
+    runner.cycle=analysis
+    runner.scan_market=lambda:scanned.set()
+    fleet.funding_pool.submit=lambda *a,**kw:None
+    fleet.management_pool.submit=lambda *a,**kw:None
+    try:
+        fleet.tick()
+        assert entered.wait(1)
+        fleet.last_scan_schedule[('demo','text')]=0
+        fleet.tick()
+        assert scanned.wait(1)
+        assert not fleet.futures['demo'].done()
+        fleet.scan_futures[('demo','text')].result(timeout=1)
+        scanned.clear()
+        fleet.controller.set_control('demo',enabled=False,stopped=True)
+        fleet.last_scan_schedule[('demo','text')]=0
+        fleet.tick()
+        assert not scanned.is_set()
+    finally:
+        release.set()
+        fleet.stop()

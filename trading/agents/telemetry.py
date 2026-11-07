@@ -48,6 +48,10 @@ def human_reason(reason):
     known={
         'HOLD_EVALUATION_INTERVAL':'Bir sonraki analiz zamanı bekleniyor; şu anda yeni AI isteği gönderilmiyor.',
         'HOLD_SCAN_INTERVAL':'Yeni piyasa taraması bekleniyor.',
+        'HOLD_QUEUE_EMPTY':'Güncel aday kuyruğu boş; bağımsız tarama sürüyor.',
+        'HOLD_CANDIDATE_STALE':'Aday analiz sırasında eskidi veya taramada değişti; işlem açılmadı.',
+        'HOLD_DUPLICATE_OR_ALREADY_OPEN':'Bu mum için işlem zaten kaydedilmiş veya paritede açık işlem var; yeni işlem açılmadı.',
+        'HOLD_CANDIDATE_PRICE_DRIFT':'Sıradaki adayın fiyatı değişti; taramada güncellenmesi bekleniyor.',
         'HOLD_TELEGRAM_PAUSED':'Yeni işlem arayışı duraklatıldı.',
         'HOLD_NO_QUALIFIED_SIGNAL':'Henüz kurallara uyan yeni işlem adayı yok.',
         'HOLD_CLAUDE_DECISION_OR_FAILURE':'Son analiz işlem açılmasına izin vermedi; son analiz sonucunu kontrol et.',
@@ -115,6 +119,8 @@ def provider_result(attempt):
         'network_error':'bağlantı hatası',
         'json_generation_failed':'istenen karar biçiminde yanıt üretemedi',
         'invalid_decision_schema':'karar biçimi geçersizdi',
+        'output_truncated':'yanıt çıktı sınırında kesildi; eksik karar kullanılmadı',
+        'missing_decision_tool':'istenen karar aracı yanıtı gelmedi',
         'invalid_output_or_local_validation':'yanıt geçersizdi veya yerel kontrolden geçmedi',
         'authentication_or_permission':'anahtar veya erişim izni reddedildi',
         'model_unavailable':'model bu hesapta kullanılamıyor',
@@ -137,6 +143,15 @@ def format_trace(trace):
     """Simple outcome notification. Technical request details stay in diagnostics."""
     strategy={'trend':'trend takibi','momentum':'ivme takibi','mean_reversion':'ortalamaya dönüş'}.get(trace.get('strategy'),'aday incelemesi')
     text=f"{trace_outcome(trace)}\n{trace.get('symbol','?')} | {strategy}\n"
+    if trace.get('rationale'):
+        text+='AI gerekçesi: '+str(trace['rationale'])[:1200]+'\n'
+    if trace.get('watch_note') and trace.get('action') in ('hold','watch'):
+        text+='Takip notu: '+str(trace['watch_note'])[:600]+'\n'
+    if trace.get('invalidation'):
+        text+='Planı geçersiz kılan koşul: '+str(trace['invalidation'])[:500]+'\n'
+    if trace.get('why_reconsidered'):
+        changed=trace['why_reconsidered']
+        text+='Yeniden bakma nedeni: '+str(changed.get('summary','') if isinstance(changed,dict) else changed)[:400]+'\n'
     if trace.get('execution_status')=='rejected':
         text+=human_reason(trace.get('execution_reason'))+'\n'
     for attempt in trace.get('attempts',[]):

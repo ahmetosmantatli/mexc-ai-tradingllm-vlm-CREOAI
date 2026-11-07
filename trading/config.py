@@ -107,8 +107,11 @@ class Settings(BaseSettings):
     worker_loop_interval_seconds: float = Field(
         default=60.0,
         ge=1.0,
-        description="Seconds between scan → propose → risk → paper cycles.",
+        description="Seconds between independent market scans; AI evaluations have a separate minimum interval.",
     )
+    candidate_ttl_seconds: float = Field(default=900,ge=30,le=3600)
+    candidate_queue_limit: int = Field(default=80,ge=1,le=500)
+    anthropic_decision_max_tokens: int = Field(default=1200,ge=700,le=4096)
     default_target_leverage: float = Field(default=10.0, gt=0, le=25.0)
 
     # --- Scanner ---

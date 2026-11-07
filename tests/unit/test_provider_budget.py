@@ -167,3 +167,120 @@ def test_early_stop_and_missing_key_replace_previous_attempt(tmp_path):
     assert llm.last_attempt['status'] == 'missing_key'
     assert llm.last_attempt['phase'] == 'prepare'
     assert llm.last_attempt['estimated_cost_usd'] is None
+
+
+DECISION_SCHEMA = dict(type='object', properties={
+    'action':dict(type='string', enum=['hold','watch','trade']),
+    'signal_id':dict(type=['string','null']),
+}, required=['action','signal_id'], additionalProperties=False)
+
+
+def structured_client(tmp_path, *, blocks=None, stop_reason='tool_use'):
+    llm,store,_=client(tmp_path)
+    llm.decision_schema=DECISION_SCHEMA
+    count_args=[]; generation_args=[]
+    def count(**kwargs):
+        count_args.append(kwargs)
+        return SimpleNamespace(input_tokens=200)
+    def create(**kwargs):
+        generation_args.append(kwargs)
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=200,output_tokens=40),
+            stop_reason=stop_reason, content=blocks if blocks is not None else [
+                SimpleNamespace(type='tool_use',name='submit_trade_decision',input={'action':'hold','signal_id':None})])
+    llm._client=SimpleNamespace(messages=SimpleNamespace(count_tokens=count,create=create))
+    return llm,store,count_args,generation_args
+
+
+def test_forced_tool_decision_uses_counted_payload_and_larger_output_budget(tmp_path):
+    llm,store,counts,generations=structured_client(tmp_path)
+    result=llm.complete_json(system='private instructions',user='private context',max_tokens=700)
+    assert result=={'action':'hold','signal_id':None}
+    assert len(counts)==len(generations)==1
+    arguments=dict(generations[0]); output_limit=arguments.pop('max_tokens')
+    assert output_limit==getattr(llm.settings,'anthropic_decision_max_tokens',1200)
+    assert counts[0]==arguments
+    assert arguments['tool_choice']==dict(type='tool',name='submit_trade_decision',disable_parallel_tool_use=True)
+    assert arguments['tools'][0]['input_schema']==DECISION_SCHEMA
+    assert arguments['tools'][0]['strict'] is True
+    assert llm.last_attempt['output_stop_reason']=='tool_use'
+    assert llm.last_attempt['validation_issues']==[]
+    assert store.get('ai_budget')['successful_calls']==1
+    assert 'private context' not in str(llm.last_attempt)
+
+
+@pytest.mark.parametrize('blocks,reason,category', [
+    ([SimpleNamespace(type='text',text='private provider explanation')],'end_turn','missing_decision_tool'),
+    ([SimpleNamespace(type='tool_use',name='unknown_tool',input={'private':'secret'})],'tool_use','missing_decision_tool'),
+    ([SimpleNamespace(type='tool_use',name='submit_trade_decision',input='private malformed input')],'tool_use','invalid_tool_input'),
+    ([], 'refusal','model_refusal'),
+    ([SimpleNamespace(type='tool_use',name='submit_trade_decision',input={'action':'hold','signal_id':None})],'max_tokens','output_truncated'),
+    ([SimpleNamespace(type='tool_use',name='submit_trade_decision',input={'action':'hold','signal_id':None})],'model_context_window_exceeded','output_truncated'),
+])
+def test_structured_failures_hold_without_retry_or_erasing_usage(tmp_path,blocks,reason,category):
+    llm,store,counts,generations=structured_client(tmp_path,blocks=blocks,stop_reason=reason)
+    assert llm.complete_json(system='private',user='private') is None
+    assert len(counts)==len(generations)==1
+    assert llm.last_attempt['error_category']==category
+    assert llm.last_attempt['output_stop_reason']==reason
+    assert llm.last_attempt['validation_issues']
+    assert llm.last_attempt['estimated_cost_usd']>0
+    assert store.get('ai_budget')['successful_calls']==1
+    assert store.get('ai_budget')['reservations']=={}
+    assert 'private' not in str(llm.last_attempt)
+    assert 'secret' not in str(llm.last_attempt)
+
+
+def test_legacy_json_truncation_also_rejected_even_when_parseable(tmp_path):
+    llm,store,calls=client(tmp_path)
+    llm._client.messages.create=lambda **kw:SimpleNamespace(
+        usage=SimpleNamespace(input_tokens=100,output_tokens=10),stop_reason='max_tokens',
+        content=[SimpleNamespace(type='text',text='{"ok":true}')])
+    assert llm.complete_json(system='JSON',user='test') is None
+    assert llm.last_status=='output_truncated'
+    assert store.get('ai_budget')['successful_calls']==1
+
+
+def test_router_forwards_schema_and_checks_unknown_signal_without_retry(tmp_path):
+    from trading.agents.provider_router import ProviderRouter
+    cfg=Settings(_env_file=None,anthropic_api_key='test',ai_primary_provider='anthropic')
+    store=RuntimeStore(str(tmp_path/'router.sqlite3'))
+    router=ProviderRouter(cfg,Budget(store,cfg),store)
+    router.decision_schema=DECISION_SCHEMA
+    counts=[];generations=[]
+    def count(**kwargs):
+        counts.append(kwargs)
+        return SimpleNamespace(input_tokens=200)
+    def create(**kwargs):
+        generations.append(kwargs)
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=200,output_tokens=40),stop_reason='tool_use',
+            content=[SimpleNamespace(type='tool_use',name='submit_trade_decision',input={'action':'trade','signal_id':'private-unknown-signal'})])
+    router.claude._client=SimpleNamespace(messages=SimpleNamespace(count_tokens=count,create=create))
+    def validate(payload):
+        if payload['signal_id']!='allowed':
+            raise ValueError('private-unknown-signal')
+    router.response_validator=validate
+    assert router.complete_json(system='private instructions',user='private context') is None
+    assert len(counts)==len(generations)==1
+    attempt=router.last_trace['attempts'][0]
+    assert attempt['status']=='invalid_schema'
+    assert attempt['validation_issues']==[dict(field='response',type='custom_validation')]
+    assert 'private-unknown-signal' not in str(attempt)
+    assert store.get('ai_budget')['successful_calls']==1
+    router.close()
+
+
+def test_router_validation_issues_use_only_known_fields_and_categories(tmp_path):
+    from pydantic import BaseModel,ConfigDict,Field
+    from trading.agents.provider_router import ProviderRouter
+    class Decision(BaseModel):
+        model_config=ConfigDict(extra='forbid')
+        action:str=Field(pattern='^(hold|watch|trade)$')
+    router=ProviderRouter(Settings(_env_file=None),None,RuntimeStore(str(tmp_path/'router.sqlite3')))
+    router.decision_schema=Decision.model_json_schema()
+    try:
+        Decision.model_validate({'action':'private-value','private-secret-key':'private-secret-value'})
+    except Exception as exc:
+        issues=router._validation_issues(exc)
+    assert issues==[dict(field='action',type='string_pattern_mismatch'),dict(field='field',type='extra_forbidden')]
+    assert 'private' not in str(issues)
+    router.close()

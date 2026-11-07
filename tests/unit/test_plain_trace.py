@@ -33,3 +33,21 @@ def test_quota_skip_distinguishes_temporary_shared_limit_from_rejection():
     text=format_trace(dict(base,attempts=[rejected]))
     assert 'token/kota sınırına takıldı' in text
     assert 'istek gönderilmedi' not in text
+
+
+def test_wait_notification_explains_reason_and_changed_context_in_turkish():
+    trace=dict(symbol='ONE_USDT',strategy='momentum',status='completed',action='hold',execution_status='not_opened',
+        rationale='15 dakika kapanışı eski tepenin üstünde değil.',watch_note='Tepenin üstünde kapanış bekle.',
+        invalidation='Son dip kırılırsa plan iptal.',
+        why_reconsidered={'summary':'Kapanmış mum verisi değişti: 5m. Önceki kurulum kartı korunuyor.','reason':'closed_context_changed'},attempts=[])
+    text=format_trace(trace)
+    assert 'AI gerekçesi: 15 dakika kapanışı' in text
+    assert 'Takip notu: Tepenin üstünde' in text
+    assert 'Yeniden bakma nedeni: Kapanmış mum verisi değişti: 5m.' in text
+    assert 'closed_context_changed' not in text
+    assert 'Sanal işlem açıldı' not in text
+
+
+def test_claude_truncated_response_has_a_plain_failure_reason():
+    from trading.agents.telemetry import provider_result
+    assert 'kesildi' in provider_result({'provider':'anthropic','status':'output_truncated','error_category':'output_truncated'})

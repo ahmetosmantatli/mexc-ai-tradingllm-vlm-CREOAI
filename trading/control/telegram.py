@@ -141,7 +141,7 @@ class TelegramController:
     @staticmethod
     def algorithm_text():
         return ('Aday algoritmaları: trend SMA8/21, momentum ROC12, ortalamaya dönüş SMA20 (15dk). '
-                'Sabit yüzde ağırlık yok; uygun adaylar arasından en yüksek puan değerlendirilir. '
+                'Sabit yüzde ağırlık yok; güncel adaylar bekleme sırasına göre dönüşümlü değerlendirilir. '
                 'Aday puanı başarı olasılığı değildir. AI ayrıca 4s/15dk/5dk yapısını değerlendirir.')
 
     @staticmethod
@@ -158,6 +158,17 @@ class TelegramController:
             age=max(0,time.time()-scan.get('at',time.time()))
             text += (f"Son tarama: {age:.0f} sn önce | Parite {scan.get('scanned',0)} | Likidite filtresini geçen {scan.get('kept',0)}\n"
                      f"Üretilen aday {scan.get('candidates',0)} | AI için uygun {scan.get('eligible',0)}\n")
+            if scan.get('duration_seconds') is not None:
+                text+=f"Tarama süresi: {scan['duration_seconds']:.2f} sn\n"
+            if scan.get('errors'):
+                text+=f"Veri hatası nedeniyle atlanan parite: {len(scan['errors']) if isinstance(scan['errors'],dict) else scan['errors']}\n"
+        queue=snapshot.get('queue_status') or {}
+        if queue:
+            text+=f"Kuyruktaki güncel aday: {queue.get('size',0)}\n"
+            if queue.get('next_symbol'):
+                text+=f"Sıradaki aday: {queue['next_symbol']}\n"
+        if snapshot.get('scan_stage')=='scanning_market':
+            text+='Yeni tarama arka planda sürüyor; AI bekleme aralığından bağımsız.\n'
         next_at=snapshot.get('next_evaluation_at')
         if next_at:
             text += f"Sonraki AI değerlendirmesine en az {max(0,next_at-time.time()):.0f} sn; uygun yeni aday gerekir.\n"
@@ -181,6 +192,13 @@ class TelegramController:
             score_text=f"{score:.2f}" if isinstance(score,(int,float)) else '?'
             text += (f"\nAnaliz {trace.get('id','?')} | {trace.get('symbol','?')} | {trace.get('strategy','?')}\n"
                      f"Aday puanı {score_text} (olasılık değil) | Sonuç: {trace.get('status','?')}\n")
+            if trace.get('rationale'):
+                text+='Gerekçe: '+str(trace['rationale'])[:500]+'\n'
+            if trace.get('why_reconsidered'):
+                changed=trace['why_reconsidered']
+                text+='Değişiklik: '+str(changed.get('summary','') if isinstance(changed,dict) else changed)[:250]+'\n'
+            if trace.get('context_policy'):
+                text+=f"Bağlam: {trace['context_policy']} | Gönderi: {trace.get('prompt_bytes','?')} bayt\n"
             attempts=trace.get('attempts') or []
             text += f"Sağlayıcı denemesi: {len(attempts)}\n"
             for attempt in attempts[-4:]:
@@ -190,6 +208,10 @@ class TelegramController:
                 if errors:
                     text+=' | '.join(errors)+'\n'
                 text+=f"Üretim isteği {attempt.get('generation_requests',0)} | Token sayımı {attempt.get('count_requests',0)}\n"
+                if attempt.get('output_stop_reason'):
+                    text+=f"Yanıt bitiş nedeni: {attempt['output_stop_reason']}\n"
+                if attempt.get('validation_issues'):
+                    text+='Karar doğrulama alanları: '+str(attempt['validation_issues'])[:250]+'\n'
                 incoming,outgoing=attempt.get('input_tokens'),attempt.get('output_tokens')
                 if incoming is not None or outgoing is not None:
                     text+=f"Token girdi/çıktı: {incoming if incoming is not None else '?'} / {outgoing if outgoing is not None else '?'}\n"

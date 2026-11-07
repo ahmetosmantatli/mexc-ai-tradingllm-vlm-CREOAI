@@ -12,6 +12,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable
 import httpx
+import copy
 
 from trading.config import Settings, get_settings
 
@@ -28,6 +29,7 @@ class AnthropicClient:
     last_status: str = "not_called"
     successful_calls: int = 0
     last_attempt: dict[str, Any] = field(default_factory=dict, repr=False)
+    decision_schema: dict[str, Any] | None = field(default=None, repr=False)
     can_call: Callable[[], bool] | None = field(default=None, repr=False)
     _client: Any = field(default=None, repr=False, init=False)
 
@@ -68,10 +70,14 @@ class AnthropicClient:
         reservation = None
         reserved_cost = 0.
         model = self.model or self.settings.anthropic_model
+        schema = copy.deepcopy(self.decision_schema)
+        if schema is not None:
+            max_tokens = max(max_tokens, getattr(self.settings, 'anthropic_decision_max_tokens', 1200))
         attempt = dict(provider='anthropic', model=model, status='preparing', phase='prepare',
                        http_status=None, error_category='', latency_ms=0,
                        count_requests=0, generation_requests=0,
-                       input_tokens=None, output_tokens=None, estimated_cost_usd=None, pending_usd=0.)
+                       input_tokens=None, output_tokens=None, estimated_cost_usd=None, pending_usd=0.,
+                       output_stop_reason=None, validation_issues=[])
         self.last_attempt = attempt
         try:
             if self.can_call is not None and not self.can_call():
@@ -86,6 +92,12 @@ class AnthropicClient:
                 content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png",
                     "data": base64.b64encode(Path(path).read_bytes()).decode("ascii")}})
             arguments = dict(model=model, system=system, messages=[{"role": "user", "content": content}])
+            if schema is not None:
+                arguments.update(
+                    tools=[dict(name='submit_trade_decision',
+                        description='Submit the single structured decision for the supplied candidate. This does not execute an order.',
+                        input_schema=schema, strict=True)],
+                    tool_choice=dict(type='tool', name='submit_trade_decision', disable_parallel_tool_use=True))
             if self.budget is not None:
                 if not self.budget.can_spend():
                     self.last_status = "budget_exhausted"
@@ -122,6 +134,35 @@ class AnthropicClient:
                 reservation = None
             self.successful_calls += 1
             self.last_status = "success"
+            stop_reason = getattr(message, 'stop_reason', None)
+            allowed_reasons = {'end_turn','max_tokens','stop_sequence','tool_use','pause_turn','refusal','model_context_window_exceeded'}
+            attempt['output_stop_reason'] = stop_reason if stop_reason in allowed_reasons else 'unknown' if stop_reason is not None else None
+            if stop_reason == 'max_tokens' or stop_reason == 'model_context_window_exceeded':
+                self.last_status = 'output_truncated'
+                attempt['error_category'] = 'output_truncated'
+                attempt['validation_issues'] = [dict(field='response', type='output_truncated')]
+                return None
+            if stop_reason == 'refusal':
+                self.last_status = 'model_refusal'
+                attempt['error_category'] = 'model_refusal'
+                attempt['validation_issues'] = [dict(field='response', type='model_refusal')]
+                return None
+            if schema is not None:
+                def attr(block, name, default=None):
+                    return block.get(name, default) if isinstance(block, dict) else getattr(block, name, default)
+                tools = [block for block in message.content if attr(block, 'type') == 'tool_use']
+                if stop_reason != 'tool_use' or len(tools) != 1 or attr(tools[0], 'name') != 'submit_trade_decision':
+                    self.last_status = 'error_or_invalid_output'
+                    attempt['error_category'] = 'missing_decision_tool'
+                    attempt['validation_issues'] = [dict(field='response', type='missing_decision_tool')]
+                    return None
+                result = attr(tools[0], 'input')
+                if not isinstance(result, dict):
+                    self.last_status = 'error_or_invalid_output'
+                    attempt['error_category'] = 'invalid_tool_input'
+                    attempt['validation_issues'] = [dict(field='response', type='object_required')]
+                    return None
+                return result
             text_parts: list[str] = []
             for block in message.content:
                 text = getattr(block, "text", None)
@@ -166,6 +207,7 @@ class AnthropicClient:
                 attempt['error_category'] = 'provider_server_error'
             elif attempt['input_tokens'] is not None:
                 attempt['error_category'] = 'invalid_output'
+                attempt['validation_issues'] = [dict(field='response', type='invalid_json' if isinstance(exc, json.JSONDecodeError) else 'invalid_output')]
             else:
                 attempt['error_category'] = 'transport_or_local_error'
             logger.warning("Anthropic call failed; using stub fallback: %s", type(exc).__name__)

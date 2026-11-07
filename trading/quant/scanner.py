@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 import time
+import sqlite3
 
 from trading.exchange.mexc_public import MexcPublicClient, TickerSnapshot
 from trading.quant.signals import CandidateSignal
@@ -40,6 +42,8 @@ class ScanResult:
     kept: int
     filtered_out: dict[str, str] = field(default_factory=dict)
     candidates: list[CandidateSignal] = field(default_factory=list)
+    errors: dict[str,str] = field(default_factory=dict)
+    duration_seconds: float = 0.0
 
 
 @dataclass
@@ -53,9 +57,18 @@ class MarketScanner:
     kline_limit: int = 60
     prefer_fee_free: bool = True
     max_symbols: int = 40
+    max_workers: int = 4
 
     def scan(self, symbols: Sequence[str] | None = None) -> ScanResult:
-        fee_free = set(s.upper() for s in self.client.list_fee_free_candidates())
+        started=time.monotonic()
+        errors={}
+        try:
+            fee_free = set(s.upper() for s in self.client.list_fee_free_candidates())
+        except sqlite3.Error:
+            raise
+        except Exception as exc:
+            fee_free=set()
+            errors['fee_free_metadata']=type(exc).__name__
         universe = list(symbols) if symbols is not None else self.client.list_contract_symbols()
         if self.prefer_fee_free and fee_free and symbols is None:
             # Prefer fee-free first, then fill remaining slots.
@@ -68,36 +81,50 @@ class MarketScanner:
         candidates: list[CandidateSignal] = []
         kept = 0
 
-        for symbol in universe:
-            sym = symbol.upper()
-            ticker = self.client.get_ticker(sym)
-            ok, reason = self.liquidity.passes(ticker)
-            if not ok:
-                filtered_out[sym] = reason
-                continue
-            kept += 1
-            klines = self.client.get_klines(sym, interval=self.kline_interval, limit=self.kline_limit)
-            candles = klines.get("candles") or []
-            if not self.client.use_fixtures:
-                candles = [c for c in candles if isinstance(c, list) and len(c) >= 5 and float(c[0])+900 <= time.time()]
-                if not candles or time.time()-(float(candles[-1][0])+900) > 1200:
-                    filtered_out[sym] = "STALE_OR_MISSING_CANDLES"
-                    continue
-            ctx = StrategyContext(
-                symbol=sym,
-                last_price=float(ticker.last_price or 0.0),
-                klines=candles,
-                fee_free_pair=sym in fee_free or bool(ticker.fee_free),
-                quote_volume_24h=ticker.quote_volume_24h,
-            )
-            candidates.extend(run_strategies(ctx, self.strategies))
+        def inspect(symbol):
+            sym=symbol.upper()
+            passed=False
+            try:
+                ticker=self.client.get_ticker(sym)
+                ok,reason=self.liquidity.passes(ticker)
+                if not ok:
+                    return sym,False,[],reason,None
+                passed=True
+                klines=self.client.get_klines(sym,interval=self.kline_interval,limit=self.kline_limit)
+                candles=klines.get('candles') or []
+                if not getattr(self.client,'use_fixtures',False):
+                    candles=[c for c in candles if isinstance(c,list) and len(c)>=5 and float(c[0])+900<=time.time()]
+                    if not candles or time.time()-(float(candles[-1][0])+900)>1200:
+                        return sym,passed,[],'STALE_OR_MISSING_CANDLES',None
+                ctx=StrategyContext(symbol=sym,last_price=float(ticker.last_price or 0),klines=candles,
+                    fee_free_pair=sym in fee_free or bool(ticker.fee_free),quote_volume_24h=ticker.quote_volume_24h)
+                produced=run_strategies(ctx,self.strategies)
+                for candidate in produced:
+                    if candles:
+                        candidate.features.update(source_open_at=candles[-1][0],source_closed_at=float(candles[-1][0])+900)
+                return sym,passed,produced,None,None
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                return sym,passed,[],'SYMBOL_DATA_ERROR',type(exc).__name__
+
+        # httpx clients may be shared between threads. Metadata calls above have
+        # initialized the dedicated scan client's connection pool before workers.
+        with ThreadPoolExecutor(max_workers=max(1,min(self.max_workers,4)),thread_name_prefix='market-scan') as pool:
+            for sym,passed,produced,reason,error in pool.map(inspect,universe):
+                kept+=int(passed)
+                candidates.extend(produced)
+                if reason:
+                    filtered_out[sym]=reason
+                if error:
+                    errors[sym]=error
 
         candidates.sort(key=lambda c: c.confidence, reverse=True)
         return ScanResult(
             scanned=len(universe),
             kept=kept,
             filtered_out=filtered_out,
-            candidates=candidates,
+            candidates=candidates, errors=errors, duration_seconds=time.monotonic()-started,
         )
 
     def scan_to_dicts(self, symbols: Sequence[str] | None = None) -> dict[str, Any]:

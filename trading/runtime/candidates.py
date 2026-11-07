@@ -1,0 +1,72 @@
+"""Durable, bounded candidate rotation independent of provider call cadence."""
+from time import time
+
+from trading.quant.signals import CandidateSignal
+
+
+def candidate_key(candidate):
+    return f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}'
+
+
+class CandidateQueue:
+    def __init__(self, store, ttl_seconds=900, limit=80):
+        self.store,self.ttl,self.limit=store,ttl_seconds,limit
+
+    def refresh(self, candidates, now=None):
+        now=time() if now is None else now
+        with self.store.lock:
+            previous={row['key']:row for row in self.store.get('candidate_queue',[])}
+            current={}
+            for candidate in candidates:
+                key=candidate_key(candidate)
+                old=previous.get(key,{})
+                closed_at=candidate.features.get('source_closed_at',now)
+                if closed_at>now or now-closed_at>1200:
+                    continue
+                current[key]=dict(key=key,signal=candidate.model_dump(mode='json'),
+                    first_seen=old.get('first_seen',now),refreshed_at=now,
+                    expires_at=min(now+self.ttl,closed_at+1200),
+                    last_considered_at=old.get('last_considered_at',0),
+                    last_evaluated_at=old.get('last_evaluated_at',0))
+            # Keep the currently strongest candidates if the bounded queue is full;
+            # rotation is by last-considered time inside that eligible population.
+            rows=sorted(current.values(),key=lambda r:(-r['signal']['confidence'],r['first_seen'],r['key']))[:self.limit]
+            self.store.put('candidate_queue',rows)
+            return len(rows)
+
+    def next(self, *, now=None, open_symbols=(), seen=()):
+        now=time() if now is None else now
+        with self.store.lock:
+            rows=[r for r in self.store.get('candidate_queue',[]) if r['expires_at']>now]
+            self.store.put('candidate_queue',rows)
+            eligible=[r for r in rows if r['signal']['symbol'] not in open_symbols and r['signal'].get('features',{}).get('dedup_key') not in seen]
+            if not eligible:
+                return None
+            row=min(eligible,key=lambda r:(r['last_considered_at'],r['first_seen'],-r['signal']['confidence'],r['key']))
+            # Reserve consideration before slow provider work; concurrent scans
+            # preserve this timestamp, so a refreshed top signal cannot starve peers.
+            row['last_considered_at']=now
+            self.store.put('candidate_queue',rows)
+            return CandidateSignal.model_validate(row['signal'])
+
+    def is_current(self,candidate,now=None):
+        now=time() if now is None else now
+        key=candidate_key(candidate)
+        with self.store.lock:
+            return any(row['key']==key and row['expires_at']>now
+                and row['signal'].get('features',{}).get('dedup_key')==candidate.features.get('dedup_key')
+                for row in self.store.get('candidate_queue',[]))
+
+    def evaluated(self, candidate, now=None):
+        now=time() if now is None else now
+        with self.store.lock:
+            rows=self.store.get('candidate_queue',[])
+            for row in rows:
+                if row['key']==candidate_key(candidate):
+                    row['last_evaluated_at']=now
+            self.store.put('candidate_queue',rows)
+
+    def drop(self, candidate):
+        with self.store.lock:
+            key=candidate_key(candidate)
+            self.store.put('candidate_queue',[r for r in self.store.get('candidate_queue',[]) if r['key']!=key])

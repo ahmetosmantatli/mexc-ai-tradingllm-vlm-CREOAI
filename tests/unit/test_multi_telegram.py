@@ -459,3 +459,14 @@ def test_position_cards_include_both_variants_and_entry_model(tmp_path):
     assert 'Zarar durdur (SL)' in text and 'Kâr al (TP)' in text
     assert '+2.5000 USDT' in text
     assert 'Açık işlemler (2)' in str(ctl.keyboard('a'))
+
+
+def test_scan_and_queue_progress_show_independent_refresh_and_elapsed_time():
+    text=TelegramController.progress_text(dict(stage='model_evaluation',scan_stage='scanning_market',
+        scan_summary=dict(at=0,scanned=40,kept=39,candidates=21,eligible=19,duration_seconds=1.25),
+        queue_status=dict(size=19,next_symbol='ONE_USDT')))
+    assert 'AI yanıtı bekleniyor' in text
+    assert 'Tarama süresi: 1.25 sn' in text
+    assert 'Kuyruktaki güncel aday: 19' in text
+    assert 'Sıradaki aday: ONE_USDT' in text
+    assert 'AI bekleme aralığından bağımsız' in text

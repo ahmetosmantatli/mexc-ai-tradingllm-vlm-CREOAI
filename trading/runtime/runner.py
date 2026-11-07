@@ -18,6 +18,7 @@ from trading.risk.engine import RiskEngine, RiskContext
 from trading.runtime.budget import Budget
 from trading.runtime.paper import PaperLedger
 from trading.runtime.store import RuntimeStore
+from trading.runtime.candidates import CandidateQueue
 from trading.runtime.telegram import Telegram
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,8 @@ class PaperRunner:
         self.lock = self.store.lock
         self.protection = None
         self.external_control = None
+        self.external_scan = False
+        self.external_scan_control = None
         self.public = public or MexcPublicClient(base_url=settings.mexc_base_url)
         self.account_client = account_client or MexcReadOnlyClient(api_key=settings.mexc_api_key,
             api_secret=settings.mexc_api_secret, base_url=settings.mexc_base_url,
@@ -46,8 +49,8 @@ class PaperRunner:
             self.ledger = PaperLedger(self.store, 0, settings.paper_fee_rate, settings.paper_slippage_bps)
         self.telegram = Telegram(settings, self.store)
 
-    def quote(self, symbol):
-        ticker = self.public.get_ticker(symbol)
+    def quote(self, symbol, client=None):
+        ticker = (client or self.public).get_ticker(symbol)
         timestamp = float(ticker.raw['timestamp']) / 1000
         age = time.time()-timestamp
         values = (ticker.bid1, ticker.ask1, ticker.last_price, ticker.quote_volume_24h, ticker.raw.get('fairPrice'))
@@ -187,6 +190,85 @@ class PaperRunner:
             logger.warning('paper entry held (%s)', type(exc).__name__)
             return self.status(f'HOLD_ENTRY_{type(exc).__name__}')
 
+    def candidate_queue(self):
+        return CandidateQueue(self.store,getattr(self.cfg,'candidate_ttl_seconds',900),getattr(self.cfg,'candidate_queue_limit',80))
+
+    def scan_market(self):
+        """Refresh durable candidates without account/model calls or ledger locks.
+
+        Fleet calls this on a separate executor. A dedicated public client avoids
+        sharing the analysis client's network operations; fixture clients stay local.
+        """
+        scan_control=self.external_scan_control or self.external_control
+        if scan_control and not scan_control().get('enabled'):
+            return None
+        if not self.cfg.always_on_scan or Path(self.cfg.kill_switch_path).exists():
+            return None
+        started=time.monotonic()
+        observed=time.time()
+        self.store.put('last_scan_at',observed)
+        self.store.put('scan_stage','scanning_market')
+        client=self.public
+        owned=type(client) is MexcPublicClient and not client.use_fixtures and client.transport is None
+        if owned:
+            client=MexcPublicClient(base_url=self.cfg.mexc_base_url,timeout_seconds=3)
+        try:
+            scanner=MarketScanner(client,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,self.cfg.scanner_max_spread_bps),max_symbols=self.cfg.scanner_max_symbols)
+            scan=scanner.scan()
+            with self.lock:
+                positions=set(self.ledger.positions) if self.ledger else set()
+                seen=set(self.ledger.state['seen']) if self.ledger else set()
+            eligible=[]
+            errors=dict(getattr(scan,'errors',{}))
+            for candidate in scan.candidates:
+                try:
+                    if candidate.symbol in positions or not candidate.symbol.endswith('_USDT') or candidate.confidence<0.65:
+                        continue
+                    ticker=self.quote(candidate.symbol,client)
+                    if ticker.quote_volume_24h<self.cfg.scanner_min_quote_volume_24h or ticker.spread_bps>self.cfg.scanner_max_spread_bps:
+                        continue
+                    closed_at=candidate.features.get('source_closed_at')
+                    source_open=candidate.features.get('source_open_at')
+                    if closed_at is None:
+                        rows=client.get_klines(candidate.symbol,interval='Min15',limit=60)['candles']
+                        closed=[c for c in rows if float(c[0])+900<=time.time()]
+                        if not closed:
+                            continue
+                        source_open=closed[-1][0]
+                        closed_at=float(source_open)+900
+                    if closed_at>time.time() or time.time()-closed_at>1200:
+                        continue
+                    if source_open is None:
+                        source_open=int(closed_at-900) if float(closed_at-900).is_integer() else closed_at-900
+                    prefix=f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}:'
+                    key=hashlib.sha256(f'{prefix}{source_open}'.encode()).hexdigest()
+                    legacy_keys={hashlib.sha256(f'{prefix}{stamp}'.encode()).hexdigest() for stamp in (source_open,float(source_open),int(float(source_open)))}
+                    if legacy_keys & seen:
+                        continue
+                    candidate.features.update(dedup_key=key,source_open_at=source_open,source_closed_at=closed_at)
+                    eligible.append(candidate)
+                except sqlite3.Error:
+                    raise
+                except Exception as exc:
+                    errors[candidate.symbol]=type(exc).__name__
+            if scan_control and not scan_control().get('enabled'):
+                self.store.put('scan_stage','scan_discarded_after_pause')
+                return None
+            size=self.candidate_queue().refresh(eligible)
+            summary=dict(at=time.time(),scanned=scan.scanned,kept=scan.kept,candidates=len(scan.candidates),eligible=len(eligible),queue_size=size,errors=errors,duration_seconds=time.monotonic()-started)
+            self.store.put('scan_summary',summary)
+            self.store.put('scan_stage','scan_completed')
+            return summary
+        except sqlite3.Error:
+            raise
+        except Exception as exc:
+            self.store.put('scan_stage','scan_failed')
+            self.store.put('scan_error',dict(at=time.time(),type=type(exc).__name__))
+            return None
+        finally:
+            if owned:
+                client.close()
+
     def _entries(self, account):
         ledger = self.ledger
         if getattr(self,'management_fatal',False):
@@ -214,43 +296,34 @@ class PaperRunner:
             return self.status('HOLD_POSITION_LIMIT')
         if not self.llm.available:
             return self.status('HOLD_AI_NOT_CONFIGURED')
-        if time.time()-self.store.get('last_evaluation_at', 0) < self.cfg.anthropic_min_interval_seconds:
+        queue=self.candidate_queue()
+        if not self.external_scan and time.time()-self.store.get('last_scan_at',0)>=self.cfg.worker_loop_interval_seconds:
+            self.scan_market()
+        if time.time()-self.store.get('last_evaluation_at',0)<self.cfg.anthropic_min_interval_seconds:
             return self.status('HOLD_EVALUATION_INTERVAL')
-        if time.time()-self.store.get('last_scan_at', 0) < self.cfg.worker_loop_interval_seconds:
-            return self.status('HOLD_SCAN_INTERVAL')
-        self.store.put('stage','scanning_market')
-        scanner = MarketScanner(self.public, liquidity=LiquidityFilter(
-            self.cfg.scanner_min_quote_volume_24h, self.cfg.scanner_max_spread_bps),
-            max_symbols=self.cfg.scanner_max_symbols)
-        self.store.put('last_scan_at', time.time())
-        scan = scanner.scan()
-        eligible = []
-        for candidate in scan.candidates:
-            if candidate.symbol in risk_positions or not candidate.symbol.endswith('_USDT') or candidate.confidence < 0.65:
-                continue
-            ticker = self.quote(candidate.symbol)
-            if ticker.quote_volume_24h < self.cfg.scanner_min_quote_volume_24h or ticker.spread_bps > self.cfg.scanner_max_spread_bps:
-                continue
-            # Tie idempotency to the actual closed candle, not a random signal UUID.
-            candles = self.public.get_klines(candidate.symbol, interval='Min15', limit=60)['candles']
-            closed = [c for c in candles if float(c[0])+900 <= time.time()]
-            if not closed or time.time()-(float(closed[-1][0])+900) > 1200:
-                continue
-            key = hashlib.sha256(f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}:{closed[-1][0]}'.encode()).hexdigest()
-            if key in ledger.state['seen']:
-                continue
-            candidate.features['dedup_key'] = key
-            eligible.append(candidate)
-        self.store.put('scan_summary',dict(at=time.time(),scanned=scan.scanned,kept=scan.kept,candidates=len(scan.candidates),eligible=len(eligible)))
-        self.store.put('stage','candidates_filtered')
-        if not eligible:
+        with self.lock:
+            open_symbols=set(ledger.positions)
+            seen=set(ledger.state['seen'])
+        selected=queue.next(open_symbols=open_symbols,seen=seen)
+        if selected is None:
             return self.status('HOLD_NO_QUALIFIED_SIGNAL')
-        self.store.put('last_evaluation_at', time.time())
+        ticker=self.quote(selected.symbol)
+        if abs(ticker.last_price/selected.entry_price-1)>min(selected.stop_distance_pct/2,0.005):
+            queue.drop(selected)
+            return self.status('HOLD_CANDIDATE_PRICE_DRIFT')
+        eligible=[selected]
+        evaluation_started=time.time()
         risk_pct = min(self.cfg.risk_per_trade_pct, self.risk.preset.risk_per_trade_pct)
         result = self.graph.evaluate_candidates(eligible, equity=analysis_equity,
             open_risk=sum(p['risk'] for p in risk_positions.values()), open_positions=len(risk_positions),
             risk_profile=self.cfg.risk_profile.value, risk_per_trade_pct=risk_pct,
             target_leverage=min(self.cfg.default_target_leverage, self.cfg.paper_max_leverage))
+        # Identical-data HOLD consumes no provider cadence. Rotation still advances
+        # so another queued pair can be considered on the next worker tick.
+        provider_called=result.metadata.get('provider_called')
+        if provider_called is not False:
+            self.store.put('last_evaluation_at',evaluation_started)
+            queue.evaluated(selected)
         if result.action != GraphAction.TRADE or not all(note and note.mode=='llm' for note in (result.market, result.strategy, result.portfolio)):
             return self.status('HOLD_CLAUDE_DECISION_OR_FAILURE')
         signal = result.selected_signal
@@ -284,6 +357,10 @@ class PaperRunner:
                 latest_control=self.external_control()
                 if not latest_control.get('enabled') or latest_control.get('updated_at')!=evaluation_control.get('updated_at'):
                     return self.status('HOLD_SETTINGS_CHANGED')
+            if Path(self.cfg.kill_switch_path).exists():
+                return self.status('HOLD_KILL_SWITCH')
+            if not queue.is_current(signal):
+                return self.status('HOLD_CANDIDATE_STALE')
             if self.protection:
                 self.protection.assert_ready()
             if getattr(self,'management_fatal',False):
@@ -298,6 +375,8 @@ class PaperRunner:
             if context.open_positions >= self.cfg.paper_max_positions or not self.risk.evaluate(proposal, context).accepted:
                 return self.status('HOLD_RISK_CHANGED')
             opened = ledger.open(proposal, rules, ticker.bid1, ticker.ask1, signal.features['dedup_key'], risk_pct, self.cfg.liquidation_buffer_pct)
+            if opened is None:
+                return self.status('HOLD_DUPLICATE_OR_ALREADY_OPEN')
             if opened:
                 opened['decision_ai'] = copy.deepcopy(result.metadata.get('decision_ai',dict(provider='unknown',model='unknown',fallback_reason='')))
                 ledger.state['events'][-1]['decision_ai'] = copy.deepcopy(opened['decision_ai'])

@@ -47,6 +47,9 @@ class Fleet:
         self.protections = []
         self.pool = ThreadPoolExecutor(max_workers=len(self.accounts), thread_name_prefix='analysis')
         self.futures = {}
+        self.scan_pool = ThreadPoolExecutor(max_workers=len(self.accounts),thread_name_prefix='scan')
+        self.scan_futures = {}
+        self.last_scan_schedule = {}
         self.funding_futures = {}
         self.funding_pool = ThreadPoolExecutor(max_workers=len(self.accounts)*2, thread_name_prefix='funding')
         self.last_funding = {}
@@ -79,8 +82,10 @@ class Fleet:
             settings = cfg.model_copy(update=overrides)
             llm = ProviderRouter(settings, Budget(self.budget_store,cfg), self.budget_store)
             runner = PaperRunner(settings,llm=llm)
+            runner.external_scan = True
             runner.graph = ContextEvaluator(llm, runner.store, runner.public, settings)
             runner.external_control = lambda aid=account.account_id,v=version:self.entry_control(aid,v)
+            runner.external_scan_control = lambda aid=account.account_id,v=version:self.scan_control(aid,v)
             llm.can_call = lambda r=runner: bool(r.external_control().get("enabled"))
             public = MexcPublicClient(base_url=cfg.mexc_base_url,timeout_seconds=2)
             runner.protection = PositionProtection(lambda r=runner:r.ledger,public,lock=runner.lock,
@@ -95,6 +100,9 @@ class Fleet:
         if future and not future.done():
             raise ConnectionIssue('Analiz sürüyor; yeni girişler durduruldu. Biraz sonra tekrar dene.')
         for version in ('text','vlm'):
+            scanning=self.scan_futures.get((ident,version))
+            if scanning and not scanning.done():
+                raise ConnectionIssue('Piyasa taraması tamamlanıyor; yeni analizler durduruldu. Biraz sonra tekrar dene.')
             future=self.funding_futures.get((ident,version))
             if future and not future.done():
                 raise ConnectionIssue('Hesap uzlaştırması sürüyor; biraz sonra tekrar dene.')
@@ -112,12 +120,17 @@ class Fleet:
             old=self.runners[(ident,version)]
             old.protection.stop()
             self.protections.remove(old.protection)
+            close=getattr(old.llm,'close',None)
+            if close:
+                close()
         self.create_runners(replace(account,mexc_api_key=key,mexc_api_secret=secret))
         for version in ('text','vlm'):
             self.runners[(ident,version)].protection.start()
             self.funding_health[(ident,version)]=False
             self.last_funding[(ident,version)]=0
             self.last_status[(ident,version)]=0
+            self.last_scan_schedule[(ident,version)]=0
+            self.scan_futures.pop((ident,version),None)
         self.futures.pop(ident,None)
         self.control_store.put(f'account:{ident}:status',{})
 
@@ -147,6 +160,12 @@ class Fleet:
         if self.vault:
             self.vault.delete(ident)
         self.replace_runners(ident,'','')
+
+    def scan_control(self,account_id,version):
+        control=self.controller.control(account_id)
+        return dict(enabled=bool(control.get('enabled') and not control.get('stopped')
+            and self.controller.capital_ready(account_id) and control.get('version_chosen')
+            and control.get('profile_chosen') and control['version']==version))
 
     def entry_control(self, account_id, version):
         control = self.controller.control(account_id)
@@ -200,6 +219,11 @@ class Fleet:
             with other.lock:
                 snapshot['variants'][version] = dict(paper=other.ledger.metrics() if other.ledger else None, positions=copy.deepcopy(other.ledger.positions) if other.ledger else {})
         snapshot['scan_summary']=runner.store.get('scan_summary',{})
+        snapshot['scan_stage']=runner.store.get('scan_stage','idle')
+        queue_rows=[row for row in runner.store.get('candidate_queue',[]) if row.get('expires_at',0)>time.time()
+                    and row.get('signal',{}).get('symbol') not in snapshot.get('positions',{})]
+        next_row=min(queue_rows,key=lambda row:(row.get('last_considered_at',0),row.get('first_seen',0),-row.get('signal',{}).get('confidence',0),row.get('key',''))) if queue_rows else None
+        snapshot['queue_status']=dict(size=len(queue_rows),next_symbol=next_row['signal']['symbol'] if next_row else None)
         snapshot['stage']=runner.store.get('stage','awaiting_scan')
         snapshot['next_evaluation_at']=runner.store.get('last_evaluation_at',0)+self.cfg.anthropic_min_interval_seconds
         snapshot['analysis_trace']=runner.store.get('analysis_trace',{})
@@ -383,7 +407,7 @@ class Fleet:
             if command.get('status')!='pending':
                 continue
             if command.get('kind')=='capital_reset':
-                jobs=[self.futures.get(account.account_id)]+[self.funding_futures.get((account.account_id,v)) for v in ('text','vlm')]+[self.management_futures.get((account.account_id,v)) for v in ('text','vlm')]
+                jobs=[self.futures.get(account.account_id)]+[self.scan_futures.get((account.account_id,v)) for v in ('text','vlm')]+[self.funding_futures.get((account.account_id,v)) for v in ('text','vlm')]+[self.management_futures.get((account.account_id,v)) for v in ('text','vlm')]
                 if any(job and not job.done() for job in jobs):
                     continue
                 try:
@@ -436,6 +460,15 @@ class Fleet:
                     self.funding_futures[key]=self.funding_pool.submit(self.reconcile_funding,key,runner)
             key=(account.account_id,control['version'])
             runner=self.runners[key]
+            scanning=self.scan_futures.get(key)
+            if scanning and scanning.done():
+                scanning.result()  # Persistence failures must not be hidden.
+            if (control.get('enabled') and not control.get('stopped') and self.controller.capital_ready(account.account_id)
+                    and control.get('version_chosen') and control.get('profile_chosen') and self.cfg.always_on_scan
+                    and (scanning is None or scanning.done())
+                    and time.time()-self.last_scan_schedule.get(key,0)>=self.cfg.worker_loop_interval_seconds):
+                self.last_scan_schedule[key]=time.time()
+                self.scan_futures[key]=self.scan_pool.submit(runner.scan_market)
             future=self.futures.get(account.account_id)
             if future and future.done():
                 # Persistence failure must be visible and fail closed.
@@ -447,6 +480,7 @@ class Fleet:
             self.publish(account)
 
     def stop(self):
+        self.scan_pool.shutdown(wait=True,cancel_futures=True)
         self.pool.shutdown(wait=True,cancel_futures=True)
         self.funding_pool.shutdown(wait=True,cancel_futures=True)
         self.management_pool.shutdown(wait=True,cancel_futures=True)
