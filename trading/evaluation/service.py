@@ -2,6 +2,8 @@ import hashlib
 import json
 from pathlib import Path
 import time
+from uuid import uuid4
+import copy
 
 from pydantic import BaseModel, ConfigDict, Field
 from trading.agents.schemas import EvaluationResult, GraphAction, MarketAnalystNote, StrategyReviewNote, PortfolioAnalystNote
@@ -34,12 +36,14 @@ class ContextEvaluator:
             return EvaluationResult(action=GraphAction.HOLD, hold_reason='no_candidates')
         candidate = max(candidates, key=lambda c:c.confidence)
         symbol = candidate.symbol
+        self.store.put('stage','fetching_multitimeframe_context')
         bundle = build_bundle(self.public, symbol)
         chart_context = bundle.to_context()
         fingerprint = bundle.fingerprint
         key = 'memory:'+symbol
         memory = self.store.get(key, {'history':[], 'watch_note':'', 'last_fingerprint':None})
         if memory.get('last_fingerprint') == fingerprint:
+            self.store.put('stage','unchanged_closed_candles')
             return EvaluationResult(action=GraphAction.HOLD, hold_reason='unchanged_closed_candles')
         if self.llm.budget is not None and not self.llm.budget.can_spend():
             self.llm.last_status = 'budget_exhausted'
@@ -51,6 +55,12 @@ class ContextEvaluator:
             candidate=candidate.model_dump(mode='json'), market=chart_context,
             account=dict(equity=equity, risk_per_trade_pct=risk_per_trade_pct, leverage=target_leverage, **context),
             memory=memory, positions=self.store.get('paper', {}).get('positions', {})), default=str)
+        trace=dict(id=uuid4().hex,symbol=symbol,strategy=candidate.strategy.value,confidence=candidate.confidence,
+            started_at=started,status='pending',attempts=[],provider='none',model='')
+        self.store.put('analysis_trace',trace)
+        self.store.put('stage','model_evaluation')
+        if hasattr(self.llm,'on_trace'):
+            self.llm.on_trace=lambda update:self.store.put('analysis_trace',{**trace,**copy.deepcopy(update)})
         payload = self.llm.complete_json(system=(
             'Evaluate this USDT perpetual candidate. Both variants use the same strict policy. '
             'Use confirmed swings, BOS, FVG and sweep evidence as hypotheses, never a promised edge. '
@@ -61,12 +71,18 @@ class ContextEvaluator:
             'Only trade if evidence across Hour4, Min15 and Min5 is coherent. '
             'Chart annotations are deterministic observations, not proof of profit.'),
             user=prompt, max_tokens=700, images=paths if self.cfg.analysis_version=='vlm' else None)
+        trace.update(copy.deepcopy(getattr(self.llm,'last_trace',{}) or {}))
+        trace['completed_at']=time.time()
         try:
             decision = ModelDecision.model_validate(payload)
             if decision.action=='trade' and decision.signal_id != candidate.signal_id:
                 raise ValueError('unknown signal')
         except Exception:
+            trace.update(status='invalid_or_unavailable_model',action='hold')
+            self._save_trace(trace)
             return EvaluationResult(action=GraphAction.HOLD, hold_reason='invalid_or_unavailable_model')
+        trace.update(status='completed',action=decision.action)
+        self._save_trace(trace)
         decision_ai=dict(provider=getattr(self.llm,'last_provider','unknown'),
             model=getattr(self.llm,'last_model','unknown'),
             fallback_reason=getattr(self.llm,'last_fallback_reason',''))
@@ -88,3 +104,8 @@ class ContextEvaluator:
         return EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=candidate,
             market=MarketAnalystNote(mode='llm'), strategy=StrategyReviewNote(mode='llm'),
             portfolio=PortfolioAnalystNote(mode='llm'),metadata=metadata)
+
+    def _save_trace(self,trace):
+        self.store.put('analysis_trace',trace)
+        self.store.put('analysis_history',(self.store.get('analysis_history',[])+[copy.deepcopy(trace)])[-30:])
+        self.store.put('stage','model_'+trace['status'])

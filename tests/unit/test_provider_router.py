@@ -87,3 +87,35 @@ def test_invalid_groq_schema_can_fall_back_to_valid_claude(tmp_path,monkeypatch)
     monkeypatch.setattr(router.claude,'complete_json',lambda **kw:decision())
     assert router.complete_json(system='JSON',user='context')==decision()
     assert router.last_provider=='anthropic'
+
+
+def test_rejection_trace_is_safe_and_counts_real_requests(tmp_path,monkeypatch):
+    secret='NEVER_STORE_PRIVATE_PROMPT'
+    router=setup(tmp_path,lambda request:httpx.Response(400,json={'error':{'code':'json_validate_failed','param':'response_format','message':'Failed to generate JSON '+secret,'failed_generation':secret}}),ai_claude_fallback_enabled=False)
+    progress=[]
+    router.on_trace=lambda trace:progress.append(trace)
+    assert router.complete_json(system='JSON',user=secret) is None
+    attempt=router.last_trace['attempts'][0]
+    assert attempt['http_status']==400
+    assert attempt['error_category']=='json_generation_failed'
+    assert attempt['error_code']=='json_validate_failed'
+    assert attempt['generation_requests']==1
+    assert attempt['estimated_cost_usd'] is None
+    import json
+    assert secret not in json.dumps(progress)
+    assert router.store.get('ai_request_stats')['groq']['failures']==1
+    assert router.store.get('ai_request_stats')['groq']['generation_requests']==1
+    router.complete_json(system='JSON',user=secret)
+    assert router.store.get('ai_request_stats')['groq']['generation_requests']==1
+
+
+def test_reasoning_json_request_uses_documented_gpt_oss_options(tmp_path):
+    payloads=[]
+    def handler(request):
+        import json
+        payloads.append(json.loads(request.content))
+        return response(decision())
+    router=setup(tmp_path,handler)
+    router.complete_json(system='JSON',user='candidate')
+    assert payloads[0]['include_reasoning'] is False
+    assert 'reasoning_format' not in payloads[0]

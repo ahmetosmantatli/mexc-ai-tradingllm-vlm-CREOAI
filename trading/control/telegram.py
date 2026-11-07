@@ -96,10 +96,11 @@ class TelegramController:
         elif not control['profile_chosen']:
             rows.extend([[{'text':mode['label'], 'callback_data':'control:'+key}] for key,mode in TRADER_MODES.items()])
         else:
-            rows.append([{'text':'✓ Çalışıyor' if control['enabled'] else '▶ Ayarlarla başlat', 'callback_data':'control:status' if control['enabled'] else 'control:start'}])
+            rows.append([{'text':'✓ Yeni analiz açık' if control['enabled'] else '▶ Ayarlarla başlat', 'callback_data':'control:status' if control['enabled'] else 'control:start'}])
             rows.append([{'text':'⏸ İşlem arayışını duraklat', 'callback_data':'control:pause'}, {'text':'⏹ Bot / AI durdur', 'callback_data':'control:stop'}])
             rows.append([{'text':'Ayarları değiştir', 'callback_data':'control:settings'}, {'text':'Kasa seçimini değiştir', 'callback_data':'control:capital'}])
         rows.append([{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':'Pozisyonlar', 'callback_data':'control:positions'}, {'text':'Günlük rapor', 'callback_data':'control:report'}])
+        rows.append([{'text':'Son analiz / AI istekleri', 'callback_data':'control:diagnostics'}])
         if self.linked(account_id):
             rows.append([{'text':'✓ MEXC bağlı', 'callback_data':'control:status'}, {'text':'Bağlantıyı kaldır', 'callback_data':'control:disconnect'}])
         return {'inline_keyboard':rows}
@@ -116,13 +117,80 @@ class TelegramController:
         if mode is None:
             return 'Trader modu yeniden seçilmeli. /settings'
         risk=state['risk_per_trade_pct']*100
+        snapshot=self.snapshot_provider(account_id) or {}
+        variant=(snapshot.get('variants') or {}).get(state['version'],{})
+        paper=variant.get('paper') or (snapshot.get('paper') if snapshot.get('version',state['version'])==state['version'] else {}) or {}
+        equity=paper.get('equity')
+        source='Son gözlenen paper özkaynak'
+        if equity is None:
+            equity=state.get('capital_amount') or 0
+            source='Başlangıç paper kasası (güncel gözlem henüz yok)'
+        risk_amount=float(equity)*state['risk_per_trade_pct']
         return (f"4/4 · Ayar özeti | PAPER\n{self.capital_text(account_id)}\nAnaliz: {'VLM (grafikli)' if state['version']=='vlm' else 'Görselsiz'}\n"
                 f"Trader modu: {mode['label']}\nİşlem başına planlanan azami stop kaybı: %{risk:g}\n"
-                f"Örnek: 500 TL eşdeğeri kasada yaklaşık {500*state['risk_per_trade_pct']:g} TL planlanan risk. Bu, yatırılacak teminat yüzdesi değildir.\n"
-                f"Kaldıraç üst sınırı: {state['max_leverage']:g}x; parite/teminat/stop koşulları daha düşük değer gerektirebilir.\n"
+                f"{source}: {equity:g} USDT → en fazla {risk_amount:g} USDT planlanan stop riski.\n"
+                'Yüzde profil sınırıdır; tutar her işlemde güncel özkaynağa göre yeniden hesaplanır. Teminat yüzdesi değildir.\n'
+                f"Kaldıraç üst sınırı: {state['max_leverage']:g}x; bu kaldıracı kullanmak zorunlu değil. Parite/teminat/stop koşulları daha düşük değer gerektirebilir.\n"
                 f"Azami açık pozisyon: {state['max_positions']}\nGünlük kayıp eşiği: %{state['daily_loss_limit_pct']*100:g} | Zirveden düşüş: %{state['drawdown_limit_pct']*100:g}\n"
+                'Günlük eşik gün başı özkaynağa, düşüş eşiği özkaynak zirvesine göredir. Eşikler yeni girişleri durdurur; açık işlemleri zorla kapatmaz ve kesin kayıp tavanı değildir.\n'
+                + self.algorithm_text() + '\n'
                 'Fiyat boşluklarında kayıp planı aşabilir. Uygun fırsatta işlem açılır; işlem zorunlu değil. '
-                + ('Bot bu ayarlarla çalışıyor.' if state['enabled'] else 'Başlat ile onayla.'))
+                + ('Yeni analizlere izin verildi. Gerçek ilerlemeyi Durum / Bakiye ve Son analiz ekranından kontrol et.' if state['enabled'] else 'Başlat ile onayla.'))
+
+    @staticmethod
+    def algorithm_text():
+        return ('Aday algoritmaları: trend SMA8/21, momentum ROC12, ortalamaya dönüş SMA20 (15dk). '
+                'Sabit yüzde ağırlık yok; uygun adaylar arasından en yüksek puan değerlendirilir. '
+                'Aday puanı başarı olasılığı değildir. AI ayrıca 4s/15dk/5dk yapısını değerlendirir.')
+
+    @staticmethod
+    def progress_text(snapshot):
+        text=f"Aşama: {snapshot.get('stage') or snapshot.get('reason','henüz gözlem yok')}\n"
+        scan=snapshot.get('scan_summary') or {}
+        if scan:
+            age=max(0,time.time()-scan.get('at',time.time()))
+            text += (f"Son tarama: {age:.0f} sn önce | Parite {scan.get('scanned',0)} | Likidite filtresini geçen {scan.get('kept',0)}\n"
+                     f"Üretilen aday {scan.get('candidates',0)} | AI için uygun {scan.get('eligible',0)}\n")
+        next_at=snapshot.get('next_evaluation_at')
+        if next_at:
+            text += f"Sonraki AI değerlendirmesine en az {max(0,next_at-time.time()):.0f} sn; uygun yeni aday gerekir.\n"
+        return text
+
+    def diagnostics_text(self, account_id):
+        snapshot=self.snapshot_provider(account_id) or {}
+        text='Analiz / AI istekleri | PAPER\n'+self.progress_text(snapshot)+self.algorithm_text()+'\n'
+        for provider,counts in snapshot.get('ai_request_stats',{}).items():
+            text+=(f"Ortak {provider}: üretim isteği {counts.get('generation_requests',0)}, token sayımı {counts.get('count_requests',0)}, "
+                   f"başarılı {counts.get('successes',0)}, başarısız {counts.get('failures',0)}\n")
+        latest=snapshot.get('analysis_trace') or {}
+        history=snapshot.get('analysis_history') or []
+        traces=history[-3:] if history else ([latest] if latest else [])
+        if latest and (not traces or traces[-1].get('id')!=latest.get('id')):
+            traces=(traces+[latest])[-3:]
+        if not traces:
+            return text+'Henüz kayıtlı aday değerlendirmesi yok. Çalışıyor durumu, mutlaka AI isteği veya işlem oluştuğu anlamına gelmez.'
+        for trace in reversed(traces):
+            score=trace.get('confidence')
+            score_text=f"{score:.2f}" if isinstance(score,(int,float)) else '?'
+            text += (f"\nAnaliz {trace.get('id','?')} | {trace.get('symbol','?')} | {trace.get('strategy','?')}\n"
+                     f"Aday puanı {score_text} (olasılık değil) | Sonuç: {trace.get('status','?')}\n")
+            attempts=trace.get('attempts') or []
+            text += f"Sağlayıcı denemesi: {len(attempts)}\n"
+            for attempt in attempts[-4:]:
+                text += (f"• {attempt.get('provider','?')} / {attempt.get('model','?')} | {attempt.get('status','?')}"
+                         f" | {attempt.get('latency_ms',0):.0f} ms\n")
+                errors=[f"{label}: {attempt[key]}" for key,label in (('http_status','HTTP'),('error_category','Tür'),('error_code','Kod'),('error_param','Alan')) if attempt.get(key) is not None]
+                if errors:
+                    text+=' | '.join(errors)+'\n'
+                text+=f"Üretim isteği {attempt.get('generation_requests',0)} | Token sayımı {attempt.get('count_requests',0)}\n"
+                incoming,outgoing=attempt.get('input_tokens'),attempt.get('output_tokens')
+                if incoming is not None or outgoing is not None:
+                    text+=f"Token girdi/çıktı: {incoming if incoming is not None else '?'} / {outgoing if outgoing is not None else '?'}\n"
+                estimate=attempt.get('estimated_cost_usd')
+                text += (f"Yanıt kullanımından tahmini maliyet: ${estimate:.6f}\n" if estimate is not None else 'İstek maliyeti doğrulanmadı / hesaplanmadı.\n')
+                if attempt.get('pending_usd'):
+                    text+=f"Bekleyen/belirsiz rezervasyon: ${attempt['pending_usd']:.6f} (fatura değil)\n"
+        return text+'\nBu kayıtlar sağlayıcı faturası değildir; ham istek/yanıt veya anahtar gösterilmez.'
 
     def request_capital(self, account_id, mode, amount=None, allocation_mode='fixed'):
         if mode not in ('demo','account') or allocation_mode not in ('fixed','full'):
@@ -193,6 +261,10 @@ class TelegramController:
         observed = snapshot.get('observed_at', 0)
         age = max(0, time.time()-observed)
         text += f"Son gözlem: {age:.0f} saniye önce | {snapshot.get('reason','bilinmiyor')}\n"
+        text += self.progress_text(snapshot)
+        trace=snapshot.get('analysis_trace') or {}
+        if trace:
+            text += f"Son aday: {trace.get('symbol','?')} | {trace.get('strategy','?')} | {trace.get('status','?')} | Sağlayıcı denemesi: {len(trace.get('attempts',[]))}\n"
         real = snapshot.get('real_account')
         if real:
             account_age = max(0, time.time()-real.get('observed_at', 0))
@@ -258,7 +330,7 @@ class TelegramController:
         name = parts[0].split('@')[0].lower() if parts else ''
         mapping = {'/start':'menu', '/help':'menu', '/status':'status', '/durum':'status', '/balance':'status',
                    '/bakiye':'status', '/report':'report', '/history':'report', '/rapor':'report', '/settings':'settings', '/ayarlar':'settings', '/positions':'positions', '/pozisyonlar':'positions',
-                   '/run':'start', '/baslat':'start', '/pause':'pause', '/durdur':'stop', '/stop':'stop'}
+                   '/diagnostics':'diagnostics', '/events':'diagnostics', '/run':'start', '/baslat':'start', '/pause':'pause', '/durdur':'stop', '/stop':'stop'}
         if self.command_handler and self.command_handler(account.account_id, text, message):
             return
         if name in ('/demo','/capital'):
@@ -388,6 +460,8 @@ class TelegramController:
         elif command in ('risk005','risk01'):
             self.set_control(account_id,enabled=False)
             message='Eski risk düğmesi kullanılmıyor. /settings ile analiz sürümü ve trader modunu sırayla seç.'
+        elif command=='diagnostics':
+            message=self.diagnostics_text(account_id)
         elif command=='report':
             message=self.report_text(account_id)
         elif command in ('status','positions'):

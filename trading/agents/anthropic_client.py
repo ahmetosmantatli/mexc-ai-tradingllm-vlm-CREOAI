@@ -7,6 +7,7 @@ import logging
 import os
 import sqlite3
 import base64
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -25,6 +26,7 @@ class AnthropicClient:
     budget: Any = field(default=None, repr=False)
     last_status: str = "not_called"
     successful_calls: int = 0
+    last_attempt: dict[str, Any] = field(default_factory=dict, repr=False)
     can_call: Callable[[], bool] | None = field(default=None, repr=False)
     _client: Any = field(default=None, repr=False, init=False)
 
@@ -60,18 +62,24 @@ class AnthropicClient:
         max_tokens: int = 800,
         images: list[str] | None = None,
     ) -> dict[str, Any] | None:
-        """Ask for JSON. Returns None on missing key / errors (caller uses stub)."""
+        """Ask for JSON and retain safe request/usage telemetry, never prompt content."""
+        started = time.monotonic()
         reservation = None
-        if self.can_call is not None and not self.can_call():
-            self.last_status = "stopped"
-            return None
-        if not self.available:
-            logger.debug("Anthropic stub mode: no ANTHROPIC_API_KEY")
-            self.last_status = "missing_key"
-            return None
+        reserved_cost = 0.
+        model = self.model or self.settings.anthropic_model
+        attempt = dict(provider='anthropic', model=model, status='preparing', phase='prepare',
+                       http_status=None, error_category='', latency_ms=0,
+                       count_requests=0, generation_requests=0,
+                       input_tokens=None, output_tokens=None, estimated_cost_usd=None, pending_usd=0.)
+        self.last_attempt = attempt
         try:
+            if self.can_call is not None and not self.can_call():
+                self.last_status = "stopped"
+                return None
+            if not self.available:
+                self.last_status = "missing_key"
+                return None
             client = self._ensure_sdk()
-            model = self.model or self.settings.anthropic_model
             content = [{"type": "text", "text": user}]
             for path in images or []:
                 content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png",
@@ -84,7 +92,8 @@ class AnthropicClient:
                 if self.can_call is not None and not self.can_call():
                     self.last_status = "stopped"
                     return None
-                # Count before generating; reserve headroom for provider token accounting.
+                attempt['phase'] = 'count_tokens'
+                attempt['count_requests'] += 1
                 counted = client.messages.count_tokens(**arguments).input_tokens + 1024
                 if counted > 50000:
                     self.last_status = "context_too_large"
@@ -97,9 +106,16 @@ class AnthropicClient:
             if self.can_call is not None and not self.can_call():
                 if reservation is not None:
                     self.budget.release(reservation)
+                    reservation = None
                 self.last_status = "stopped"
                 return None
+            attempt['phase'] = 'generation'
+            attempt['generation_requests'] += 1
             message = client.messages.create(max_tokens=max_tokens, **arguments)
+            attempt['http_status'] = 200
+            attempt['input_tokens'] = message.usage.input_tokens
+            attempt['output_tokens'] = message.usage.output_tokens
+            attempt['estimated_cost_usd'] = (message.usage.input_tokens*self.settings.anthropic_input_usd_per_million + message.usage.output_tokens*self.settings.anthropic_output_usd_per_million)/1e6
             if self.budget is not None:
                 self.budget.settle(reservation, message.usage.input_tokens, message.usage.output_tokens)
                 reservation = None
@@ -120,18 +136,42 @@ class AnthropicClient:
                 raise ValueError("expected JSON object")
             return result
         except sqlite3.Error:
+            self.last_status = 'persistence_error'
+            attempt['error_category'] = 'persistence_error'
             raise
-        except Exception as exc:  # noqa: BLE001 — fallback path is intentional
-            # A definitive rejection (including rate limit) did not generate a reply.
-            # Ambiguous timeouts/5xx retain a pending estimate, never reported as billed.
+        except Exception as exc:  # noqa: BLE001 — raw response content is never retained
             status_code = getattr(exc, "status_code", None)
+            if isinstance(status_code, int) and 100 <= status_code <= 599:
+                attempt['http_status'] = status_code
             if reservation is not None and isinstance(status_code, int) and 400 <= status_code < 500 and status_code not in (408, 499):
                 self.budget.release(reservation)
+                reservation = None
             self.last_status = "error_or_invalid_output"
             body = getattr(exc, "body", {})
             error = body.get("error", {}) if isinstance(body, dict) else {}
             message = str(error.get("message", "")).lower() if isinstance(error, dict) else ""
             if "credit balance" in message or "insufficient credit" in message:
                 self.last_status = "provider_credit_exhausted"
+                attempt['error_category'] = 'credit_exhausted'
+            elif status_code == 429:
+                attempt['error_category'] = 'rate_limit'
+            elif status_code in (401, 403):
+                attempt['error_category'] = 'authentication_or_permission'
+            elif status_code in (408, 499):
+                attempt['error_category'] = 'ambiguous_timeout'
+            elif isinstance(status_code, int) and 400 <= status_code < 500:
+                attempt['error_category'] = 'request_rejected'
+            elif isinstance(status_code, int) and status_code >= 500:
+                attempt['error_category'] = 'provider_server_error'
+            elif attempt['input_tokens'] is not None:
+                attempt['error_category'] = 'invalid_output'
+            else:
+                attempt['error_category'] = 'transport_or_local_error'
             logger.warning("Anthropic call failed; using stub fallback: %s", type(exc).__name__)
             return None
+        finally:
+            attempt['status'] = self.last_status
+            attempt['latency_ms'] = round((time.monotonic()-started)*1000)
+            attempt['pending_usd'] = reserved_cost if reservation is not None else 0.
+            if not attempt['error_category'] and self.last_status != 'success':
+                attempt['error_category'] = self.last_status

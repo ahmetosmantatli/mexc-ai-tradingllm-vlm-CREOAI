@@ -111,11 +111,15 @@ class PaperLedger:
             raise ValueError('stop too close to estimated liquidation')
         if abs(entry-exit_sl)*quantity + entry_fee + exit_sl*quantity*self.fee > budget+1e-8:
             raise ValueError('stop loss exceeds risk budget')
+        risk_basis=self.equity
+        stop_loss_estimate=abs(entry-exit_sl)*quantity+entry_fee+exit_sl*quantity*self.fee
         self.state['cash'] -= entry_fee
         self.state['fees'] += entry_fee
         self.positions[proposal.symbol] = dict(symbol=proposal.symbol, side=proposal.side.value,
             entry=entry, stop=sl, target=tp, quantity=quantity, contracts=contracts,
             notional=notional, leverage=proposal.leverage, margin=margin, liquidation=liq,
+            stop_loss_estimate=stop_loss_estimate, stop_risk_pct=stop_loss_estimate/risk_basis,
+            candidate_score=proposal.metadata.get('confidence'), risk_basis=risk_basis,
             initial_stop=sl, initial_risk_price=abs(entry-sl), entry_timeframe_seconds=900, price_step=rules.price_step, strategy=proposal.metadata.get('strategy','unknown'), management_policy='structure-v1', opened_at=int(time()*1000), unrealized=0., risk=budget, entry_fee=entry_fee, funding=0., funding_time=None)
         self.state['seen'].append(signal_key)
         self.event('OPEN', **self.positions[proposal.symbol], equity=self.equity)

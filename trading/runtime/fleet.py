@@ -199,16 +199,17 @@ class Fleet:
             other=self.runners[(account.account_id,version)]
             with other.lock:
                 snapshot['variants'][version] = dict(paper=other.ledger.metrics() if other.ledger else None, positions=copy.deepcopy(other.ledger.positions) if other.ledger else {})
-        ai_state=(snapshot.get('ai_status'),snapshot.get('reason'))
-        previous=self.control_store.get(f'account:{account.account_id}:ai_notice')
-        if snapshot.get('ai_status') in ('error_or_invalid_output','budget_exhausted','budget_or_interval_hold','provider_credit_exhausted','primary_unavailable_fallback_disabled') and previous!=list(ai_state):
-            prefix='Claude API bakiyesi yetersiz. ' if snapshot.get('ai_status')=='provider_credit_exhausted' else ''
-            self.controller.enqueue(account.account_id,prefix+'AI çağrısı başarısız veya bütçe sınırına ulaşıldı. Yeni AI işlemleri bekliyor; açık pozisyon takibi devam ediyor. Sağlayıcı bakiyesi, erişim ve ağ durumunu kontrol et.',event_id='ai:'+str(time.time()))
-        self.control_store.put(f'account:{account.account_id}:ai_notice',list(ai_state))
-        route=(snapshot.get('ai_provider'),snapshot.get('ai_fallback'))
-        if route[1] and route!=tuple(self.control_store.get(f'account:{account.account_id}:ai_route',[])):
-            self.controller.enqueue(account.account_id,f"AI yönlendirmesi: {route[0]} | Neden: {route[1]}. Claude yedeğine geçilmesi ücretli kullanım oluşturabilir. Aynı analiz bağlamı korunur; karar ayrıca risk/fiyat kontrollerinden geçer.",event_id='ai-route:'+str(time.time()))
-        self.control_store.put(f'account:{account.account_id}:ai_route',list(route))
+        snapshot['scan_summary']=runner.store.get('scan_summary',{})
+        snapshot['stage']=runner.store.get('stage','awaiting_scan')
+        snapshot['next_evaluation_at']=runner.store.get('last_evaluation_at',0)+self.cfg.anthropic_min_interval_seconds
+        snapshot['analysis_trace']=runner.store.get('analysis_trace',{})
+        snapshot['analysis_history']=runner.store.get('analysis_history',[])
+        snapshot['ai_request_stats']=self.budget_store.get('ai_request_stats',{})
+        trace=snapshot['analysis_trace']
+        if trace.get('completed_at'):
+            # One candidate-scoped result notification, no stale-status error spam.
+            from trading.agents.telemetry import format_trace
+            self.controller.enqueue(account.account_id,format_trace(trace),event_id=f"analysis:{selected}:{trace['id']}")
         if snapshot.get('real_account') and not self.control_store.get(f'account:{account.account_id}:disconnected',False):
             self.control_store.put(f'account:{account.account_id}:linked',True)
         from trading.runtime.reports import daily_trade_report
@@ -258,6 +259,11 @@ class Fleet:
                     text += (f"İşlem açıldı: {event['side']} | {event['leverage']:g}x\n"
                              f"Giriş {event['entry']:.6g} | SL {event['stop']:.6g} | TP {event['target']:.6g}\n"
                              f"Büyüklük {event['notional']:.4f} USDT\n{event.get('rationale','')}\n")
+                    text += f"Aday algoritması: {event.get('strategy','kayıtlı değil')}\n"
+                    if event.get('candidate_score') is not None:
+                        text += f"Aday puanı: {event['candidate_score']:.2f} (başarı olasılığı değil)\n"
+                    if event.get('stop_loss_estimate') is not None:
+                        text += f"Planlanan stop kaybı: %{event['stop_risk_pct']*100:.2f} | {event['stop_loss_estimate']:.4f} USDT (ücret/kayma varsayımlarıyla)\n"
                 elif event['kind']=='CLOSE':
                     text += f"İşlem kapandı: {event['reason']} | Net sonuç {event['net_pnl']:+.4f} USDT\n"
                 elif event['kind']=='STOP_UPDATED':

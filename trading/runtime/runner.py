@@ -203,11 +203,12 @@ class PaperRunner:
         if len(risk_positions) >= self.cfg.paper_max_positions:
             return self.status('HOLD_POSITION_LIMIT')
         if not self.llm.available:
-            return self.status('HOLD_CLAUDE_NOT_CONFIGURED')
+            return self.status('HOLD_AI_NOT_CONFIGURED')
         if time.time()-self.store.get('last_evaluation_at', 0) < self.cfg.anthropic_min_interval_seconds:
             return self.status('HOLD_EVALUATION_INTERVAL')
         if time.time()-self.store.get('last_scan_at', 0) < self.cfg.worker_loop_interval_seconds:
             return self.status('HOLD_SCAN_INTERVAL')
+        self.store.put('stage','scanning_market')
         scanner = MarketScanner(self.public, liquidity=LiquidityFilter(
             self.cfg.scanner_min_quote_volume_24h, self.cfg.scanner_max_spread_bps),
             max_symbols=self.cfg.scanner_max_symbols)
@@ -230,6 +231,8 @@ class PaperRunner:
                 continue
             candidate.features['dedup_key'] = key
             eligible.append(candidate)
+        self.store.put('scan_summary',dict(at=time.time(),scanned=scan.scanned,kept=scan.kept,candidates=len(scan.candidates),eligible=len(eligible)))
+        self.store.put('stage','candidates_filtered')
         if not eligible:
             return self.status('HOLD_NO_QUALIFIED_SIGNAL')
         self.store.put('last_evaluation_at', time.time())

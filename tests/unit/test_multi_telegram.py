@@ -259,7 +259,8 @@ def test_wizard_requires_verified_link_then_version_then_mode(tmp_path):
     assert state['risk_profile']=='aggressive_growth'
     assert state['risk_per_trade_pct']==.03 and state['max_leverage']==10
     assert not state['enabled']
-    assert '15 TL' in calls[-2][1]['text']
+    assert '30 USDT planlanan stop riski' in calls[-2][1]['text']
+    assert '15 TL' not in calls[-2][1]['text']
     ctl.dispatch(message(11,11,'/run'))
     assert ctl.control('a')['enabled']
     assert not ctl.control('b')['enabled']
@@ -382,3 +383,46 @@ def test_budget_status_separates_settled_estimate_from_pending_reservations(tmp_
     assert 'tahmini maliyet: $0.0000' in text
     assert 'bekleyen rezervasyon: $0.1070' in text
     assert 'gerçek bakiyesi/faturası' in text
+
+
+def test_settings_risk_uses_selected_variant_equity_not_fixed_example(tmp_path):
+    snapshots={'a':{'version':'text','paper':{'equity':900},'variants':{'text':{'paper':{'equity':900}},'vlm':{'paper':{'equity':400}}}}}
+    ctl,calls=controller(tmp_path,snapshots)
+    ready(ctl,'a')
+    ctl._command('a','trader_aggressive')
+    text=ctl.settings_text('a')
+    assert 'Son gözlenen paper özkaynak: 400 USDT' in text
+    assert '12 USDT planlanan stop riski' in text
+    assert '%3' in text and 'TL eşdeğeri' not in text
+    assert 'Yüzde profil sınırıdır' in text
+    assert 'bu kaldıracı kullanmak zorunlu değil' in text
+    assert 'açık işlemleri zorla kapatmaz' in text
+    assert 'Sabit yüzde ağırlık yok' in text
+    snapshots['a']['variants']['vlm']['paper']['equity']=300
+    assert '9 USDT planlanan stop riski' in ctl.settings_text('a')
+
+
+def test_diagnostics_routes_only_owner_and_shows_safe_trace_metadata(tmp_path):
+    trace=dict(id='analysis-123',symbol='BTC_USDT',strategy='momentum',confidence=.72,status='hold',
+        attempts=[dict(provider='groq',model='openai/gpt-oss-20b',status='http_error',http_status=400,
+                       error_category='invalid_request',error_code='json_validate_failed',error_param='response_format',
+                       latency_ms=25,input_tokens=None,output_tokens=None,estimated_cost_usd=None,
+                       raw_error='DO_NOT_SHOW_SECRET'),
+                  dict(provider='anthropic',model='claude-sonnet-4-6',status='success',latency_ms=100,
+                       input_tokens=100,output_tokens=20,estimated_cost_usd=.0006)])
+    snapshots={'a':dict(observed_at=1,reason='HOLD',stage='waiting',scan_summary=dict(scanned=40,kept=20,candidates=4,eligible=2,at=1),analysis_trace=trace)}
+    ctl,calls=controller(tmp_path,snapshots)
+    ctl.dispatch(message(22,22,'/diagnostics'))
+    assert 'BTC_USDT' not in calls[-1][1]['text']
+    ctl.dispatch(message(11,11,'/diagnostics'))
+    data=calls[-1][1]
+    assert data['chat_id']==11
+    assert 'BTC_USDT' in data['text'] and 'HTTP: 400' in data['text']
+    assert 'Sağlayıcı denemesi: 2' in data['text']
+    assert 'json_validate_failed' in data['text']
+    assert '$0.000600' in data['text']
+    assert 'DO_NOT_SHOW_SECRET' not in data['text']
+    assert 'Son analiz / AI istekleri' in str(data['reply_markup'])
+    text=ctl.status_text('a')
+    assert 'Parite 40' in text and 'AI için uygun 2' in text
+    assert 'Son aday: BTC_USDT' in text

@@ -225,6 +225,8 @@ def test_telegram_demo_to_trade_stop_update_close_report_and_restart(tmp_path,mo
         assert 'Giriş kararını veren AI: anthropic | claude-sonnet-4-6' in texts
         assert 'Yedek geçiş nedeni: groq_http_429' in texts
         assert 'a-later-model' not in texts
+        assert 'Planlanan stop kaybı: %' in texts
+        assert 'Aday algoritması: trend' in texts
         assert runner.ledger.state['closed_positions'][-1]['decision_ai']['model']=='claude-sonnet-4-6'
         message('/stop')
         assert not fleet.controller.control('demo')['enabled']

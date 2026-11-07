@@ -43,3 +43,18 @@ def test_unknown_signal_and_extra_fields_fail_closed(tmp_path,monkeypatch):
     llm=SimpleNamespace(budget=None,complete_json=lambda **kw:dict(action='trade',signal_id='unknown',rationale='x',invalidation='x',watch_note='x'))
     service=ContextEvaluator(llm,RuntimeStore(str(tmp_path/'s')),None,Settings(_env_file=None))
     assert service.evaluate_candidates([candidate],equity=500,risk_per_trade_pct=.01,target_leverage=3).action==GraphAction.HOLD
+
+
+def test_failed_analysis_retains_candidate_trace_without_prompt(tmp_path,monkeypatch):
+    candidate=CandidateSignal(symbol='BTC_USDT',side=Side.LONG,strategy=StrategyName.TREND,entry_price=100,stop_loss_price=98,take_profit_price=104,confidence=.8)
+    monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='closed',to_context=lambda:{}))
+    monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
+    llm=SimpleNamespace(budget=None,complete_json=lambda **kw:None,last_trace={'attempts':[{'provider':'groq','model':'test','http_status':400,'status':'rejected'}]})
+    store=RuntimeStore(str(tmp_path/'trace'))
+    evaluator=ContextEvaluator(llm,store,None,Settings(_env_file=None))
+    evaluator.evaluate_candidates([candidate],equity=500,risk_per_trade_pct=.03,target_leverage=10)
+    trace=store.get('analysis_trace')
+    assert trace['symbol']=='BTC_USDT' and trace['strategy']=='trend'
+    assert trace['status']=='invalid_or_unavailable_model'
+    assert trace['attempts'][0]['http_status']==400
+    assert store.get('analysis_history')[-1]['id']==trace['id']

@@ -91,3 +91,79 @@ def test_release_is_idempotent_and_preserves_settled_usage(tmp_path):
     state = store.get('ai_budget')
     assert state['total'] == pytest.approx(.00045)
     assert sum(state['days'].values()) == pytest.approx(.00045)
+
+
+def test_success_telemetry_records_usage_and_both_request_types(tmp_path):
+    llm, store, calls = client(tmp_path)
+    assert llm.complete_json(system='JSON', user='private context') == {'ok': True}
+    attempt = llm.last_attempt
+    assert attempt['provider'] == 'anthropic'
+    assert attempt['model'] == llm.settings.anthropic_model
+    assert attempt['status'] == 'success' and attempt['phase'] == 'generation'
+    assert attempt['http_status'] == 200
+    assert attempt['count_requests'] == attempt['generation_requests'] == 1
+    assert attempt['input_tokens'] == 100 and attempt['output_tokens'] == 10
+    assert attempt['estimated_cost_usd'] == pytest.approx(.00045)
+    assert attempt['pending_usd'] == 0 and attempt['latency_ms'] >= 0
+    assert 'private context' not in str(attempt)
+
+
+def test_rejected_generation_telemetry_has_no_invented_cost_or_raw_error(tmp_path):
+    error = Rejected(400)
+    error.body = {'error': {'message': 'secret-key-sample private account'}}
+    llm, store, calls = client(tmp_path, error=error)
+    assert llm.complete_json(system='JSON', user='test') is None
+    attempt = llm.last_attempt
+    assert attempt['http_status'] == 400
+    assert attempt['error_category'] == 'request_rejected'
+    assert attempt['phase'] == 'generation'
+    assert attempt['count_requests'] == attempt['generation_requests'] == 1
+    assert attempt['estimated_cost_usd'] is None
+    assert attempt['input_tokens'] is None and attempt['output_tokens'] is None
+    assert attempt['pending_usd'] == 0
+    assert 'secret-key-sample' not in str(attempt)
+    assert 'private account' not in str(attempt)
+
+
+def test_count_failure_is_distinguished_from_generation_failure(tmp_path):
+    llm, store, calls = client(tmp_path)
+    def reject_count(**kwargs):
+        raise Rejected(429)
+    llm._client.messages.count_tokens = reject_count
+    assert llm.complete_json(system='JSON', user='test') is None
+    assert llm.last_attempt['phase'] == 'count_tokens'
+    assert llm.last_attempt['count_requests'] == 1
+    assert llm.last_attempt['generation_requests'] == 0
+    assert llm.last_attempt['error_category'] == 'rate_limit'
+    assert llm.last_attempt['pending_usd'] == 0
+    assert store.get('ai_budget') is None
+
+
+def test_ambiguous_failure_telemetry_keeps_unknown_cost_and_pending_reserve(tmp_path):
+    llm, store, calls = client(tmp_path, error=TimeoutError())
+    assert llm.complete_json(system='JSON', user='test') is None
+    assert llm.last_attempt['estimated_cost_usd'] is None
+    assert llm.last_attempt['pending_usd'] > 0
+    assert llm.last_attempt['http_status'] is None
+
+
+def test_malformed_response_telemetry_retains_completed_cost(tmp_path):
+    llm, store, calls = client(tmp_path, raw='not JSON')
+    assert llm.complete_json(system='JSON', user='test') is None
+    assert llm.last_attempt['error_category'] == 'invalid_output'
+    assert llm.last_attempt['estimated_cost_usd'] == pytest.approx(.00045)
+    assert llm.last_attempt['pending_usd'] == 0
+
+
+def test_early_stop_and_missing_key_replace_previous_attempt(tmp_path):
+    llm, store, calls = client(tmp_path)
+    llm.can_call = lambda: False
+    assert llm.complete_json(system='JSON', user='test') is None
+    assert llm.last_attempt['status'] == 'stopped'
+    assert llm.last_attempt['count_requests'] == llm.last_attempt['generation_requests'] == 0
+    llm.can_call = None
+    llm.settings.anthropic_api_key = ''
+    assert llm.complete_json(system='JSON', user='test') is None
+    assert llm.last_attempt['status'] == 'missing_key'
+    assert llm.last_attempt['phase'] == 'prepare'
+    assert llm.last_attempt['estimated_cost_usd'] is None
