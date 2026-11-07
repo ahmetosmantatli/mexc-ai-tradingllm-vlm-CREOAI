@@ -40,6 +40,13 @@ class Settings(BaseSettings):
         default=BrokerMode.PAPER,
         description="Active broker. Paper never hits private order endpoints.",
     )
+    live_operator_ids: str = Field(
+        default="",
+        description=(
+            "Comma-separated operator ids allowed to arm live entries. "
+            "Empty means nobody can arm. Not a secret and not an order."
+        ),
+    )
 
     # --- Product default profile ---
     risk_profile: RiskProfile = Field(
@@ -238,6 +245,7 @@ class Settings(BaseSettings):
         return {
             "live_trading_enabled": self.live_trading_enabled,
             "broker_mode": self.effective_broker_mode().value,
+            "live_operator_configured": bool(self.live_operator_ids.strip()),
             "risk_profile": self.risk_profile.value,
             "starting_capital_try": self.starting_capital_try,
             "capital_floor_try": self.capital_floor_try,

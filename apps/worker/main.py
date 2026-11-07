@@ -1,11 +1,11 @@
-"""Single persistent paper worker. Never submits real exchange orders."""
+"""Persistent worker. Paper never submits real orders. Live boots disarmed."""
 import fcntl
 import logging
 from pathlib import Path
 import signal
 import time
 
-from trading.config import get_settings
+from trading.config import BrokerMode, get_settings
 from trading.runtime.runner import PaperRunner
 
 logger = logging.getLogger('worker')
@@ -15,6 +15,23 @@ _RUNNING = True
 def _stop(*_):
     global _RUNNING
     _RUNNING = False
+
+
+def worker_mode(cfg):
+    """paper, live, or refused. Live requires both gates; anything else stays off."""
+    live = cfg.broker_mode == BrokerMode.LIVE
+    enabled = cfg.live_trading_enabled is True
+    if live and enabled:
+        return 'live'
+    if live or enabled:
+        return 'refused'
+    return 'paper'
+
+
+def _wait(cfg):
+    deadline = time.monotonic()+cfg.position_poll_seconds
+    while _RUNNING and time.monotonic() < deadline:
+        time.sleep(max(0, min(0.5, deadline-time.monotonic())))
 
 
 def main():
@@ -32,6 +49,25 @@ def main():
             logger.error('another worker owns this ledger')
             return 2
         try:
+            mode = worker_mode(cfg)
+            if mode == 'refused':
+                logger.error('startup refused: set both BROKER_MODE=live and LIVE_TRADING_ENABLED=true, or leave both off')
+                return 2
+            if mode == 'live':
+                from trading.runtime.live_runner import LiveRunner
+                runner = LiveRunner(cfg)
+                logger.info('LIVE worker started disarmed; no new entries until an operator arms this generation')
+                signal.signal(signal.SIGINT, _stop)
+                signal.signal(signal.SIGTERM, _stop)
+                while _RUNNING:
+                    try:
+                        status = runner.cycle()
+                        logger.info('live cycle: %s equity=%s armed=%s', status.get('reason'), status.get('equity'), status.get('armed'))
+                    except Exception as exc:
+                        logger.error('fatal worker failure (%s); restart/reconciliation required', type(exc).__name__)
+                        return 1
+                    _wait(cfg)
+                return 0
             if Path(cfg.accounts_file).is_file():
                 from trading.runtime.fleet import Fleet
                 fleet = Fleet(cfg)
@@ -67,9 +103,7 @@ def main():
                 # A persistence failure is fatal. Do not trade against stale memory.
                 logger.error('fatal worker failure (%s); restart/reconciliation required', type(exc).__name__)
                 return 1
-            deadline = time.monotonic()+cfg.position_poll_seconds
-            while _RUNNING and time.monotonic() < deadline:
-                time.sleep(max(0, min(0.5, deadline-time.monotonic())))
+            _wait(cfg)
     return 0
 
 

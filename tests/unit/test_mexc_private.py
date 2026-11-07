@@ -149,6 +149,18 @@ def test_read_endpoints_return_data_without_wrappers_and_use_documented_paths():
     assert all(req.method=='GET' for req in requests)
 
 
+def test_history_positions_are_a_get_and_report_exchange_fee_and_funding(monkeypatch):
+    monkeypatch.setattr('trading.exchange.mexc_private.time.time',lambda:1700000000.)
+    row=dict(positionId=42,symbol='BTC_USDT',state=3,closeVol=1,fee=-0.009,holdFee=-0.02)
+    client,requests=setup(lambda req:httpx.Response(200,json=dict(success=True,code=0,data=[row])))
+    assert client.history_positions('BTC_USDT')==[row]
+    request=requests[0]
+    assert request.method=='GET'
+    assert request.url.path=='/api/v1/private/position/list/history_positions'
+    assert b'symbol=BTC_USDT' in request.url.query
+    assert request.content==b''
+
+
 def test_native_position_protection_no_reverse_market_order_and_modify():
     client,requests=setup(writes_enabled=True)
     client.place_protection(position_id=45,contracts=2,stop_loss=90,take_profit=110,request_id='protect_123')

@@ -172,6 +172,26 @@ class MexcPrivateClient:
         return self._request('GET','/api/v1/private/account/risk_limit',operation='risk_limits',
             params={'symbol':_symbol(symbol) if symbol else None},expected=(dict,list))
 
+    def history_positions(self,symbol=None):
+        """GET closed positions. fee is the trading fee; holdFee is funding. Never a write."""
+        rows=[]
+        for page in range(1,11):
+            params=self._page(page,100)
+            if symbol is not None:
+                params['symbol']=_symbol(symbol)
+            data=self._request('GET','/api/v1/private/position/list/history_positions',
+                operation='history_positions',params=params,expected=(list,dict))
+            if isinstance(data,dict):
+                chunk=data.get('resultList')
+                if not isinstance(chunk,list):
+                    raise MexcPrivateError('history_positions')
+            else:
+                chunk=data
+            rows.extend(chunk)
+            if len(chunk)<100:
+                return rows
+        raise MexcPrivateError('history_positions')
+
     def protection_orders(self,symbol=None,page_num=1,page_size=100):
         return self._request('GET','/api/v1/private/stoporder/list/orders',operation='protection_orders',
             params=dict(self._page(page_num,page_size),symbol=_symbol(symbol) if symbol else None,is_finished=0),expected=list)

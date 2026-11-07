@@ -59,7 +59,7 @@ def inspect_account(client, symbol):
         symbol=symbol,position_mode=mode,open_positions=len(positions),open_orders=len(orders),
         account_leverage_data_present=bool(leverage),account_risk_data_present=bool(risk),
         writes_enabled=False,automatic_live_worker_available=False,
-        note='Read-only connectivity check, not execution approval or a guarantee of trading permission.')
+        note='Read-only connectivity check. It does not arm entries or send orders. The live runner stays disarmed until an operator arms it.')
 
 
 def main(argv=None):

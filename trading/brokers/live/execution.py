@@ -53,15 +53,23 @@ class ApprovedLiveExecutor:
         if not isfinite(number):raise LiveExecutionError('invalid_numeric_exchange_field')
         return number
 
-    def _gate(self):
+    def _gate(self,*,entries=False):
         mode=getattr(self.gates.broker_mode,'value',self.gates.broker_mode)
         if not isinstance(self.binding_id,str) or not self.binding_id or len(self.binding_id)>128:
             raise LiveExecutionError('credential_binding_generation_required')
         if self.gates.live_trading_enabled is not True or mode!='live' or self.gates.reviewed is not True:
             raise LiveExecutionError('live_gates_disabled')
-        if not self.can_execute():raise LiveExecutionError('operator_execution_paused')
         if getattr(self.private,'writes_enabled',False) is not True:
             raise LiveExecutionError('private_writes_disabled')
+        # Pause and the armed flag block new entries only. Reconciliation and
+        # protection of an order that was already sent must keep running.
+        if not entries:
+            return
+        if not self.can_execute():
+            raise LiveExecutionError('operator_execution_paused')
+        armed=getattr(self,'entries_armed',None)
+        if armed is not None and armed() is not True:
+            raise LiveExecutionError('live_not_armed')
 
     @staticmethod
     def _fingerprint(proposal):
@@ -78,10 +86,45 @@ class ApprovedLiveExecutor:
         self.store.put(self._key(row['intent_id']),row)
         return copy.deepcopy(row)
 
-    def _halt(self,row,reason):
-        self.store.put('live:halt',dict(intent_id=row['intent_id'],reason=reason,at=time()))
+    def _halt(self,row,reason,*,account=True):
+        # account=False keeps the intent unresolved without latching every future entry.
+        # Unknown writes still latch: a second open is worse than a stopped account.
+        if account:
+            self.store.put('live:halt',dict(intent_id=row['intent_id'],reason=reason,at=time()))
         row.update(halt_reason=reason)
         return self._save(row)
+
+    def _optional_number(self,value):
+        try:
+            return self._number(value)
+        except LiveExecutionError:
+            return None
+
+    def _book_exchange_costs(self,row,*sources):
+        """Persist fee and funding only when the exchange report includes them."""
+        costs=dict(row.get('exchange_costs') or {})
+        for source in sources:
+            if not isinstance(source,dict):
+                continue
+            if 'fee' in source and source.get('fee') is not None:
+                fee=self._optional_number(source.get('fee'))
+                if fee is not None:
+                    costs['fee']=fee
+            elif 'takerFee' in source or 'makerFee' in source:
+                taker=self._optional_number(source.get('takerFee')) if 'takerFee' in source else 0
+                maker=self._optional_number(source.get('makerFee')) if 'makerFee' in source else 0
+                if taker is not None and maker is not None:
+                    costs['fee']=taker+maker
+            if 'holdFee' in source and source.get('holdFee') is not None:
+                funding=self._optional_number(source.get('holdFee'))
+                if funding is not None:
+                    costs['funding']=funding
+        if not costs:
+            return costs
+        row['exchange_costs']=costs
+        self.store.put('live:costs:'+row['intent_id'],dict(intent_id=row['intent_id'],
+            symbol=row['proposal']['symbol'],source='exchange',fee=costs.get('fee'),funding=costs.get('funding')))
+        return costs
 
     def stage(self,proposal,*,ttl_seconds=60):
         """Create a reviewable immutable intent without any exchange request."""
@@ -101,7 +144,7 @@ class ApprovedLiveExecutor:
 
     def approve(self,intent_id,proposal_fingerprint,operator_id,*,allow_emergency_close=False):
         """Only a caller-authenticated, allowlisted human operator may invoke this."""
-        self._gate()
+        self._gate(entries=True)
         if str(operator_id) not in {str(v) for v in self.gates.operator_ids}:
             raise LiveExecutionError('operator_not_allowed')
         with self.store.lock:
@@ -109,8 +152,8 @@ class ApprovedLiveExecutor:
             if row['proposal_fingerprint']!=proposal_fingerprint:raise LiveExecutionError('approval_proposal_mismatch')
             if row['expires_at']<=time():raise LiveExecutionError('approval_expired')
             if row['status']!='awaiting_manual_approval':raise LiveExecutionError('intent_not_awaiting_approval')
-            if not allow_emergency_close:raise LiveExecutionError('explicit_emergency_close_permission_required')
-            row.update(status='approved',approved_by=str(operator_id),approved_at=time(),allow_emergency_close=True)
+            row.update(status='approved',approved_by=str(operator_id),approved_at=time(),
+                allow_emergency_close=bool(allow_emergency_close))
             return self._save(row)
 
     def _preflight(self,row):
@@ -187,13 +230,14 @@ class ApprovedLiveExecutor:
                 self.store.put('live:executor_lease',{})
 
     def execute(self,intent_id):
-        self._gate()
+        self._gate(entries=False)
         token=self._acquire_lease(intent_id)
         try:
             row=self.state(intent_id)
             if row.get('binding_id')!=self.binding_id:raise LiveExecutionError('credential_binding_changed')
             if row.get('entry_write_attempted'):
                 return self._reconcile(row,token)
+            self._gate(entries=True)
             if self.store.get('live:halt'):raise LiveExecutionError('live_halt_latched')
             if row['status']!='approved' or row['expires_at']<=time():raise LiveExecutionError('fresh_exact_manual_approval_required')
             with self.store.lock:
@@ -231,8 +275,9 @@ class ApprovedLiveExecutor:
             and p.get('autoAddIm') in (False,0) and self._number(p.get('holdVol'))==row['contracts']]
         return matches[0] if len(matches)==1 else None
 
-    def _protected(self,row,position):
+    def _protected(self,row,position,volume=None):
         """True=matching native pair, False=complete list no pair, None=unknown."""
+        expected=row['contracts'] if volume is None else volume
         protections=[]
         try:
             complete=False
@@ -247,9 +292,9 @@ class ApprovedLiveExecutor:
             for protection in protections:
                 try:
                     volumes=protection.get('profitLossVolType')
-                    volume_ok=(self._number(protection.get('vol'))==row['contracts'] if volumes=='SAME' else
-                        volumes=='SEPARATE' and self._number(protection.get('stopLossVol'))==row['contracts']
-                        and self._number(protection.get('takeProfitVol'))==row['contracts'])
+                    volume_ok=(self._number(protection.get('vol'))==expected if volumes=='SAME' else
+                        volumes=='SEPARATE' and self._number(protection.get('stopLossVol'))==expected
+                        and self._number(protection.get('takeProfitVol'))==expected)
                     if (str(protection.get('positionId'))==str(position['positionId']) and protection.get('state')==1
                             and protection.get('isFinished')==0 and protection.get('lossTrend')==2 and protection.get('profitTrend')==2
                             and protection.get('stopLossType')==0 and protection.get('takeProfitType')==0
@@ -266,7 +311,7 @@ class ApprovedLiveExecutor:
 
     def reconcile(self,intent_id):
         """Read/reconcile the original entry. Never resubmit an uncertain entry."""
-        self._gate()
+        self._gate(entries=False)
         token=self._acquire_lease(intent_id)
         try:
             row=self.state(intent_id)
@@ -274,6 +319,73 @@ class ApprovedLiveExecutor:
             return self._reconcile(row,token)
         finally:
             self._release_lease(token)
+
+    def _mark_closed(self,row,report,*,reason):
+        self._book_exchange_costs(row,report)
+        row.update(status='closed',close_reason=reason,halt_reason=None)
+        return self._save(row)
+
+    def _confirmed_close(self,row):
+        """Exchange-confirmed flat position. None when the close is not proven."""
+        position_id=row.get('position_id')
+        if not position_id:
+            return None
+        symbol=row['proposal']['symbol']
+        try:
+            open_rows=self.private.open_positions(symbol)
+            if any(str(item.get('positionId'))==str(position_id) and self._optional_number(item.get('holdVol')) not in (None,0)
+                    and self._optional_number(item.get('holdVol'))>0 for item in open_rows):
+                return None
+            method=getattr(self.private,'history_positions',None)
+            if method is None:
+                return None
+            history=method(symbol)
+            if not isinstance(history,list):
+                return None
+            matches=[item for item in history if isinstance(item,dict) and str(item.get('positionId'))==str(position_id)
+                and item.get('symbol')==symbol and item.get('state')==3 and (self._optional_number(item.get('closeVol')) or 0)>0]
+            return matches[0] if len(matches)==1 else None
+        except Exception:
+            return None
+
+    def _partial(self,row,order,filled,token):
+        """Keep the original external id. Do not latch the account or send a second entry."""
+        row.update(status='partial_fill',filled_contracts=filled,halt_reason='entry_fill_not_fully_confirmed')
+        self._save(row)
+        try:
+            if filled<=0 and order.get('state') in (3,4,5):
+                row.update(status='entry_rejected')
+                return self._save(row)
+            if filled<=0 or filled>row['contracts']:
+                return self.state(row['intent_id'])
+            positions=self.private.open_positions(row['proposal']['symbol'])
+            expected=1 if row['proposal']['side']=='long' else 2
+            matches=[item for item in positions if item.get('symbol')==row['proposal']['symbol']
+                and item.get('positionType')==expected and item.get('state')==1 and item.get('openType')==1
+                and self._optional_number(item.get('holdVol'))==filled]
+            if len(matches)!=1:
+                return self.state(row['intent_id'])
+            position=matches[0]
+            row.update(position_id=str(position['positionId']))
+            self._book_exchange_costs(row,order,position)
+            self._save(row)
+            if self._protected(row,position,filled) is True:
+                row.update(status='partial_protected')
+                return self._save(row)
+            if row.get('partial_protection_attempted'):
+                return self.state(row['intent_id'])
+            row.update(partial_protection_attempted=True)
+            self._save(row)
+            self._check_lease(token)
+            self.private.place_protection(position_id=row['position_id'],contracts=filled,
+                stop_loss=row['proposal']['stop_loss']['price'],take_profit=row['proposal']['take_profit_price'],
+                request_id='psl-'+row['intent_id'][:24])
+            if self._protected(row,position,filled) is True:
+                row.update(status='partial_protected')
+                return self._save(row)
+        except Exception:
+            return self.state(row['intent_id'])
+        return self.state(row['intent_id'])
 
     def _reconcile(self,row,token):
         self._check_lease(token)
@@ -288,9 +400,12 @@ class ApprovedLiveExecutor:
                         and close.get('symbol')==row['proposal']['symbol'] and close.get('side')==expected_close_side
                         and close.get('state')==3 and self._number(close.get('dealVol'))==row['contracts']
                         and not any(str(p.get('positionId'))==row['position_id'] and self._number(p.get('holdVol'))>0 for p in remaining)):
-                    row.update(status='closed')
-                    return self._save(row)
+                    return self._mark_closed(row,close,reason='emergency_close')
                 return self._halt(row,'emergency_close_not_confirmed')
+            if row.get('position_id'):
+                confirmed=self._confirmed_close(row)
+                if confirmed is not None:
+                    return self._mark_closed(row,confirmed,reason='exchange_confirmed')
             order=self.private.order_by_external_id(row['proposal']['symbol'],row['external_id'])
             if not isinstance(order,dict) or str(order.get('externalOid'))!=row['external_id']:
                 return self._halt(row,'entry_order_not_reconciled')
@@ -300,11 +415,19 @@ class ApprovedLiveExecutor:
                     or self._number(order.get('vol'))!=row['contracts']):
                 return self._halt(row,'entry_order_identity_mismatch')
             filled=self._number(order.get('dealVol'))
+            if filled>row['contracts']:
+                return self._halt(row,'entry_order_identity_mismatch')
             if filled!=row['contracts'] or order.get('state')!=3:
-                return self._halt(row,'entry_fill_not_fully_confirmed')
+                return self._partial(row,order,filled,token)
             position=self._position(row,order)
             if position is None:
-                return self._halt(row,'entry_position_not_identified')
+                confirmed=self._confirmed_close(row)
+                if confirmed is not None:
+                    return self._mark_closed(row,confirmed,reason='exchange_confirmed')
+                # A missing position is not proof of a close. Keep the intent open so a
+                # later history read can mark the TP/SL closed without latching the account.
+                return self._halt(row,'entry_position_not_identified',account=False)
+            self._book_exchange_costs(row,order,position)
             row.update(position_id=str(position['positionId']),status='entry_filled_unprotected')
             self._save(row)
             protection_state=self._protected(row,position)
@@ -328,7 +451,8 @@ class ApprovedLiveExecutor:
                     return self._save(row)
             return self._emergency_close(row,position,token)
         except Exception:
-            return self._halt(row,'reconciliation_incomplete')
+            row.update(halt_reason='reconciliation_incomplete')
+            return self._save(row)
 
     def _emergency_close(self,row,position,token):
         self._halt(row,'native_protection_not_confirmed')
