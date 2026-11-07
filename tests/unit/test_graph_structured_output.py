@@ -110,3 +110,17 @@ def test_size_proposal_from_signal_has_stop() -> None:
     assert proposal.stop_loss.price == pytest.approx(98.0)
     assert proposal.max_loss_if_stopped == pytest.approx(21.0)
     assert proposal.notional > 0
+
+
+@pytest.mark.parametrize('risk_pct',[.005,.01,.03])
+def test_fractional_equity_risk_budget_never_rounds_above_cap(risk_pct):
+    from trading.risk.engine import RiskContext,RiskEngine
+    from trading.config import RiskProfile
+    profile={.005:RiskProfile.CAPITAL_PRESERVATION,.01:RiskProfile.BALANCED,.03:RiskProfile.AGGRESSIVE_GROWTH}[risk_pct]
+    cfg=Settings(_env_file=None,risk_profile=profile,risk_per_trade_pct=risk_pct)
+    engine=RiskEngine(settings=cfg)
+    for equity in (500.0017,497.1923,13.7307,701.71719):
+        proposal=size_proposal_from_signal(_signal(),equity=equity,risk_per_trade_pct=risk_pct,target_leverage=3)
+        assert proposal.max_loss_if_stopped==equity*risk_pct
+        decision=engine.evaluate(proposal,RiskContext(equity=equity,starting_capital=equity,capital_floor=0))
+        assert 'MAX_LOSS_EXCEEDS_CAP' not in decision.reason_codes
