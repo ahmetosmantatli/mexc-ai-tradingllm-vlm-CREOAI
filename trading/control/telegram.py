@@ -270,7 +270,7 @@ class TelegramController:
             text+=f"Giriş: {p.get('entry',0):.6g}\nZarar durdur (SL): {p.get('stop',0):.6g} | Kâr al (TP): {p.get('target',0):.6g}\n"
             text+=f"Şu anki kâr/zarar: {p.get('unrealized',0):+.4f} USDT\n"
             origin=p.get('decision_ai') or {}
-            provider={'groq':'Groq','anthropic':'Claude'}.get(origin.get('provider'),'Kayıtlı değil')
+            provider={'groq':'Groq','gemini':'Gemini','anthropic':'Claude'}.get(origin.get('provider'),'Kayıtlı değil')
             text+=f"Giriş kararını veren: {provider} / {origin.get('model') or 'model bilgisi yok'}\n"
         return text
 

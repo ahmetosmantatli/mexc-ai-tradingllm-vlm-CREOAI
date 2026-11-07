@@ -140,7 +140,7 @@ def format_trace(trace):
     if trace.get('execution_status')=='rejected':
         text+=human_reason(trace.get('execution_reason'))+'\n'
     for attempt in trace.get('attempts',[]):
-        provider={'groq':'Groq','anthropic':'Claude'}.get(attempt.get('provider'),'AI')
+        provider={'groq':'Groq','gemini':'Gemini','anthropic':'Claude'}.get(attempt.get('provider'),'AI')
         text+=f"• {provider} ({attempt.get('model','model bilgisi yok')}): {provider_result(attempt)}.\n"
     known=[a['estimated_cost_usd'] for a in trace.get('attempts',[]) if a.get('estimated_cost_usd') is not None]
     pending=sum(a.get('pending_usd') or 0 for a in trace.get('attempts',[]))

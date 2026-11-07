@@ -206,3 +206,20 @@ An AI `trade` response is a proposal, not a fill. The analysis journal now separ
 `GROQ_REQUEST_TOKEN_BUDGET=8000` is a configurable conservative local token scheduling allowance, not a claim about your actual Groq tier. Estimated text tokens are UTF-8 bytes/3 plus512 overhead; vision adds2048 per chart and the configured output allowance. `GROQ_MAX_COMPLETION_TOKENS=2048` replaces the previous4096 minimum. The prompt uses compact JSON without removing fields. Requests larger than the local allowance are skipped before HTTP rather than silently truncated. A shared rolling60s model window also bounds estimated token reservations and30 requests across this fleet's accounts. `0` disables the local estimate/gate. Other programs sharing a Groq account are not observed. Set allowance to your actual model/account quota; the estimate may conservatively skip requests the provider would have accepted. Full three-chart VLM contexts can exceed a free allowance and route to Claude often.
 
 The original complete text/memory/images are forwarded once to Claude when primary output is unavailable and `AI_CLAUDE_FALLBACK_ENABLED=true`. Valid HOLD/WATCH never falls back. `false` waits instead; skipped or failed requests do not approve trades. Actual provider413 token-budget rejection and429 rate limits remain diagnosed even with local estimates. No tight retry or sleep blocks position protection. `AI_PROVIDER_TIMEOUT_SECONDS=25` applies per provider operation, with no automatic SDK retries; final decision TTL and current-price checks still reject stale outcomes. This can reduce failures caused by a15s client timeout but does not guarantee a provider response or erase uncertain past usage. Account quota handling has mock tests; deployment behavior still needs paper observation with real keys.
+
+## Gemini setup (text and vision)
+
+Set these in the server `.env`; keep the key out of chat, shell arguments and git:
+
+```dotenv
+GEMINI_API_KEY=your_server_only_key
+GEMINI_TEXT_MODEL=gemini-3.5-flash-lite
+GEMINI_VISION_MODEL=gemini-3.5-flash-lite
+AI_PRIMARY_PROVIDER=groq
+AI_VISION_PRIMARY_PROVIDER=gemini
+AI_CLAUDE_FALLBACK_ENABLED=true
+```
+
+With both keys, this chooses Groq → Gemini → Claude for text and Gemini → Groq → Claude for charts. Set `AI_PRIMARY_PROVIDER=gemini` to put Gemini first for text too. A missing free-provider key is skipped. Valid trade/watch/hold JSON ends the chain; local schema validation, executable-price/risk/control gates still apply. `AI_CLAUDE_FALLBACK_ENABLED=false` disables the final potentially paid Claude attempt while retaining the two free-provider attempts. `AI_PRIMARY_PROVIDER=anthropic` explicitly uses Claude directly unless a vision primary override is set. Accounts keep isolated state and identical complete market/memory/chart inputs on fallback; no promise of identical judgments between models. The application deadline blocks fresh fallback calls after a decision expires.
+
+Gemini uses Google's [OpenAI-compatible endpoint](https://ai.google.dev/gemini-api/docs/openai), explicit JSON object output and base64 inline charts. The [model code](https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite) is configurable. Access/free quotas depend on your Google project; this code neither enables Cloud Billing nor verifies that your project's usage is free. HTTP429 creates a shared per-model cooldown; transient/invalid responses have a60s cooldown and no immediate retry. Telegram diagnostics/usage exports identify Gemini and its token usage without assigning Claude pricing to it. No real Gemini request has been executed in this development session; mock tests verify unchanged text/images, correct failover, stop/deadline and no paid fallback after a valid free response.

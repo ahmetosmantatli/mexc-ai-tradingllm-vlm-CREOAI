@@ -177,3 +177,55 @@ def test_completion_budget_reduced_without_touching_input(tmp_path):
     router.complete_json(system='JSON',user='unchanged context',max_tokens=700)
     assert payloads[0]['max_completion_tokens']==2048
     assert payloads[0]['messages'][1]['content'][0]['text']=='unchanged context'
+
+
+def test_groq_then_gemini_preserves_context_without_paid_claude(tmp_path,monkeypatch):
+    import json
+    calls=[]
+    def handler(request):
+        calls.append((request.url.host,json.loads(request.content)))
+        if request.url.host=='api.groq.com':
+            return httpx.Response(429,headers={'retry-after':'60'})
+        return response(decision())
+    router=setup(tmp_path,handler,gemini_api_key='fake-gemini')
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:pytest.fail('valid Gemini HOLD must stop chain'))
+    assert router.complete_json(system='JSON rules',user='full context')==decision()
+    assert [host for host,_ in calls]==['api.groq.com','generativelanguage.googleapis.com']
+    assert calls[0][1]['messages']==calls[1][1]['messages']
+    assert router.last_provider=='gemini'
+    assert len(router.last_trace['attempts'])==2
+
+
+def test_gemini_then_groq_then_claude_with_exact_images(tmp_path,monkeypatch):
+    calls=[]
+    router=setup(tmp_path,lambda request:calls.append(request.url.host) or httpx.Response(503),gemini_api_key='fake-gemini',ai_vision_primary_provider='gemini')
+    path=tmp_path/'chart.png';path.write_bytes(b'chart')
+    forwarded=[]
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:forwarded.append(kw) or decision())
+    router.complete_json(system='JSON',user='context',images=[str(path)])
+    assert calls==['generativelanguage.googleapis.com','api.groq.com']
+    assert forwarded[0]['images']==[str(path)] and forwarded[0]['user']=='context'
+    assert [a['provider'] for a in router.last_trace['attempts']]==['gemini','groq','anthropic']
+
+
+def test_expired_decision_does_not_start_next_provider(tmp_path,monkeypatch):
+    import time
+    holder=[]
+    def handler(request):
+        holder[0].deadline=time.time()-1
+        return httpx.Response(429)
+    router=setup(tmp_path,handler,gemini_api_key='fake-gemini')
+    holder.append(router)
+    monkeypatch.setattr(router.gemini,'complete_json',lambda **kw:pytest.fail('stale free fallback'))
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:pytest.fail('stale paid fallback'))
+    assert router.complete_json(system='JSON',user='context') is None
+    assert len(router.last_trace['attempts'])==1
+
+
+def test_gemini_primary_can_run_without_other_keys(tmp_path):
+    cfg=Settings(_env_file=None,gemini_api_key='fake',groq_api_key='',anthropic_api_key='',ai_primary_provider='gemini',ai_claude_fallback_enabled=False)
+    store=RuntimeStore(str(tmp_path/'gemini-only'))
+    router=ProviderRouter(cfg,Budget(store,cfg),store,httpx.Client(transport=httpx.MockTransport(lambda request:response(decision()))))
+    assert router.available
+    assert router.complete_json(system='JSON',user='context')==decision()
+    assert router.last_provider=='gemini'

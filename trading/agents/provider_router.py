@@ -16,6 +16,7 @@ import httpx
 
 from trading.agents.anthropic_client import AnthropicClient
 from trading.agents.telemetry import safe_error
+from trading.agents.gemini_client import GeminiClient
 
 
 class ProviderRouter:
@@ -24,6 +25,7 @@ class ProviderRouter:
         self.claude = AnthropicClient(settings=settings, budget=budget)
         self.budget = None  # Claude's dollar cap does not block Groq.
         self.client = client or httpx.Client(timeout=settings.ai_provider_timeout_seconds)
+        self.gemini=GeminiClient(settings,store,self.client)
         logging.getLogger('httpx').setLevel(logging.WARNING)
         self.can_call = lambda: True
         self.response_validator = None
@@ -34,15 +36,22 @@ class ProviderRouter:
         self.successful_calls = 0
         self.last_trace = {}
         self.on_trace = None
+        self.deadline = None
 
     def close(self):
         self.client.close()
 
+    def _primary(self, images):
+        return (self.settings.ai_vision_primary_provider or self.settings.ai_primary_provider) if images else self.settings.ai_primary_provider
+
+    def _allowed(self):
+        return self.can_call() and (self.deadline is None or time.time()<self.deadline)
+
     @property
     def available(self):
-        if self.settings.ai_primary_provider=='anthropic':
+        if self._primary(self.settings.analysis_version=='vlm')=='anthropic':
             return self.claude.available
-        return bool(self.settings.groq_api_key or (self.settings.ai_claude_fallback_enabled and self.claude.available))
+        return bool(self.settings.groq_api_key or self.settings.gemini_api_key or (self.settings.ai_claude_fallback_enabled and self.claude.available))
 
     def valid(self, payload):
         if not isinstance(payload, dict):
@@ -126,7 +135,7 @@ class ProviderRouter:
                 payload.update(include_reasoning=False,reasoning_effort='low')
             if len(json.dumps(payload).encode())>19_000_000:
                 raise ValueError('request too large')
-            if not self.can_call():
+            if not self._allowed():
                 self.last_status='stopped'
                 attempt['status']='stopped'
                 return None
@@ -182,22 +191,47 @@ class ProviderRouter:
         self.last_provider='none'
         self.last_model=''
         self.last_status='not_called'
-        if not self.can_call():
+        if not self._allowed():
             self.last_status='stopped'
             return self._finish(None)
-        if self.settings.ai_primary_provider=='groq' and self.settings.groq_api_key:
-            result=self._groq(system,user,max_tokens,images)
+        primary=self._primary(images)
+        order=[] if primary=='anthropic' else [primary, 'gemini' if primary=='groq' else 'groq']
+        for provider in order:
+            if not self._allowed():
+                self.last_status='stopped'
+                return self._finish(None)
+            if provider=='groq' and self.settings.groq_api_key:
+                result=self._groq(system,user,max_tokens,images)
+            elif provider=='gemini' and self.settings.gemini_api_key:
+                self.last_provider='gemini'
+                self.last_model=self.settings.gemini_vision_model if images else self.settings.gemini_text_model
+                self.gemini.can_call=self._allowed
+                self.gemini.response_validator=self.response_validator
+                self.last_trace['attempts'].append(dict(provider='gemini',model=self.last_model,status='requesting',generation_requests=0,count_requests=0,latency_ms=0))
+                self._trace()
+                result=self.gemini.complete_json(system=system,user=user,max_tokens=max_tokens,images=images)
+                self.last_trace['attempts'][-1]=copy.deepcopy(self.gemini.last_attempt)
+                self.last_status=self.gemini.last_status
+                if result is not None:
+                    self.successful_calls+=1
+                else:
+                    attempt=self.gemini.last_attempt
+                    self.last_fallback_reason='gemini_http_'+str(attempt['http_status']) if attempt.get('http_status') else 'gemini_'+self.last_status
+            else:
+                continue
             if result is not None:
                 return self._finish(result)
-        if not self.can_call() or self.last_status=='stopped':
+            if self.last_status=='stopped':
+                return self._finish(None)
+        if not self._allowed():
             self.last_status='stopped'
             return self._finish(None)
-        if self.settings.ai_primary_provider=='groq' and not self.settings.ai_claude_fallback_enabled:
+        if primary!='anthropic' and not self.settings.ai_claude_fallback_enabled:
             self.last_status='primary_unavailable_fallback_disabled'
             return self._finish(None)
         self.last_provider='anthropic'
         self.last_model=self.settings.anthropic_model
-        self.claude.can_call=self.can_call
+        self.claude.can_call=self._allowed
         self.last_trace['attempts'].append(dict(provider='anthropic',model=self.last_model,status='requesting',generation_requests=0,count_requests=0,latency_ms=0))
         self._trace()
         result=self.claude.complete_json(system=system,user=user,max_tokens=max_tokens,images=images)

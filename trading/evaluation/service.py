@@ -59,6 +59,8 @@ class ContextEvaluator:
             started_at=started,status='pending',attempts=[],provider='none',model='')
         self.store.put('analysis_trace',trace)
         self.store.put('stage','model_evaluation')
+        if hasattr(self.llm,'deadline'):
+            self.llm.deadline=started+self.cfg.decision_ttl_seconds
         if hasattr(self.llm,'on_trace'):
             self.llm.on_trace=lambda update:self.store.put('analysis_trace',{**trace,**copy.deepcopy(update)})
         payload = self.llm.complete_json(system=(

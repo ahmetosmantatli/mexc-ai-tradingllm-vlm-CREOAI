@@ -161,7 +161,12 @@ class Settings(BaseSettings):
     drawdown_limit_pct: float = Field(default=0.08, gt=0, le=0.3)
     kill_switch_path: str = "data/STOP"
     groq_api_key: str = Field(default='', repr=False)
-    ai_primary_provider: str = Field(default='groq', pattern='^(groq|anthropic)$')
+    ai_primary_provider: str = Field(default='groq', pattern='^(groq|gemini|anthropic)$')
+    ai_vision_primary_provider: str = Field(default='',pattern='^(|groq|gemini|anthropic)$')
+    gemini_api_key: str = Field(default='',repr=False)
+    gemini_text_model: str = 'gemini-3.5-flash-lite'
+    gemini_vision_model: str = 'gemini-3.5-flash-lite'
+    gemini_max_completion_tokens: int = Field(default=2048,ge=700,le=8192)
     ai_claude_fallback_enabled: bool = True
     groq_text_model: str = 'openai/gpt-oss-20b'
     groq_vision_model: str = 'qwen/qwen3.8-27b'
