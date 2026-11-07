@@ -16,6 +16,7 @@ from trading.config import BrokerMode
 from trading.exchange.mexc_public import MexcPublicClient
 from trading.exchange.mexc_readonly import MexcReadOnlyClient
 from trading.quant.scanner import MarketScanner, LiquidityFilter
+from trading.quant.signals import CandidateSignal
 from trading.risk.engine import RiskEngine, RiskContext
 from trading.runtime.budget import Budget
 from trading.runtime.paper import PaperLedger
@@ -198,6 +199,76 @@ class PaperRunner:
     def candidate_queue(self):
         return CandidateQueue(self.store,getattr(self.cfg,'candidate_ttl_seconds',900),getattr(self.cfg,'candidate_queue_limit',80))
 
+    def monitor_watch(self,client=None):
+        """Observe up to40 durable watches on the independent scan cadence.
+
+        Price/closed-candle triggers do not call an LLM. A trigger only requests
+        a fresh quant setup; an old entry/SL/TP is never blindly rebased.
+        """
+        from trading.evaluation.watch import WatchCoordinator,watch_snapshot,TIMEFRAMES
+        coordinator=WatchCoordinator(self.store)
+        active=[row for row in watch_snapshot(self.store) if row['status'] in ('watching','triggered')][:40]
+        market=client or self.public
+        def inspect(summary):
+            symbol=summary['symbol']
+            try:
+                card=coordinator.card(symbol)
+                if self.ledger and symbol in self.ledger.positions:
+                    coordinator.terminate(symbol,'position_opened',expected_revision=card['revision'])
+                    return None
+                # Expiry can be applied without any exchange I/O.
+                coordinator.observe(symbol)
+                card=coordinator.card(symbol)
+                if card['status'] not in ('watching','triggered'):
+                    return None
+                ticker=self.quote(symbol,market)
+                plan=card['plan']
+                closed=None
+                tf=plan.get('timeframe')
+                if plan['trigger_condition'].startswith('closed_candle'):
+                    interval={'5m':'Min5','15m':'Min15','4h':'Hour4'}[tf]
+                    seconds=TIMEFRAMES[tf]
+                    now=time.time()
+                    rows=market.get_klines(symbol,interval=interval,limit=4)['candles']
+                    observations=[]
+                    for row in rows:
+                        if not isinstance(row,(list,tuple)) or len(row)<5:
+                            continue
+                        stamp=float(row[0]);price=float(row[4]);end=stamp+seconds
+                        if math.isfinite(stamp) and math.isfinite(price) and price>0 and end<=now:
+                            observations.append(dict(close=price,closed_at=end,complete=True))
+                    # Stale latest bars are not fresh confirmation.
+                    if observations and now-observations[-1]['closed_at']<seconds*2:
+                        closed={tf:observations}
+                event=coordinator.observe(symbol,price=ticker.last_price,closed_candles=closed,expected_revision=card['revision'])
+                card=coordinator.card(symbol)
+                if card['status']!='triggered':
+                    return None
+                marker=self.store.get('watch_trigger_queue:'+symbol,{})
+                snapshot=card['candidate']
+                scanner=MarketScanner(market,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,self.cfg.scanner_max_spread_bps),max_symbols=1,max_workers=1)
+                result=scanner.scan(symbols=[symbol])
+                candidates=[candidate for candidate in result.candidates if candidate.strategy.value==snapshot['strategy'] and candidate.side.value==snapshot['side'] and candidate.confidence>=.65]
+                if not candidates:
+                    self.store.put('watch_waiting_quant:'+symbol,dict(revision=card['revision'],at=time.time(),reason='triggered_waiting_fresh_quant_setup'))
+                    return None
+                candidate=max(candidates,key=lambda item:item.confidence)
+                latest=coordinator.card(symbol)
+                if latest['revision']!=card['revision'] or latest['status']!='triggered':
+                    return None
+                candidate.features.update(watch_trigger_revision=card['revision'],watch_trigger_event_id=event['id'] if event else marker.get('event_id',str(card.get('updated_at'))))
+                self.store.put('watch_trigger_queue:'+symbol,dict(revision=card['revision'],event_id=candidate.features['watch_trigger_event_id'],candidate=candidate.model_dump(mode='json')))
+                return candidate
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                self.store.put('watch_monitor_error:'+symbol,dict(at=time.time(),type=type(exc).__name__))
+                return None
+        with ThreadPoolExecutor(max_workers=min(4,max(1,len(active))),thread_name_prefix='watch-observe') as pool:
+            candidates=[candidate for candidate in pool.map(inspect,active) if candidate is not None]
+        self.store.put('watch_monitor_at',time.time())
+        return candidates
+
     def scan_market(self):
         """Refresh durable candidates without account/model calls or ledger locks.
 
@@ -219,7 +290,9 @@ class PaperRunner:
             client=MexcPublicClient(base_url=self.cfg.mexc_base_url,timeout_seconds=3)
         try:
             scanner=MarketScanner(client,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,self.cfg.scanner_max_spread_bps),max_symbols=self.cfg.scanner_max_symbols)
+            watched=self.monitor_watch(client)
             scan=scanner.scan()
+            scan.candidates.extend(watched)
             with self.lock:
                 positions=set(self.ledger.positions) if self.ledger else set()
                 seen=set(self.ledger.state['seen']) if self.ledger else set()
@@ -318,7 +391,9 @@ class PaperRunner:
         selected=[]
         price_drift=False
         for _ in range(count):
-            candidate=queue.next(open_symbols=open_symbols|{c.symbol for c in selected},seen=seen,
+            from trading.evaluation.watch import watch_snapshot
+            waiting_symbols={row['symbol'] for row in watch_snapshot(self.store) if row['status']=='watching'}
+            candidate=queue.next(open_symbols=open_symbols|waiting_symbols|{c.symbol for c in selected},seen=seen,
                 lease_seconds=max(120,self.cfg.decision_ttl_seconds+30) if parallel else 0)
             if candidate is None:
                 break
@@ -436,7 +511,7 @@ class PaperRunner:
         ticker = self.quote(signal.symbol)
         if abs(ticker.last_price/signal.entry_price-1) > min(signal.stop_distance_pct/2, 0.005):
             return finish('HOLD_PRICE_DRIFT')
-        with self.lock:
+        with self.lock, self.store.lock:
             if result.metadata.get('decision_started_at') and time.time()-result.metadata['decision_started_at'] > self.cfg.decision_ttl_seconds:
                 return finish('HOLD_DECISION_EXPIRED')
             if self.external_control:
@@ -445,6 +520,13 @@ class PaperRunner:
                     return finish('HOLD_SETTINGS_CHANGED')
             if Path(self.cfg.kill_switch_path).exists():
                 return finish('HOLD_KILL_SWITCH')
+            watch_revision=result.metadata.get('watch_revision')
+            if watch_revision is not None:
+                from trading.evaluation.watch import WatchCoordinator
+                current_watch=WatchCoordinator(self.store).card(signal.symbol)
+                if (current_watch['revision']!=watch_revision or current_watch.get('last_action')!='trade'
+                        or current_watch.get('candidate',{}).get('signal_id')!=signal.signal_id):
+                    return finish('HOLD_WATCH_CHANGED')
             if not queue.is_current(signal):
                 return finish('HOLD_CANDIDATE_STALE')
             if self.protection:
@@ -478,4 +560,6 @@ class PaperRunner:
                 ledger.state['events'][-1]['charts'] = opened['charts']
                 ledger.state['events'][-1]['analysis_version'] = self.cfg.analysis_version
                 ledger.save()
+                if watch_revision is not None:
+                    WatchCoordinator(self.store).terminate(signal.symbol,'position_opened',expected_revision=watch_revision)
         return finish('PAPER_OPENED')

@@ -308,3 +308,35 @@ def test_pool_mode_preserves_every_parallel_analysis_notification(tmp_path,monke
         assert snapshot['provider_pool']['groups']
     finally:
         fleet.stop()
+
+
+def test_watch_events_are_durable_deduplicated_and_private(tmp_path,monkeypatch):
+    from time import time
+    from trading.evaluation.watch import WatchCoordinator,WatchPlan
+    account=Account('demo',7,7,'','')
+    monkeypatch.setattr('trading.runtime.fleet.load_accounts',lambda *a,**kw:[account])
+    cfg=Settings(_env_file=None,runtime_db_path=str(tmp_path/'runtime'),shared_budget_db_path=str(tmp_path/'budget'),telegram_bot_token='fake')
+    fleet=Fleet(cfg)
+    try:
+        runner=fleet.runners[('demo','text')]
+        runner.ledger=PaperLedger(runner.store,500)
+        runner.status('HOLD_NO_QUALIFIED_SIGNAL')
+        signal=CandidateSignal(symbol='BTC_USDT',side=Side.LONG,strategy=StrategyName.TREND,
+            entry_price=100,stop_loss_price=98,take_profit_price=104,confidence=.8)
+        plan=WatchPlan(trigger_condition='price_above',trigger_price=101,invalidation_condition='below',invalidation_price=98,expires_at=time()+600)
+        coordinator=WatchCoordinator(runner.store)
+        assert coordinator.commit(signal,'watch',0,plan,rationale='Teyit bekle')
+        fleet.last_publish['demo']=float('inf')
+        fleet.publish(account)
+        fleet.publish(account)
+        rows=fleet.control_store.get('account:demo:outbox')
+        assert len([r for r in rows if r['id'].startswith('watch:')])==1
+        assert fleet.control_store.get('account:demo:status')['watchlist'][0]['symbol']=='BTC_USDT'
+        assert not fleet.runners[('demo','vlm')].store.get('watch_events',[])
+        coordinator.observe('BTC_USDT',price=102)
+        fleet.publish(account)
+        rows=fleet.control_store.get('account:demo:outbox')
+        assert len([r for r in rows if r['id'].startswith('watch:')])==2
+        assert any('Takip şartı gerçekleşti' in r['text'] for r in rows)
+    finally:
+        fleet.stop()

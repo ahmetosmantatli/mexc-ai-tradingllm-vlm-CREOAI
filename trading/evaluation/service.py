@@ -5,13 +5,16 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from trading.agents.schemas import EvaluationResult, GraphAction, MarketAnalystNote, StrategyReviewNote, PortfolioAnalystNote
+from trading.evaluation.watch import WatchPlan, WatchCoordinator, ACTIVE
 from trading.evaluation.planning import PlanSizing, PlanSizingError, apply_decision_sizing
-from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context, economic_review_key
+from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context, economic_review_key, canonical_watch_card, watch_review_key
 
 
 class ModelDecision(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
     sizing_plan: PlanSizing | None = None
+    watch_plan: WatchPlan | None = None
+    reviewed_watch_revision: int | None = Field(default=None,ge=0,strict=True)
     action: str = Field(pattern='^(trade|watch|hold)$')
     signal_id: str | None
     rationale: str = Field(max_length=1200)
@@ -29,7 +32,13 @@ SYSTEM_POLICY = (
     'A research objective is reporting context only, never a reason to force a trade or exceed risk limits. '
     'Only the supplied candidate may be traded and only when cross-timeframe evidence is coherent. '
     'Return exactly JSON: action (trade/watch/hold), signal_id (supplied candidate ID or null), '
-    'rationale, invalidation, watch_note, sizing_plan. For trade choose sizing_plan with integer leverage and '
+    'rationale, invalidation, watch_note, sizing_plan, watch_plan, reviewed_watch_revision. '
+    'For an actionable watch return watch_plan: trigger_condition (price_above/price_below/closed_candle_cross_above/closed_candle_cross_below), '
+    'trigger_price, timeframe (5m/15m/4h, required for candle triggers), invalidation_condition (above/below), '
+    'invalidation_price, expires_at (UTC epoch seconds within24h). Null watch_plan is a passive note without automatic triggers. '
+    'canonical_watch is the current cross-strategy plan for this symbol. If proposing a trade or new watch opposite to its active side, '
+    'explicitly set reviewed_watch_revision to that revision and explain concretely in Turkish why the old plan is invalid or superseded. '
+    'Never pretend to supersede an unseen plan. For trade choose sizing_plan with integer leverage and '
     'risk_per_trade_pct as an account fraction (.01 means 1%), within supplied limits; null retains policy sizing. '
     'Entry/SL/TP remain the candidate levels; never invent a different setup. Write concise Turkish rationale explaining the concrete missing confirmation '
     'or rejection, and a watch_note describing what would justify reconsideration. Do not just say insufficient evidence. '
@@ -129,6 +138,8 @@ class ContextEvaluator:
         memory.setdefault('last_fingerprint',None)
         if legacy.get('last_outcome') is not None:
             memory['last_outcome']=copy.deepcopy(legacy['last_outcome'])
+        coordinator=WatchCoordinator(self.store)
+        prior_watch=coordinator.card(symbol)
         positions = self.store.get('paper', {}).get('positions', {})
         account=dict(equity=equity,risk_per_trade_pct=risk_per_trade_pct,leverage=target_leverage,**context)
         exchange_cap=target_leverage
@@ -136,7 +147,9 @@ class ContextEvaluator:
             exchange_cap=self.public.get_contract_rules(symbol).max_leverage
         account['sizing_limits']=dict(max_risk_fraction=risk_per_trade_pct,policy_max_leverage=target_leverage,exchange_max_leverage=exchange_cap)
         account['operating_context']=account_research_context(self.store,equity,self.cfg)
+        account['canonical_watch']=canonical_watch_card(prior_watch)
         economic_basis=economic_review_key(account,positions)
+        economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
         evaluation_key=digest(dict(market=fingerprint,scope=scope,economic_basis=economic_basis))
         if memory.get('last_evaluation_key')==evaluation_key:
             self.store.put('stage','unchanged_closed_candles')
@@ -169,6 +182,10 @@ class ContextEvaluator:
             decision=ModelDecision.model_validate(payload)
             if decision.action=='trade' and decision.signal_id!=candidate.signal_id:
                 raise ValueError('unknown signal')
+            if decision.watch_plan is not None and decision.action!='watch':
+                raise ValueError('watch plan only allowed for watch action')
+            if decision.watch_plan is not None and not time.time()<decision.watch_plan.expires_at<=time.time()+86400:
+                raise ValueError('watch expiry must be within24h')
             return decision
         if hasattr(self.llm,'response_validator'):
             self.llm.response_validator=validate
@@ -197,6 +214,49 @@ class ContextEvaluator:
                 self.store.put(key,memory)
                 metadata['retry_at']=memory['last_failure']['retry_at']
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_or_unavailable_model',metadata=metadata)
+        def reject_coordinated(reason):
+            trace.update(status=reason,action='hold',execution_status='not_opened',rationale=decision.rationale)
+            self._save_trace(trace)
+            if provider_called:
+                memory['last_failure']=dict(evaluation_key=evaluation_key,retry_at=time.time()+60)
+                self.store.put(key,memory)
+                metadata['retry_at']=memory['last_failure']['retry_at']
+            return EvaluationResult(action=GraphAction.HOLD,hold_reason=reason,metadata=metadata)
+        # Coordinate model output against the exact symbol plan it reviewed.
+        # A watch without a structured condition remains passive for legacy models.
+        conflict=prior_watch.get('status') in ACTIVE and prior_watch.get('side')!=candidate.side.value
+        if (conflict and decision.action in ('trade','watch')
+                and (decision.reviewed_watch_revision!=prior_watch['revision'] or len(decision.rationale.strip())<12)):
+            metadata['watch_revision']=prior_watch['revision']
+            return reject_coordinated('watch_conflict')
+        if time.time()-started>self.cfg.decision_ttl_seconds:
+            trace.update(status='decision_expired',action='hold',execution_status='not_opened')
+            self._save_trace(trace)
+            return EvaluationResult(action=GraphAction.HOLD,hold_reason='decision_expired',metadata=metadata)
+        prepared_proposal=None
+        if decision.action=='trade':
+            try:
+                prepared_proposal=apply_decision_sizing(candidate,decision.sizing_plan,equity,risk_per_trade_pct,target_leverage,exchange_cap)
+            except PlanSizingError:
+                return reject_coordinated('invalid_model_sizing')
+        coordinated_action='hold' if decision.action=='watch' and decision.watch_plan is None else decision.action
+        try:
+            committed=coordinator.commit(candidate,coordinated_action,prior_watch['revision'],
+                watch_plan=decision.watch_plan,rationale=decision.rationale,reviewed_revision=decision.reviewed_watch_revision)
+        except ValueError:
+            committed=False
+        if not committed:
+            return reject_coordinated('watch_revision_changed')
+        committed_revision=prior_watch['revision']+1
+        metadata.update(watch_revision=committed_revision,watch_plan=decision.watch_plan.model_dump() if decision.watch_plan else None)
+        current_watch=coordinator.card(symbol)
+        if current_watch['revision']!=committed_revision:
+            return reject_coordinated('watch_revision_changed')
+        trace.update(watch_revision=committed_revision,watch_plan=metadata['watch_plan'])
+        # Save dedup against the state our own successful commit created so HOLD
+        # cannot invalidate its own cache through a coordinator revision bump.
+        economic_basis['account']['canonical_watch']=watch_review_key(current_watch)
+        evaluation_key=digest(dict(market=fingerprint,scope=scope,economic_basis=economic_basis))
         trace.update(status='completed',action=decision.action,rationale=decision.rationale,
             invalidation=decision.invalidation,watch_note=decision.watch_note,
             execution_status='awaiting_risk' if decision.action=='trade' else 'not_opened')
@@ -224,10 +284,7 @@ class ContextEvaluator:
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='decision_expired',metadata=metadata)
         if decision.action!='trade':
             return EvaluationResult(action=GraphAction.HOLD,hold_reason=decision.action,metadata=metadata)
-        try:
-            proposal=apply_decision_sizing(candidate,decision.sizing_plan,equity,risk_per_trade_pct,target_leverage,exchange_cap)
-        except PlanSizingError:
-            return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_model_sizing',metadata=metadata)
+        proposal=prepared_proposal
         proposal.rationale=decision.rationale
         return EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=candidate,
             market=MarketAnalystNote(mode='llm'),strategy=StrategyReviewNote(mode='llm'),

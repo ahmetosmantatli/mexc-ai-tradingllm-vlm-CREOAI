@@ -49,6 +49,10 @@ def human_reason(reason):
         'HOLD_EVALUATION_INTERVAL':'Bir sonraki analiz zamanı bekleniyor; şu anda yeni AI isteği gönderilmiyor.',
         'HOLD_SCAN_INTERVAL':'Yeni piyasa taraması bekleniyor.',
         'HOLD_PROVIDER_POOL_WAIT':'Ücretsiz sağlayıcı kotası veya erişimi bekleniyor; tarama ve açık işlem koruması sürüyor.',
+        'HOLD_WATCH_CHANGED':'Parite planı analiz sırasında değişti; eski kararla işlem açılmadı.',
+        'HOLD_WATCH_PLAN_CHANGED':'Parite planı analiz sırasında değişti; eski kararla işlem açılmadı.',
+        'HOLD_WATCH_WAITING_CANDIDATE':'Takip koşulu gerçekleşti; güncel ve geçerli işlem adayı bekleniyor.',
+        'HOLD_WATCH_CONFLICT':'Öneri mevcut parite planıyla çelişti; yeni işlem açılmadı.',
         'HOLD_QUEUE_EMPTY':'Güncel aday kuyruğu boş; bağımsız tarama sürüyor.',
         'HOLD_CANDIDATE_STALE':'Aday analiz sırasında eskidi veya taramada değişti; işlem açılmadı.',
         'HOLD_DUPLICATE_OR_ALREADY_OPEN':'Bu mum için işlem zaten kaydedilmiş veya paritede açık işlem var; yeni işlem açılmadı.',
@@ -148,6 +152,8 @@ def format_trace(trace):
         text+='AI gerekçesi: '+str(trace['rationale'])[:1200]+'\n'
     if trace.get('watch_note') and trace.get('action') in ('hold','watch'):
         text+='Takip notu: '+str(trace['watch_note'])[:600]+'\n'
+    if trace.get('action')=='watch':
+        text+='Koşullu takip ayrıntısı: /takip\n'
     if trace.get('invalidation'):
         text+='Planı geçersiz kılan koşul: '+str(trace['invalidation'])[:500]+'\n'
     if trace.get('why_reconsidered'):

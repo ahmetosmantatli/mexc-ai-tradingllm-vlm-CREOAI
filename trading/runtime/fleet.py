@@ -222,6 +222,20 @@ class Fleet:
             other=self.runners[(account.account_id,version)]
             with other.lock:
                 snapshot['variants'][version] = dict(paper=other.ledger.metrics() if other.ledger else None, positions=copy.deepcopy(other.ledger.positions) if other.ledger else {})
+        from trading.evaluation.watch import watch_snapshot
+        snapshot['watchlist']=watch_snapshot(runner.store)
+        for watched in snapshot['watchlist']:
+            waiting=runner.store.get('watch_waiting_quant:'+watched['symbol'],{})
+            if watched['status']=='triggered' and waiting.get('revision')==watched['revision']:
+                watched['status']='waiting_candidate'
+        for event in runner.store.get('watch_events',[]):
+            labels={'watching':'Takibe alındı','triggered':'Takip şartı gerçekleşti; yeniden analiz bekliyor',
+                'invalidated':'Takip iptal seviyesiyle sonlandı','expired':'Takip süresi doldu',
+                'cancelled':'Takip kaldırıldı','position_opened':'Takipten sanal işleme geçildi'}
+            if event.get('status') in labels:
+                self.controller.enqueue(account.account_id,
+                    f"Takip · {event.get('symbol','?')}\n{labels[event['status']]}\nBu bildirim tek başına işlem açıldığı anlamına gelmez. /takip",
+                    event_id=f"watch:{selected}:{event['id']}",buttons=True)
         snapshot['scan_summary']=runner.store.get('scan_summary',{})
         snapshot['scan_stage']=runner.store.get('scan_stage','idle')
         queue_rows=[row for row in runner.store.get('candidate_queue',[]) if row.get('expires_at',0)>time.time()

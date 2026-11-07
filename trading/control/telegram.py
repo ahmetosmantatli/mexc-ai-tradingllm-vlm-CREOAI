@@ -101,7 +101,7 @@ class TelegramController:
             rows.append([{'text':'Ayarları değiştir', 'callback_data':'control:settings'}, {'text':'Kasa seçimini değiştir', 'callback_data':'control:capital'}])
         count=len(self.position_targets(account_id))
         rows.append([{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':f'Açık işlemler ({count})', 'callback_data':'control:positions'}, {'text':'Günlük rapor', 'callback_data':'control:report'}])
-        rows.append([{'text':'Son analiz / AI istekleri', 'callback_data':'control:diagnostics'}])
+        rows.append([{'text':'Takip listesi', 'callback_data':'control:watchlist'}, {'text':'Son analiz / AI istekleri', 'callback_data':'control:diagnostics'}])
         if self.linked(account_id):
             rows.append([{'text':'✓ MEXC bağlı', 'callback_data':'control:status'}, {'text':'Bağlantıyı kaldır', 'callback_data':'control:disconnect'}])
         return {'inline_keyboard':rows}
@@ -180,6 +180,40 @@ class TelegramController:
         next_at=snapshot.get('next_evaluation_at')
         if next_at:
             text += f"Sonraki AI değerlendirmesine en az {max(0,next_at-time.time()):.0f} sn; uygun yeni aday gerekir.\n"
+        return text
+
+    def watchlist_text(self, account_id):
+        snapshot=self.snapshot_provider(account_id) or {}
+        rows=snapshot.get('watchlist') or []
+        text='Takip listesi · PAPER\nTakip koşulu gerçekleşmesi işlem açıldığı anlamına gelmez.\n'
+        active=[row for row in rows if row.get('status') in ('watching','triggered','waiting_candidate','reviewing')]
+        if not active:
+            return text+'Şu anda aktif takip planı yok. AI uygun gördüğünde koşullu takip oluşturabilir.'
+        labels={'price_above':'Fiyat üzerine çıkınca','price_below':'Fiyat altına inince',
+                'close_above':'Mum üzerinde kapanınca','close_below':'Mum altında kapanınca',
+                'closed_candle_cross_above':'Mum seviyeyi yukarı geçerek kapanınca','closed_candle_cross_below':'Mum seviyeyi aşağı geçerek kapanınca'}
+        statuses={'watching':'Koşul bekleniyor','triggered':'Koşul gerçekleşti; yeniden analiz bekliyor',
+                  'waiting_candidate':'Koşul gerçekleşti; güncel algoritma adayı bekleniyor',
+                  'reviewing':'Yeniden inceleniyor'}
+        for row in active[:12]:
+            remaining=max(0,(row.get('expires_at') or 0)-time.time())
+            text+=f"\n{row.get('symbol','?')} · {row.get('side','?')}\n"
+            text+=statuses.get(row.get('status'),row.get('status','?'))+'\n'
+            text+=f"{labels.get(row.get('trigger_type'),'Tetikleyici')}: {row.get('trigger_price','?')}"
+            if row.get('timeframe_seconds'):
+                text+=f" | {row['timeframe_seconds']//60} dk"
+            text+=f"\nKalan takip süresi: {remaining/60:.0f} dk\n"
+            if row.get('reason'):
+                reason={'model_watch':'AI teyit bekliyor','trigger_confirmed':'Takip koşulu gerçekleşti'}.get(row['reason'],row['reason'])
+                text+=f"Gerekçe: {str(reason)[:240]}\n"
+            if row.get('invalidation'):
+                invalidation=row['invalidation']
+                if isinstance(invalidation,dict):
+                    direction='üstü' if invalidation.get('condition')=='above' else 'altı'
+                    invalidation=f"{invalidation.get('price','?')} {direction}"
+                text+=f"İptal: {invalidation}\n"
+        if len(active)>12:
+            text+=f"\nDiğer aktif takip: {len(active)-12}"
         return text
 
     def diagnostics_text(self, account_id):
@@ -387,7 +421,7 @@ class TelegramController:
         name = parts[0].split('@')[0].lower() if parts else ''
         mapping = {'/start':'menu', '/help':'menu', '/status':'status', '/durum':'status', '/balance':'status',
                    '/bakiye':'status', '/report':'report', '/history':'report', '/rapor':'report', '/settings':'settings', '/ayarlar':'settings', '/positions':'positions', '/pozisyonlar':'positions',
-                   '/diagnostics':'diagnostics', '/events':'diagnostics', '/run':'start', '/baslat':'start', '/pause':'pause', '/durdur':'stop', '/stop':'stop'}
+                   '/watchlist':'watchlist', '/takip':'watchlist', '/diagnostics':'diagnostics', '/events':'diagnostics', '/run':'start', '/baslat':'start', '/pause':'pause', '/durdur':'stop', '/stop':'stop'}
         if self.command_handler and self.command_handler(account.account_id, text, message):
             return
         if name in ('/demo','/capital'):
@@ -517,6 +551,8 @@ class TelegramController:
         elif command in ('risk005','risk01'):
             self.set_control(account_id,enabled=False)
             message='Eski risk düğmesi kullanılmıyor. /settings ile analiz sürümü ve trader modunu sırayla seç.'
+        elif command=='watchlist':
+            message=self.watchlist_text(account_id)
         elif command=='diagnostics':
             message=self.diagnostics_text(account_id)
         elif command=='report':

@@ -478,3 +478,17 @@ def test_quota_progress_has_no_fake_fixed_tour_countdown():
     assert 'sabit tur beklemesi yok' in text
     assert 'en az' not in text
     assert '4 farklı aday' in text
+
+
+def test_watchlist_plain_language_and_account_isolation(tmp_path):
+    import time
+    snapshots={'a':{'watchlist':[dict(symbol='AAA_USDT',side='long',status='watching',
+        trigger_type='close_above',trigger_price=12,timeframe_seconds=900,
+        expires_at=time.time()+600,reason='Yapı teyidi bekleniyor',invalidation='11 altı')]}}
+    ctl,calls=controller(tmp_path,snapshots)
+    text=ctl.watchlist_text('a')
+    assert 'AAA_USDT' in text and 'Mum üzerinde kapanınca: 12' in text
+    assert '15 dk' in text and 'işlem açıldığı anlamına gelmez' in text
+    assert 'AAA_USDT' not in ctl.watchlist_text('b')
+    ctl.dispatch(message(11,11,'/takip'))
+    assert 'AAA_USDT' in calls[-1][1]['text']
