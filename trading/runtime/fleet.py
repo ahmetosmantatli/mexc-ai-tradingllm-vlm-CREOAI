@@ -126,12 +126,14 @@ class Fleet:
             client.close()
         self.vault.put(ident,key,secret)
         self.control_store.put(f'account:{ident}:disconnected',False)
+        self.control_store.put(f'account:{ident}:linked',True)
         self.control_store.put(f'account:{ident}:session',uuid4().hex)
         self.replace_runners(ident,key,secret)
 
     def disconnect_account(self, ident):
         self.idle_account(ident)
         self.control_store.put(f'account:{ident}:disconnected',True)
+        self.control_store.put(f'account:{ident}:linked',False)
         if self.vault:
             self.vault.delete(ident)
         self.replace_runners(ident,'','')
@@ -139,7 +141,7 @@ class Fleet:
     def entry_control(self, account_id, version):
         control = self.controller.control(account_id)
         result = dict(control)
-        result['enabled'] = (control['enabled'] and not control.get('stopped',False) and not self.control_store.get(f'account:{account_id}:disconnected',False) and control['version']==version
+        result['enabled'] = (self.control_store.get(f'account:{account_id}:linked',False) and control.get('version_chosen',False) and control.get('profile_chosen',False) and control['enabled'] and not control.get('stopped',False) and not self.control_store.get(f'account:{account_id}:disconnected',False) and control['version']==version
                              and self.funding_health.get((account_id,version),False))
         return result
 
@@ -193,6 +195,8 @@ class Fleet:
             prefix='Claude API bakiyesi yetersiz. ' if snapshot.get('ai_status')=='provider_credit_exhausted' else ''
             self.controller.enqueue(account.account_id,prefix+'Claude çağrısı başarısız veya bütçe sınırına ulaşıldı. Yeni AI işlemleri bekliyor; açık pozisyon takibi devam ediyor. Sağlayıcı bakiyesi, erişim ve ağ durumunu kontrol et.',event_id='ai:'+str(time.time()))
         self.control_store.put(f'account:{account.account_id}:ai_notice',list(ai_state))
+        if snapshot.get('real_account') and not self.control_store.get(f'account:{account.account_id}:disconnected',False):
+            self.control_store.put(f'account:{account.account_id}:linked',True)
         snapshot['version'] = selected
         snapshot['control'] = self.controller.control(account.account_id)
         snapshot['protection'] = runner.protection.snapshot()
@@ -244,6 +248,28 @@ class Fleet:
         for protection in self.protections:
             protection.start()
 
+    @staticmethod
+    def apply_trader_mode(runner,control):
+        from trading.config import RiskProfile
+        from trading.risk.engine import RiskEngine
+        profile = control.get('risk_profile','balanced')
+        limits = {
+            'capital_preservation': (.005,3,2,.02,.08),
+            'balanced': (.01,5,3,.035,.12),
+            'aggressive_growth': (.03,10,4,.055,.225),
+        }
+        if profile not in limits:
+            profile='balanced'
+        risk,leverage,positions,daily,drawdown=limits[profile]
+        runner.cfg.risk_profile=RiskProfile(profile)
+        runner.cfg.risk_per_trade_pct=min(control['risk_per_trade_pct'],risk)
+        runner.cfg.paper_max_leverage=leverage
+        runner.cfg.default_target_leverage=leverage
+        runner.cfg.paper_max_positions=positions
+        runner.cfg.daily_loss_limit_pct=daily
+        runner.cfg.drawdown_limit_pct=drawdown
+        runner.risk=RiskEngine(settings=runner.cfg)
+
     def execute_commands(self, account):
         key=f'account:{account.account_id}:commands'
         commands=self.control_store.get(key,[])
@@ -289,7 +315,7 @@ class Fleet:
                 # Persistence failure must be visible and fail closed.
                 future.result()
             if (future is None or future.done()) and time.time()-self.last_status.get(key,0)>self.cfg.position_poll_seconds:
-                runner.cfg.risk_per_trade_pct=control['risk_per_trade_pct']
+                self.apply_trader_mode(runner,control)
                 self.last_status[key]=time.time()
                 self.futures[account.account_id]=self.pool.submit(runner.cycle)
             self.publish(account)

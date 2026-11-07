@@ -39,3 +39,27 @@ def test_manual_close_books_pnl_and_rejects_stale_position(tmp_path):
     book.close_manual('BTC_USDT',102,102.01,stamp)
     assert book.state['events'][-1]['reason']=='MANUAL'
     assert book.equity>500 and not book.positions
+
+
+def test_expired_credentials_are_deleted_not_treated_as_menu(tmp_path):
+    ctl=TelegramController('fake',[Account('a',1,1,'','')],RuntimeStore(str(tmp_path/'control')))
+    sent=[];calls=[];bound=[]
+    ctl.send=lambda account,text,**kw:sent.append(text)
+    ctl.call=lambda method,**kw:calls.append(method)
+    flow=ConnectionFlow(ctl,object(),lambda *args:bound.append(args),lambda _:None)
+    update={'message':{'message_id':7,'chat':{'id':1,'type':'private'},'from':{'id':1},'text':'{"api_key":"expired-key","api_secret":"expired-secret"}'}}
+    assert flow.handle(update)
+    assert 'deleteMessage' in calls and not bound
+    assert any('kaydedilmedi' in text for text in sent)
+    assert not any('expired-secret' in text for text in sent)
+
+
+def test_connected_account_connect_does_not_reopen_secret_prompt(tmp_path):
+    ctl=TelegramController('fake',[Account('a',1,1,'','')],RuntimeStore(str(tmp_path/'control')))
+    ctl.store.put('account:a:linked',True)
+    sent=[]
+    ctl.send=lambda account,text,**kw:sent.append(text)
+    flow=ConnectionFlow(ctl,object(),lambda *args:None,lambda _:None)
+    assert flow.handle({'message':{'chat':{'id':1,'type':'private'},'from':{'id':1},'text':'/connect'}})
+    assert any('zaten bağlı' in text for text in sent)
+    assert ctl.store.get('account:a:connect_until') is None

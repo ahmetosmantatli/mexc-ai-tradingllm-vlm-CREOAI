@@ -59,3 +59,18 @@ def test_closed_position_funding_is_reconciled_once(tmp_path):
     book.reconcile_closed_funding('BTC_USDT',1000,2000,.001,100)
     assert abs(book.equity-(before-qty*.1))<1e-8
     assert book.state['events'][-1]['kind']=='FUNDING_ADJUSTMENT'
+
+
+def test_trader_profiles_change_effective_engine_and_limits():
+    from types import SimpleNamespace
+    from trading.config import RiskProfile
+    runner=SimpleNamespace(cfg=Settings(_env_file=None))
+    Fleet.apply_trader_mode(runner,{'risk_profile':'aggressive_growth','risk_per_trade_pct':.03})
+    assert runner.cfg.risk_per_trade_pct==.03
+    assert runner.cfg.paper_max_leverage==10
+    assert runner.cfg.paper_max_positions==4
+    assert runner.risk.preset.profile==RiskProfile.AGGRESSIVE_GROWTH
+    Fleet.apply_trader_mode(runner,{'risk_profile':'capital_preservation','risk_per_trade_pct':.03})
+    assert runner.cfg.risk_per_trade_pct==.005
+    assert runner.cfg.paper_max_positions==2
+    assert runner.cfg.daily_loss_limit_pct==.02

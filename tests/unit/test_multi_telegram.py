@@ -27,6 +27,12 @@ def controller(tmp_path, snapshots=None):
     return ctl,calls
 
 
+def ready(ctl, ident):
+    ctl.store.put(f'account:{ident}:linked',True)
+    ctl._command(ident,'vlm')
+    ctl._command(ident,'trader_balanced')
+
+
 def message(user,chat,text,chat_type='private'):
     return dict(message={'from':dict(id=user), 'chat':dict(id=chat,type=chat_type),'text':text})
 
@@ -63,6 +69,7 @@ def test_registry_rejects_duplicate_users_group_chats(tmp_path):
 
 def test_controls_are_persistent_and_account_isolated(tmp_path):
     ctl,calls=controller(tmp_path)
+    ready(ctl,'a')
     assert ctl.control('a')['enabled'] is False
     ctl.dispatch(message(11,11,'/run'))
     assert ctl.control('a')['enabled']
@@ -154,6 +161,7 @@ def test_one_recipient_failure_does_not_block_another(tmp_path):
 
 def test_stop_pauses_without_closing_and_start_resumes(tmp_path):
     ctl,calls=controller(tmp_path)
+    ready(ctl,'a')
     ctl.dispatch(message(11,11,'/run'))
     ctl.dispatch(message(11,11,'/stop'))
     assert not ctl.control('a')['enabled'] and ctl.control('a')['stopped']
@@ -222,3 +230,57 @@ def test_external_command_hook_receives_only_authorized_messages(tmp_path):
     ctl.dispatch(message(99,99,'/link'))
     ctl.dispatch(message(11,11,'/link'))
     assert seen==[('a','/link')]
+
+
+def test_wizard_requires_verified_link_then_version_then_mode(tmp_path):
+    ctl,calls=controller(tmp_path)
+    ctl.dispatch(message(11,11,'/run'))
+    assert not ctl.control('a')['enabled']
+    assert 'MEXC hesabını bağla' in str(calls[-1][1]['reply_markup'])
+    # Neither arbitrary snapshot nor an old profile callback bypasses linking.
+    ctl.dispatch(callback(11,11,'control:trader_aggressive'))
+    assert not ctl.control('a')['profile_chosen']
+    ctl.store.put('account:a:linked',True)
+    ctl.dispatch(message(11,11,'/start'))
+    keyboard=str(calls[-1][1]['reply_markup'])
+    assert 'MEXC hesabını bağla' not in keyboard
+    assert 'MEXC bağlı' in keyboard
+    assert 'VLM' in keyboard
+    ctl.dispatch(callback(11,11,'control:vlm'))
+    assert 'Agresif' in str(calls[-2][1]['reply_markup'])
+    ctl.dispatch(message(11,11,'/run'))
+    assert not ctl.control('a')['enabled']
+    ctl.dispatch(callback(11,11,'control:trader_aggressive'))
+    state=ctl.control('a')
+    assert state['risk_profile']=='aggressive_growth'
+    assert state['risk_per_trade_pct']==.03 and state['max_leverage']==10
+    assert not state['enabled']
+    assert '15 TL' in calls[-2][1]['text']
+    ctl.dispatch(message(11,11,'/run'))
+    assert ctl.control('a')['enabled']
+    assert not ctl.control('b')['enabled']
+
+
+def test_stale_start_after_disconnect_and_version_change_is_blocked(tmp_path):
+    ctl,calls=controller(tmp_path)
+    ready(ctl,'a')
+    ctl.dispatch(message(11,11,'/run'))
+    ctl.dispatch(callback(11,11,'control:text'))
+    assert not ctl.control('a')['enabled'] and not ctl.control('a')['profile_chosen']
+    ctl.dispatch(callback(11,11,'control:start'))
+    assert not ctl.control('a')['enabled']
+    ctl.dispatch(callback(11,11,'control:trader_preservation'))
+    assert ctl.control('a')['risk_per_trade_pct']==.005
+    ctl.store.put('account:a:disconnected',True)
+    ctl.dispatch(callback(11,11,'control:start'))
+    assert not ctl.control('a')['enabled']
+    assert 'MEXC hesabını bağla' in str(calls[-2][1]['reply_markup'])
+
+
+def test_legacy_risk_callback_cannot_override_mode(tmp_path):
+    ctl,calls=controller(tmp_path)
+    ready(ctl,'a')
+    before=ctl.control('a')['risk_per_trade_pct']
+    ctl.dispatch(callback(11,11,'control:risk005'))
+    assert ctl.control('a')['risk_per_trade_pct']==before
+    assert not ctl.control('a')['enabled']

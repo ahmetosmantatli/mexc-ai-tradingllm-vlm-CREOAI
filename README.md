@@ -107,3 +107,17 @@ Initial server registry may now contain empty credential environment references;
 `POSITION_UPDATE_SECONDS=60` posts active position status periodically; `/positions` queries the latest supervised snapshot. These are timestamped observations, not tick-by-tick guarantees. Trade opens include chart album, entry/SL/TP, rationale, paper balance and latest real-account observation. Manual/SL/TP closes include net result. Slow model analysis cannot block price protection, but Telegram network delivery may be delayed.
 
 Set `AI_BUDGET_ENABLED=false` to disable local daily/total caps while retaining spend accounting. Provider credit errors generate a Telegram warning and block AI entries; supervision continues. A provider-side limit still controls real spend, and other API users are outside this accounting. To restore local caps, set true. Updated `.env.example` leaves local caps off per operator preference; existing `.env` must be edited explicitly.
+
+## Guided settings flow
+
+Telegram now requires verified MEXC connection, explicit text/VLM selection, then a trader profile, a readable summary, and explicit Start. Existing accounts migrate paused until selections are made again. A linked account shows connected/disconnect rather than another connect prompt. Historical Telegram messages retain their old keyboards; stale Start callbacks are still checked against current settings. `/settings` pauses entries and reopens the version/profile sequence.
+
+Profiles are effective paper risk presets, not promised returns:
+
+- Capital preservation: 0.5% planned stop loss/trade, maximum 3x, two positions, 2% daily loss halt, 8% peak drawdown halt.
+- Balanced: 1% planned stop loss/trade, maximum 5x, three positions, 3.5% daily loss halt, 12% peak drawdown halt.
+- Aggressive: 3% planned stop loss/trade, maximum 10x, four positions, 5.5% daily loss halt, 22.5% peak drawdown halt.
+
+Exchange contract limits, margin availability and stop-to-liquidation checks may reduce size or reject the setup. Profiles share the same candidate strategies and typed analysis pipeline; aggressive is a risk posture, not a new proven strategy. No settings enable live orders. Existing positions retain their recorded SL/TP/leverage when changing settings; newly proposed risk uses the new profile. A settings change while AI runs invalidates that in-flight entry.
+
+Messages resembling API credentials sent without a live `/connect` session are best-effort deleted and explicitly reported as **not saved**. The bot no longer responds to such input with a misleading generic menu. Do not post keys in screenshots; revoke/replace any exposed key on MEXC.

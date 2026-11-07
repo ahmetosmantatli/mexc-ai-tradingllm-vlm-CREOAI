@@ -170,7 +170,8 @@ class PaperRunner:
 
     def _entries(self, account):
         ledger = self.ledger
-        if self.external_control and not self.external_control().get('enabled'):
+        evaluation_control = self.external_control() if self.external_control else None
+        if evaluation_control and not evaluation_control.get('enabled'):
             return self.status('HOLD_TELEGRAM_PAUSED')
         if self.protection:
             self.protection.assert_ready()
@@ -188,7 +189,7 @@ class PaperRunner:
             return self.status('HOLD_LOSS_CIRCUIT_BREAKER')
         if account and account.available <= 0:
             return self.status('HOLD_NO_AVAILABLE_MARGIN')
-        if len(risk_positions) >= 2:
+        if len(risk_positions) >= self.cfg.paper_max_positions:
             return self.status('HOLD_POSITION_LIMIT')
         if not self.llm.available:
             return self.status('HOLD_CLAUDE_NOT_CONFIGURED')
@@ -221,7 +222,7 @@ class PaperRunner:
         if not eligible:
             return self.status('HOLD_NO_QUALIFIED_SIGNAL')
         self.store.put('last_evaluation_at', time.time())
-        risk_pct = min(self.cfg.risk_per_trade_pct, self.risk.preset.risk_per_trade_pct, 0.01)
+        risk_pct = min(self.cfg.risk_per_trade_pct, self.risk.preset.risk_per_trade_pct)
         result = self.graph.evaluate_candidates(eligible, equity=analysis_equity,
             open_risk=sum(p['risk'] for p in risk_positions.values()), open_positions=len(risk_positions),
             risk_profile=self.cfg.risk_profile.value, risk_per_trade_pct=risk_pct,
@@ -255,8 +256,10 @@ class PaperRunner:
         with self.lock:
             if result.metadata.get('decision_started_at') and time.time()-result.metadata['decision_started_at'] > self.cfg.decision_ttl_seconds:
                 return self.status('HOLD_DECISION_EXPIRED')
-            if self.external_control and not self.external_control().get('enabled'):
-                return self.status('HOLD_TELEGRAM_PAUSED')
+            if self.external_control:
+                latest_control=self.external_control()
+                if not latest_control.get('enabled') or latest_control.get('updated_at')!=evaluation_control.get('updated_at'):
+                    return self.status('HOLD_SETTINGS_CHANGED')
             if self.protection:
                 self.protection.assert_ready()
             current = ledger.metrics()
@@ -266,7 +269,7 @@ class PaperRunner:
             context.equity = ledger.equity
             context.open_risk = sum(p['risk'] for p in ledger.positions.values())
             context.open_positions = len(ledger.positions)
-            if context.open_positions >= 2 or not self.risk.evaluate(proposal, context).accepted:
+            if context.open_positions >= self.cfg.paper_max_positions or not self.risk.evaluate(proposal, context).accepted:
                 return self.status('HOLD_RISK_CHANGED')
             opened = ledger.open(proposal, rules, ticker.bid1, ticker.ask1, signal.features['dedup_key'], risk_pct, self.cfg.liquidation_buffer_pct)
             if opened:

@@ -23,6 +23,9 @@ class ConnectionFlow:
         ident=account.account_id
         command=callback.get('data','') if callback else message.get('text','').strip()
         if command in ('/connect','/bagla','control:connect'):
+            if self.controller.store.get(f'account:{ident}:linked',False) and not self.controller.store.get(f'account:{ident}:disconnected',False):
+                self.controller.send(ident,'MEXC zaten bağlı. Hesap değiştirmek için önce bağlantıyı kaldır.',buttons=True)
+                return True
             if self.vault is None:
                 self.controller.send(ident,'Hesap bağlama için sunucuda ACCOUNT_VAULT_KEY ayarlanmalı.')
                 return True
@@ -40,6 +43,7 @@ class ConnectionFlow:
             except Exception as exc:
                 self.controller.send(ident,str(exc) if isinstance(exc,ValueError) else 'Bağlantı kaldırılamadı; mevcut pozisyonları ve işlemi kontrol et.')
                 return True
+            self.controller.store.put(f'account:{ident}:linked',False)
             self.controller.send(ident,'MEXC bağlantısı kaldırıldı. Yeni anahtar için /connect. Borsadaki API anahtarı iptal edilmez.')
         elif command=='/cancel':
             self.controller.store.put(f'account:{ident}:connect_until',0)
@@ -71,7 +75,16 @@ class ConnectionFlow:
             except Exception:
                 self.controller.send(ident,'Bağlama başarısız. Açık pozisyon/analiz, anahtar izinleri, IP ve JSON biçimini kontrol et. Yeniden denemek için /connect.')
                 return True
-            self.controller.send(ident,'MEXC hesabı doğrulandı ve bağlandı. Yeni paper oturumu; başlatmak için /run.')
+            self.controller.store.put(f'account:{ident}:linked',True)
+            self.controller.set_control(ident,enabled=False,version_chosen=False,profile_chosen=False,risk_profile=None)
+            self.controller.send(ident,'MEXC hesabı doğrulandı ve bağlandı. Şimdi analiz sürümünü seç: VLM veya Görselsiz.',buttons=True)
+        elif not callback and ('api_secret' in command or 'api_key' in command):
+            try:
+                self.controller.call('deleteMessage',chat_id=account.telegram_chat_id,message_id=message['message_id'])
+            except Exception:
+                self.controller.send(ident,'Anahtar mesajını sohbetinden elle sil.')
+            self.controller.send(ident,'Bu bilgiler kaydedilmedi: bağlantı oturumu yok veya 3 dakikalık süre dolmuş. Önce /connect yaz, sonra bilgileri gönder.')
+            return True
         else:
             return False
         if callback:

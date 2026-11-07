@@ -14,6 +14,13 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+TRADER_MODES = {
+    'trader_preservation': dict(label='Sermayeyi koru', risk_profile='capital_preservation', risk_per_trade_pct=.005, max_leverage=3., max_positions=2, daily_loss_limit_pct=.02, drawdown_limit_pct=.08),
+    'trader_balanced': dict(label='Dengeli', risk_profile='balanced', risk_per_trade_pct=.01, max_leverage=5., max_positions=3, daily_loss_limit_pct=.035, drawdown_limit_pct=.12),
+    'trader_aggressive': dict(label='Agresif', risk_profile='aggressive_growth', risk_per_trade_pct=.03, max_leverage=10., max_positions=4, daily_loss_limit_pct=.055, drawdown_limit_pct=.225),
+}
+
+
 
 class TelegramController:
     def __init__(self, token, accounts, store, snapshot_provider=None, client=None):
@@ -41,7 +48,8 @@ class TelegramController:
     def control(self, account_id):
         if account_id not in self.accounts:
             raise ValueError('unknown account')
-        return self.store.get(f'account:{account_id}:control', dict(enabled=False, version='text', risk_per_trade_pct=.01))
+        defaults=dict(enabled=False, version='text', version_chosen=False, profile_chosen=False, risk_profile=None, risk_per_trade_pct=.01)
+        return {**defaults, **self.store.get(f'account:{account_id}:control', {})}
 
     def set_control(self, account_id, **updates):
         state = self.control(account_id)
@@ -50,20 +58,51 @@ class TelegramController:
         self.store.put(f'account:{account_id}:control', state)
         return state
 
-    @staticmethod
-    def keyboard():
-        return {'inline_keyboard': [
-            [{'text':'▶ Başlat', 'callback_data':'control:start'}, {'text':'⏹ Botu durdur', 'callback_data':'control:stop'}],
-            [{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':'Pozisyonlar', 'callback_data':'control:positions'}],
-            [{'text':'Görselsiz', 'callback_data':'control:text'}, {'text':'VLM', 'callback_data':'control:vlm'}],
-            [{'text':'MEXC bağla', 'callback_data':'control:connect'}, {'text':'MEXC bağlantısını kes', 'callback_data':'control:disconnect'}],
-            [{'text':'Risk %0.5', 'callback_data':'control:risk005'}, {'text':'Risk %1', 'callback_data':'control:risk01'}],
-        ]}
+    def linked(self, account_id):
+        return (self.store.get(f'account:{account_id}:linked', False) is True
+                and not self.store.get(f'account:{account_id}:disconnected', False))
+
+    def keyboard(self, account_id):
+        control=self.control(account_id)
+        rows=[]
+        if not self.linked(account_id):
+            rows.append([{'text':'1 · MEXC hesabını bağla', 'callback_data':'control:connect'}])
+        elif not control['version_chosen']:
+            rows.append([{'text':'2 · Görselsiz', 'callback_data':'control:text'}, {'text':'2 · VLM (grafikli)', 'callback_data':'control:vlm'}])
+        elif not control['profile_chosen']:
+            rows.extend([[{'text':mode['label'], 'callback_data':'control:'+key}] for key,mode in TRADER_MODES.items()])
+        else:
+            rows.append([{'text':'✓ Çalışıyor' if control['enabled'] else '▶ Ayarlarla başlat', 'callback_data':'control:status' if control['enabled'] else 'control:start'}, {'text':'⏹ Botu durdur', 'callback_data':'control:stop'}])
+            rows.append([{'text':'Ayarları değiştir', 'callback_data':'control:settings'}])
+        rows.append([{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':'Pozisyonlar', 'callback_data':'control:positions'}])
+        if self.linked(account_id):
+            rows.append([{'text':'✓ MEXC bağlı', 'callback_data':'control:status'}, {'text':'Bağlantıyı kaldır', 'callback_data':'control:disconnect'}])
+        return {'inline_keyboard':rows}
+
+    def settings_text(self, account_id):
+        state=self.control(account_id)
+        if not self.linked(account_id):
+            return '1/4 · MEXC bağlantısı\nÖnce MEXC hesabını bağla. Bağlantı doğrulanmadan işlem başlatılmaz.'
+        if not state['version_chosen']:
+            return '2/4 · Analiz sürümü\nGörselsiz: sayısal mum/strateji verileri.\nVLM: aynı veriler + 4s/15dk/5dk grafikleri. Birini seç.'
+        if not state['profile_chosen']:
+            return f"3/4 · Trader modu\nAnaliz: {'VLM (grafikli)' if state['version']=='vlm' else 'Görselsiz'}\nSermayeyi koru, Dengeli veya Agresif seç. Modlar kazanç garantisi değildir."
+        mode=next((m for m in TRADER_MODES.values() if m['risk_profile']==state['risk_profile']),None)
+        if mode is None:
+            return 'Trader modu yeniden seçilmeli. /settings'
+        risk=state['risk_per_trade_pct']*100
+        return (f"4/4 · Ayar özeti | PAPER\nMEXC: bağlı\nAnaliz: {'VLM (grafikli)' if state['version']=='vlm' else 'Görselsiz'}\n"
+                f"Trader modu: {mode['label']}\nİşlem başına planlanan azami stop kaybı: %{risk:g}\n"
+                f"Örnek: 500 TL eşdeğeri kasada yaklaşık {500*state['risk_per_trade_pct']:g} TL planlanan risk. Bu, yatırılacak teminat yüzdesi değildir.\n"
+                f"Kaldıraç üst sınırı: {state['max_leverage']:g}x; parite/teminat/stop koşulları daha düşük değer gerektirebilir.\n"
+                f"Azami açık pozisyon: {state['max_positions']}\nGünlük kayıp eşiği: %{state['daily_loss_limit_pct']*100:g} | Zirveden düşüş: %{state['drawdown_limit_pct']*100:g}\n"
+                'Fiyat boşluklarında kayıp planı aşabilir. Uygun fırsatta işlem açılır; işlem zorunlu değil. '
+                + ('Bot bu ayarlarla çalışıyor.' if state['enabled'] else 'Başlat ile onayla.'))
 
     def send(self, account_id, text, buttons=False, keyboard=None):
         data = dict(chat_id=self.accounts[account_id].telegram_chat_id, text=text[:4000])
         if buttons or keyboard is not None:
-            data['reply_markup'] = keyboard if keyboard is not None else self.keyboard()
+            data['reply_markup'] = keyboard if keyboard is not None else self.keyboard(account_id)
         return self.call('sendMessage', **data)
 
     def status_text(self, account_id, positions=False):
@@ -71,6 +110,7 @@ class TelegramController:
         control = self.control(account_id)
         snapshot = self.snapshot_provider(account_id)
         text = (f'Hesap: {account.account_id} | PAPER\n'
+                f"MEXC: {'bağlı' if self.linked(account_id) else 'bağlı değil'}\n"
                 f"Yeni işlem: {'açık' if control['enabled'] else 'duraklatıldı'} | Sürüm: {control['version']}\n"
                 f"Planlanan risk: %{100*control['risk_per_trade_pct']:g}\n")
         if not snapshot:
@@ -132,7 +172,7 @@ class TelegramController:
         parts = text.split()
         name = parts[0].split('@')[0].lower() if parts else ''
         mapping = {'/start':'menu', '/help':'menu', '/status':'status', '/durum':'status', '/balance':'status',
-                   '/bakiye':'status', '/positions':'positions', '/pozisyonlar':'positions',
+                   '/bakiye':'status', '/settings':'settings', '/ayarlar':'settings', '/positions':'positions', '/pozisyonlar':'positions',
                    '/run':'start', '/baslat':'start', '/pause':'pause', '/durdur':'stop', '/stop':'stop'}
         if self.command_handler and self.command_handler(account.account_id, text, message):
             return
@@ -168,22 +208,41 @@ class TelegramController:
             return
         if self.action_handler and self.action_handler(account_id, command):
             return
-        if command in ('start','pause','stop'):
-            self.set_control(account_id, enabled=command=='start', stopped=command=='stop')
-            message = ('Yeni paper girişleri açıldı.' if command=='start' else
-                       'Yeni girişler duraklatıldı. Mevcut pozisyon takibi devam eder; pozisyonlar otomatik kapatılmaz.')
+        if command=='start':
+            state=self.control(account_id)
+            if not (self.linked(account_id) and state['version_chosen'] and state['profile_chosen']):
+                self.set_control(account_id,enabled=False)
+                message='Başlatılmadı: önce bağlantı, analiz sürümü ve trader modu seçilmeli.\n'+self.settings_text(account_id)
+            else:
+                self.set_control(account_id,enabled=True,stopped=False)
+                message='Seçilen ayarlarla yeni paper girişleri açıldı.\n'+self.settings_text(account_id)
+        elif command in ('pause','stop'):
+            self.set_control(account_id,enabled=False,stopped=command=='stop')
+            message='Yeni girişler duraklatıldı. Mevcut pozisyon takibi devam eder; pozisyonlar otomatik kapatılmaz.'
+        elif command in ('settings','menu'):
+            if command=='settings':
+                self.set_control(account_id,enabled=False,version_chosen=False,profile_chosen=False)
+            message=self.settings_text(account_id)
         elif command in ('text','vlm'):
-            self.set_control(account_id, version=command, enabled=False)
-            message = f'Sürüm: {command}. Yeni girişler duraklatıldı; Başlat ile seçimi onayla. Diğer sürümün açık pozisyon takibi devam eder.'
+            if not self.linked(account_id):
+                message=self.settings_text(account_id)
+            else:
+                self.set_control(account_id,version=command,version_chosen=True,profile_chosen=False,enabled=False)
+                message=self.settings_text(account_id)
+        elif command in TRADER_MODES:
+            if not self.linked(account_id) or not self.control(account_id)['version_chosen']:
+                message='Önce analiz sürümünü seç.\n'+self.settings_text(account_id)
+            else:
+                mode={k:v for k,v in TRADER_MODES[command].items() if k!='label'}
+                self.set_control(account_id,**mode,profile_chosen=True,enabled=False)
+                message=self.settings_text(account_id)
         elif command in ('risk005','risk01'):
-            self.set_control(account_id, risk_per_trade_pct=.005 if command=='risk005' else .01)
-            message = 'Risk seçimi sonraki girişler için kaydedildi; motor daha sıkı sınır uygulayabilir.'
+            self.set_control(account_id,enabled=False)
+            message='Eski risk düğmesi kullanılmıyor. /settings ile analiz sürümü ve trader modunu sırayla seç.'
         elif command in ('status','positions'):
-            message = self.status_text(account_id, command=='positions')
+            message=self.status_text(account_id,command=='positions')
         else:
-            message = ('PAPER kontrol paneli. /run /pause /status /positions /version text|vlm\n'
-                       '/connect: MEXC bağla | /disconnect: bağlantıyı kaldır.\n'
-                       'Duraklat yalnız yeni girişleri durdurur.')
+            message=self.settings_text(account_id)
         self.send(account_id, message, buttons=True)
         if command=='positions':
             self.position_buttons(account_id)
