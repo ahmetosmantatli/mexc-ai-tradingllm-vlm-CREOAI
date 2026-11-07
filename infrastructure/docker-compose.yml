@@ -11,9 +11,10 @@ services:
     command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8080"]
     env_file:
       - ../.env
+    # BROKER_MODE and LIVE_TRADING_ENABLED come from ../.env. When they are
+    # unset, the image default stays paper and false. live + true starts the
+    # live runner, which remains disarmed until Telegram /arm.
     environment:
-      LIVE_TRADING_ENABLED: "false"
-      BROKER_MODE: paper
       RUNTIME_DB_PATH: /app/data/runtime.sqlite3
       KILL_SWITCH_PATH: /app/data/STOP
       DATABASE_URL: postgresql+psycopg://mexc:${POSTGRES_PASSWORD:-mexc}@postgres:5432/${POSTGRES_DB:-mexc_ai}
@@ -56,8 +57,6 @@ services:
     env_file:
       - ../.env
     environment:
-      LIVE_TRADING_ENABLED: "false"
-      BROKER_MODE: paper
       RUNTIME_DB_PATH: /app/data/runtime.sqlite3
       KILL_SWITCH_PATH: /app/data/STOP
       DATABASE_URL: postgresql+psycopg://mexc:${POSTGRES_PASSWORD:-mexc}@postgres:5432/${POSTGRES_DB:-mexc_ai}

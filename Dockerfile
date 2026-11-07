@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+# Paper is the image default only when the server .env leaves the live gates unset.
+# Compose env_file passes BROKER_MODE and LIVE_TRADING_ENABLED through; live + true
+# starts the live runner, still disarmed until Telegram /arm.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \

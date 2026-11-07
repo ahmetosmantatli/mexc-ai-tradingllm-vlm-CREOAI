@@ -22,6 +22,14 @@ LIVE_TRADING_ENABLED=false
 LIVE_OPERATOR_IDS=
 ```
 
+Compose passes those two gates through from the server `.env`. From `/opt/mexc-ai-trading`:
+
+```sh
+docker compose --env-file .env -f infrastructure/docker-compose.yml -p mexc-ai up --build -d
+```
+
+`live` and `true` start the live runner, still disarmed until `/arm`. Unset stays paper.
+
 `python -m trading.control.live_preflight` is still read-only. It does not arm
 the runner and it does not send orders. `PaperRunner` and the Telegram paper
 fleet still refuse live flags.

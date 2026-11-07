@@ -130,6 +130,28 @@ def attach(runner, batches, chat_id='900'):
     return inbox
 
 
+def test_compose_reads_live_gates_from_env_and_publishes_no_extra_ports():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    text = (root / 'infrastructure' / 'docker-compose.yml').read_text()
+    image = (root / 'Dockerfile').read_text()
+    assignments = []
+    ports = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if stripped.startswith(('LIVE_TRADING_ENABLED:', 'BROKER_MODE:')):
+            assignments.append(stripped)
+        if stripped.startswith('- "') or stripped.startswith("- '"):
+            ports.append(stripped)
+    assert assignments == []
+    assert ports == ['- "127.0.0.1:8080:8080"']
+    assert text.count('env_file:') == 2 and '../.env' in text
+    assert '["python", "-m", "apps.worker.main"]' in text
+    assert 'LIVE_TRADING_ENABLED=false' in image and 'BROKER_MODE=paper' in image
+
+
 def test_defaults_stay_paper_and_live_runner_refuses_them(tmp_path):
     from apps.worker.main import worker_mode
     plain = Settings(_env_file=None)
