@@ -426,3 +426,36 @@ def test_diagnostics_routes_only_owner_and_shows_safe_trace_metadata(tmp_path):
     text=ctl.status_text('a')
     assert 'Parite 40' in text and 'AI için uygun 2' in text
     assert 'Son aday: BTC_USDT' in text
+
+
+def test_plain_position_panel_distinguishes_analysis_from_open_trade(tmp_path):
+    trace=dict(id='last-analysis',symbol='LIT_USDT',status='invalid_or_unavailable_model',action='hold',execution_status='not_opened')
+    snapshots={'a':dict(observed_at=1,reason='HOLD_EVALUATION_INTERVAL',paper=dict(equity=500,unrealized=0,realized=0),positions={},analysis_trace=trace)}
+    ctl,calls=controller(tmp_path,snapshots)
+    ctl.dispatch(message(11,11,'/positions'))
+    text=calls[-1][1]['text']
+    assert text.startswith('Sanal işlem paneli')
+    assert 'Açık sanal işlemler: 0' in text
+    assert 'Şu anda açık işlem yok' in text
+    assert 'İşlem açılmadı — analiz başarısız' in text
+    assert 'HOLD_EVALUATION_INTERVAL' not in text
+    assert 'invalid_or_unavailable_model' not in text
+    assert 'Açık işlemleri yenile' in str(calls[-1][1]['reply_markup'])
+    assert 'Açık işlemler (0)' in str(ctl.keyboard('a'))
+
+
+def test_position_cards_include_both_variants_and_entry_model(tmp_path):
+    def position(side,model):
+        return dict(side=side,entry=100,stop=98 if side=='long' else 102,target=104 if side=='long' else 96,
+                    leverage=3,unrealized=2.5,opened_at=1,decision_ai=dict(provider='groq',model=model))
+    snapshots={'a':dict(observed_at=1,reason='HOLD',variants={
+        'text':dict(positions={'BTC_USDT':position('long','text-model')}),
+        'vlm':dict(positions={'ETH_USDT':position('short','vision-model')})})}
+    ctl,_=controller(tmp_path,snapshots)
+    text=ctl.status_text('a',True)
+    assert 'Açık sanal işlemler: 2' in text
+    assert 'Yükseliş (LONG)' in text and 'Düşüş (SHORT)' in text
+    assert 'text-model' in text and 'vision-model' in text
+    assert 'Zarar durdur (SL)' in text and 'Kâr al (TP)' in text
+    assert '+2.5000 USDT' in text
+    assert 'Açık işlemler (2)' in str(ctl.keyboard('a'))

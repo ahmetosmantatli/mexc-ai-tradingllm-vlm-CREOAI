@@ -27,6 +27,7 @@ def test_variant_same_policy_bounded_memory_and_exact_charts(tmp_path,monkeypatc
     kwargs=dict(equity=500,risk_per_trade_pct=.01,target_leverage=3)
     first=service.evaluate_candidates([candidate],**kwargs)
     assert first.action==GraphAction.TRADE
+    assert store.get('analysis_trace')['execution_status']=='awaiting_risk'
     assert first.metadata['charts']==paths
     assert first.metadata['decision_ai']==dict(provider='anthropic',model='claude-sonnet-4-6',fallback_reason='groq_http_429')
     assert store.get('memory:BTC_USDT')['history'][-1]['decision_ai']==first.metadata['decision_ai']
@@ -58,3 +59,26 @@ def test_failed_analysis_retains_candidate_trace_without_prompt(tmp_path,monkeyp
     assert trace['status']=='invalid_or_unavailable_model'
     assert trace['attempts'][0]['http_status']==400
     assert store.get('analysis_history')[-1]['id']==trace['id']
+
+
+@pytest.mark.parametrize('reason,expected',[('PAPER_OPENED','opened'),('HOLD_PRICE_DRIFT','rejected'),('HOLD_RISK_REJECT','rejected'),('HOLD_SETTINGS_CHANGED','rejected')])
+def test_final_execution_outcome_is_persisted_separate_from_model_trade(tmp_path,reason,expected):
+    import threading
+    from trading.runtime.runner import PaperRunner
+    runner=PaperRunner.__new__(PaperRunner)
+    runner.store=RuntimeStore(str(tmp_path/'state'))
+    runner.lock=threading.RLock()
+    runner.ledger=None
+    runner.protection=None
+    runner.llm=SimpleNamespace(last_status='success')
+    trace=dict(id='decision',symbol='BTC_USDT',action='trade',status='completed',execution_status='awaiting_risk',attempts=[])
+    runner.store.put('analysis_trace',trace)
+    runner.store.put('analysis_history',[trace])
+    runner.status(reason)
+    assert runner.store.get('analysis_trace')['execution_status']==expected
+    assert runner.store.get('analysis_trace')['execution_reason']==reason
+    import json
+    saved=json.loads(runner.store.db.execute('SELECT payload FROM ai_usage_events').fetchone()[0])
+    assert saved['execution_status']==expected
+    runner.status('HOLD_EVALUATION_INTERVAL')
+    assert runner.store.get('analysis_trace')['execution_status']==expected

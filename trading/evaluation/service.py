@@ -54,7 +54,7 @@ class ContextEvaluator:
         prompt = json.dumps(dict(symbol=symbol, version=self.cfg.analysis_version,
             candidate=candidate.model_dump(mode='json'), market=chart_context,
             account=dict(equity=equity, risk_per_trade_pct=risk_per_trade_pct, leverage=target_leverage, **context),
-            memory=memory, positions=self.store.get('paper', {}).get('positions', {})), default=str)
+            memory=memory, positions=self.store.get('paper', {}).get('positions', {})), default=str,separators=(',',':'))
         trace=dict(id=uuid4().hex,symbol=symbol,strategy=candidate.strategy.value,confidence=candidate.confidence,
             started_at=started,status='pending',attempts=[],provider='none',model='')
         self.store.put('analysis_trace',trace)
@@ -78,10 +78,10 @@ class ContextEvaluator:
             if decision.action=='trade' and decision.signal_id != candidate.signal_id:
                 raise ValueError('unknown signal')
         except Exception:
-            trace.update(status='invalid_or_unavailable_model',action='hold')
+            trace.update(status='invalid_or_unavailable_model',action='hold',execution_status='not_opened')
             self._save_trace(trace)
             return EvaluationResult(action=GraphAction.HOLD, hold_reason='invalid_or_unavailable_model')
-        trace.update(status='completed',action=decision.action)
+        trace.update(status='completed',action=decision.action,execution_status='awaiting_risk' if decision.action=='trade' else 'not_opened')
         self._save_trace(trace)
         decision_ai=dict(provider=getattr(self.llm,'last_provider','unknown'),
             model=getattr(self.llm,'last_model','unknown'),

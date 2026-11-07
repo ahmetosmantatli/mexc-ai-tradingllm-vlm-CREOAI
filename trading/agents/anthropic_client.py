@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable
+import httpx
 
 from trading.config import Settings, get_settings
 
@@ -51,7 +52,7 @@ class AnthropicClient:
             import anthropic  # type: ignore
         except ImportError as exc:  # pragma: no cover - optional dep edge
             raise RuntimeError("anthropic package not installed") from exc
-        self._client = anthropic.Anthropic(api_key=self.api_key, timeout=15.0, max_retries=0)
+        self._client = anthropic.Anthropic(api_key=self.api_key, timeout=self.settings.ai_provider_timeout_seconds, max_retries=0)
         return self._client
 
     def complete_json(
@@ -157,7 +158,7 @@ class AnthropicClient:
                 attempt['error_category'] = 'rate_limit'
             elif status_code in (401, 403):
                 attempt['error_category'] = 'authentication_or_permission'
-            elif status_code in (408, 499):
+            elif status_code in (408, 499) or isinstance(exc,httpx.TimeoutException) or type(exc).__name__=="APITimeoutError":
                 attempt['error_category'] = 'ambiguous_timeout'
             elif isinstance(status_code, int) and 400 <= status_code < 500:
                 attempt['error_category'] = 'request_rejected'

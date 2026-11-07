@@ -206,10 +206,10 @@ class Fleet:
         snapshot['analysis_history']=runner.store.get('analysis_history',[])
         snapshot['ai_request_stats']=self.budget_store.get('ai_request_stats',{})
         trace=snapshot['analysis_trace']
-        if trace.get('completed_at'):
+        if trace.get('completed_at') and trace.get('execution_status') in ('opened','rejected','not_opened'):
             # One candidate-scoped result notification, no stale-status error spam.
             from trading.agents.telemetry import format_trace
-            self.controller.enqueue(account.account_id,format_trace(trace),event_id=f"analysis:{selected}:{trace['id']}")
+            self.controller.enqueue(account.account_id,format_trace(trace),event_id=f"analysis:{selected}:{trace['id']}",buttons=True)
         if snapshot.get('real_account') and not self.control_store.get(f'account:{account.account_id}:disconnected',False):
             self.control_store.put(f'account:{account.account_id}:linked',True)
         from trading.runtime.reports import daily_trade_report

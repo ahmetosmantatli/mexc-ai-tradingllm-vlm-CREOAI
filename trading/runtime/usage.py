@@ -1,8 +1,8 @@
 """Durable, allowlisted usage journal; no prompts, secrets or chart content."""
 import json
 
-TRACE_FIELDS=('id','symbol','strategy','confidence','started_at','completed_at','status','action','provider','model','fallback_reason')
-ATTEMPT_FIELDS=('provider','model','status','phase','http_status','error_category','error_code','error_param','latency_ms','generation_requests','count_requests','input_tokens','output_tokens','estimated_cost_usd','pending_usd')
+TRACE_FIELDS=('id','symbol','strategy','confidence','started_at','completed_at','status','action','provider','model','fallback_reason','execution_status','execution_reason')
+ATTEMPT_FIELDS=('provider','model','status','phase','http_status','error_category','error_code','error_param','latency_ms','generation_requests','count_requests','input_tokens','output_tokens','estimated_cost_usd','pending_usd','estimated_input_tokens','token_budget','completion_token_limit')
 
 
 def archive_trace(store, trace):

@@ -165,6 +165,9 @@ class Settings(BaseSettings):
     ai_claude_fallback_enabled: bool = True
     groq_text_model: str = 'openai/gpt-oss-20b'
     groq_vision_model: str = 'qwen/qwen3.8-27b'
+    groq_request_token_budget: int = Field(default=8000,ge=0)
+    groq_max_completion_tokens: int = Field(default=2048,ge=700,le=8192)
+    ai_provider_timeout_seconds: float = Field(default=25,ge=5,le=60)
     anthropic_model: str = "claude-sonnet-4-6"
     anthropic_daily_budget_usd: float = Field(default=3, ge=0)
     anthropic_total_budget_usd: float = Field(default=24, ge=0, le=25)

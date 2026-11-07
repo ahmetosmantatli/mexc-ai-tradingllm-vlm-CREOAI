@@ -102,6 +102,17 @@ class PaperRunner:
         self.ledger.roll_day()
 
     def status(self, reason):
+        trace=self.store.get('analysis_trace',{})
+        if trace.get('execution_status')=='awaiting_risk':
+            from trading.runtime.usage import archive_trace
+            trace.update(execution_status='opened' if reason=='PAPER_OPENED' else 'rejected',execution_reason=reason)
+            self.store.put('analysis_trace',trace)
+            history=self.store.get('analysis_history',[])
+            for row in history:
+                if row['id']==trace['id']:
+                    row.update(trace)
+            self.store.put('analysis_history',history)
+            archive_trace(self.store,trace)
         with self.lock:
             paper_snapshot = self.ledger.metrics() if self.ledger else None
             positions_snapshot = copy.deepcopy(self.ledger.positions) if self.ledger else {}
@@ -118,27 +129,26 @@ class PaperRunner:
 
     @staticmethod
     def status_text(s):
-        real, paper = s.get('real_account'), s.get('paper')
-        text = f"MEXC AI | PAPER\nDurum: {s['reason']}\n"
-        if real:
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-            observed = datetime.fromtimestamp(real['observed_at'], ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M:%S')
-            text += (f"Gerçek futures: {real['equity']:.4f} USDT\n"
-                     f"Kullanılabilir: {real['available']:.4f} USDT\nSon hesap okuması: {observed}\n")
-        else:
-            text += 'Gerçek futures: doğrulanmadı\n'
+        from trading.agents.telemetry import human_reason,trace_outcome
+        paper=s.get('paper') or {}
+        count=paper.get('open_positions',0)
+        text=f"Sanal işlem durumu\nAçık işlem: {count}\n"
+        if not count:
+            text+='Şu anda açık işlem yok.\n'
         if paper:
-            text += (f"Simülasyon: {paper['equity']:.4f} USDT | Açık: {paper['open_positions']}\n"
-                     f"Gerçekleşen net PnL: {paper['realized']:+.4f} USDT\n"
-                     f"Açık PnL: {paper['unrealized']:+.4f} USDT\n"
-                     f"Ücret: {paper['fees']:.4f} | Funding: {paper['funding']:+.4f} USDT\n")
+            text+=(f"Güncel sanal kasa: {paper['equity']:.4f} USDT\n"
+                   f"Açık işlemlerin kâr/zararı: {paper.get('unrealized',0):+.4f} USDT\n"
+                   f"Kapanan işlemlerin net sonucu: {paper.get('realized',0):+.4f} USDT\n")
+        text+=f"Bot ne yapıyor? {human_reason(s.get('reason',''))}\n"
+        trace=s.get('analysis_trace') or {}
+        if trace:
+            text+=f"Son aday: {trace.get('symbol','?')} — {trace_outcome(trace)}\n"
         budget=s.get('ai_budget',{})
         pending=sum(row.get('amount',0) for row in budget.get('reservations',{}).values())
-        text += f"AI: {s.get('ai_provider','anthropic')} | {s['ai_status']}\n"
-        text += f"Claude yanıt tokenlarına göre tahmini: ${max(0,budget.get('total',0)-pending):.4f} | Sonucu belirsiz rezervasyon: ${pending:.4f}\nSağlayıcı faturası/bakiyesi değildir."
-        if s.get('ai_fallback'):
-            text += f"\nYedek geçiş nedeni: {s['ai_fallback']}"
+        text+=(f"Claude kullanım tahmini: ${max(0,budget.get('total',0)-pending):.4f}\n"
+               f"Sonucu bilinmeyen eski/yeni istek rezervasyonu: ${pending:.4f} (kesilmiş ücret değildir).\n"
+               'İşlemleri görmek için /positions, teknik ayrıntı için /diagnostics.\n'
+               'Bu bir durum mesajı; yeni AI isteği veya işlem açılışı bildirimi değil. Gerçek emir yok.')
         return text
 
     def cycle(self):

@@ -12,6 +12,7 @@ from trading.runtime.store import RuntimeStore
 
 
 def setup(tmp_path,handler,**overrides):
+    overrides.setdefault('groq_request_token_budget',0)
     cfg=Settings(_env_file=None,groq_api_key='fake-groq',anthropic_api_key='fake-claude',**overrides)
     store=RuntimeStore(str(tmp_path/'state'))
     router=ProviderRouter(cfg,Budget(store,cfg),store,httpx.Client(transport=httpx.MockTransport(handler)))
@@ -119,3 +120,60 @@ def test_reasoning_json_request_uses_documented_gpt_oss_options(tmp_path):
     router.complete_json(system='JSON',user='candidate')
     assert payloads[0]['include_reasoning'] is False
     assert 'reasoning_format' not in payloads[0]
+
+
+def test_large_context_routes_without_groq_call_or_data_loss(tmp_path,monkeypatch):
+    router=setup(tmp_path,lambda request:pytest.fail('over-budget Groq request'),groq_request_token_budget=8000)
+    charts=[]
+    for i in range(3):
+        path=tmp_path/f'{i}.png';path.write_bytes(b'chart');charts.append(str(path))
+    forwarded=[]
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:forwarded.append(kw) or decision())
+    original=dict(system='JSON policy',user='all original fields '*500,max_tokens=700,images=charts)
+    assert router.complete_json(**original)==decision()
+    assert forwarded==[original]
+    attempt=router.last_trace['attempts'][0]
+    assert attempt['status']=='quota_skipped'
+    assert attempt['error_category']=='request_token_budget'
+    assert attempt['estimated_input_tokens']>0 and attempt['token_budget']==8000
+    assert attempt['generation_requests']==0
+    assert router.store.get('ai_request_stats')['groq']['generation_requests']==0
+
+
+def test_local_quota_can_wait_without_any_paid_request(tmp_path,monkeypatch):
+    router=setup(tmp_path,lambda request:pytest.fail('should not send'),groq_request_token_budget=1000,ai_claude_fallback_enabled=False)
+    monkeypatch.setattr(router.claude,'complete_json',lambda **kw:pytest.fail('paid fallback disabled'))
+    assert router.complete_json(system='JSON',user='context') is None
+    assert router.last_status=='primary_unavailable_fallback_disabled'
+    assert router.last_trace['attempts'][0]['generation_requests']==0
+
+
+def test_shared_minute_window_blocks_other_account_and_expires(tmp_path,monkeypatch):
+    now=[1000.]
+    monkeypatch.setattr('trading.agents.provider_router.time.time',lambda:now[0])
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        return response(decision())
+    first=setup(tmp_path,handler,groq_request_token_budget=4000,ai_claude_fallback_enabled=False)
+    second=setup(tmp_path,handler,groq_request_token_budget=4000,ai_claude_fallback_enabled=False)
+    assert first.complete_json(system='JSON',user='context')==decision()
+    assert second.complete_json(system='JSON',user='context') is None
+    assert second.last_fallback_reason=='groq_shared_minute_token_budget'
+    assert second.last_trace['attempts'][0]['generation_requests']==0
+    assert len(calls)==1
+    now[0]+=61
+    assert second.complete_json(system='JSON',user='context')==decision()
+    assert len(calls)==2
+
+
+def test_completion_budget_reduced_without_touching_input(tmp_path):
+    payloads=[]
+    def handler(request):
+        import json
+        payloads.append(json.loads(request.content))
+        return response(decision())
+    router=setup(tmp_path,handler)
+    router.complete_json(system='JSON',user='unchanged context',max_tokens=700)
+    assert payloads[0]['max_completion_tokens']==2048
+    assert payloads[0]['messages'][1]['content'][0]['text']=='unchanged context'

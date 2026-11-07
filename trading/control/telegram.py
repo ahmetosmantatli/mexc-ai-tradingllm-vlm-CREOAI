@@ -99,7 +99,8 @@ class TelegramController:
             rows.append([{'text':'✓ Yeni analiz açık' if control['enabled'] else '▶ Ayarlarla başlat', 'callback_data':'control:status' if control['enabled'] else 'control:start'}])
             rows.append([{'text':'⏸ İşlem arayışını duraklat', 'callback_data':'control:pause'}, {'text':'⏹ Bot / AI durdur', 'callback_data':'control:stop'}])
             rows.append([{'text':'Ayarları değiştir', 'callback_data':'control:settings'}, {'text':'Kasa seçimini değiştir', 'callback_data':'control:capital'}])
-        rows.append([{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':'Pozisyonlar', 'callback_data':'control:positions'}, {'text':'Günlük rapor', 'callback_data':'control:report'}])
+        count=len(self.position_targets(account_id))
+        rows.append([{'text':'Durum / Bakiye', 'callback_data':'control:status'}, {'text':f'Açık işlemler ({count})', 'callback_data':'control:positions'}, {'text':'Günlük rapor', 'callback_data':'control:report'}])
         rows.append([{'text':'Son analiz / AI istekleri', 'callback_data':'control:diagnostics'}])
         if self.linked(account_id):
             rows.append([{'text':'✓ MEXC bağlı', 'callback_data':'control:status'}, {'text':'Bağlantıyı kaldır', 'callback_data':'control:disconnect'}])
@@ -145,7 +146,13 @@ class TelegramController:
 
     @staticmethod
     def progress_text(snapshot):
-        text=f"Aşama: {snapshot.get('stage') or snapshot.get('reason','henüz gözlem yok')}\n"
+        stage=snapshot.get('stage')
+        label={'fetching_multitimeframe_context':'4 saat / 15 dakika / 5 dakika verileri hazırlanıyor',
+               'scanning_market':'Pariteler taranıyor', 'model_evaluation':'AI yanıtı bekleniyor',
+               'unchanged_closed_candles':'Mumlar değişmedi; gereksiz AI çağrısı yapılmıyor',
+               'candidates_filtered':'Aday filtreleri tamamlandı', 'model_completed':'AI analizi tamamlandı',
+               'model_invalid_or_unavailable_model':'AI analizi sonuçlanmadı', 'awaiting_scan':'İlk tarama bekleniyor'}.get(stage,'Piyasa ve işlem durumu izleniyor')
+        text=f"Şu an: {label}\n"
         scan=snapshot.get('scan_summary') or {}
         if scan:
             age=max(0,time.time()-scan.get('at',time.time()))
@@ -246,58 +253,65 @@ class TelegramController:
             data['reply_markup'] = keyboard if keyboard is not None else self.keyboard(account_id)
         return self.call('sendMessage', **data)
 
+    def _position_views(self, account_id, snapshot):
+        variants=snapshot.get('variants') or {self.control(account_id)['version']:{'positions':snapshot.get('positions',{})}}
+        return [(version,symbol,p) for version,view in variants.items() for symbol,p in view.get('positions',{}).items()]
+
+    def positions_text(self, account_id, snapshot):
+        items=self._position_views(account_id,snapshot)
+        text=f"Açık sanal işlemler: {len(items)}\n"
+        if not items:
+            return text+'Şu anda açık işlem yok. Analiz mesajı, işlem açıldığı anlamına gelmez.\n'
+        for version,symbol,p in items:
+            side='Yükseliş (LONG)' if p.get('side')=='long' else 'Düşüş (SHORT)'
+            label='Görselsiz' if version=='text' else 'VLM (grafikli)'
+            text+=f"\n{symbol} · {side} · {p.get('leverage','?')}x\n"
+            text+=f"Sürüm: {label}\n"
+            text+=f"Giriş: {p.get('entry',0):.6g}\nZarar durdur (SL): {p.get('stop',0):.6g} | Kâr al (TP): {p.get('target',0):.6g}\n"
+            text+=f"Şu anki kâr/zarar: {p.get('unrealized',0):+.4f} USDT\n"
+            origin=p.get('decision_ai') or {}
+            provider={'groq':'Groq','anthropic':'Claude'}.get(origin.get('provider'),'Kayıtlı değil')
+            text+=f"Giriş kararını veren: {provider} / {origin.get('model') or 'model bilgisi yok'}\n"
+        return text
+
     def status_text(self, account_id, positions=False):
-        account = self.accounts[account_id]
-        control = self.control(account_id)
-        snapshot = self.snapshot_provider(account_id)
-        control_note = ('Bot / AI durduruldu: yeni model çağrısı yok. Kod ile SL/TP koruması sürer.\n' if control.get('stopped') else
-                        'İşlem arayışı duraklatıldı: yeni analiz çağrısı yok. Kod ile pozisyon takibi sürer.\n' if not control['enabled'] else '')
-        text = (f'Hesap: {account.account_id} | PAPER\n'
-                f"MEXC: {'bağlı' if self.linked(account_id) else 'bağlı değil'}\n{self.capital_text(account_id)}\n"
-                f"Yeni işlem: {'açık' if control['enabled'] else 'duraklatıldı'} | Sürüm: {control['version']}\n"
-                f"{control_note}Planlanan risk: %{100*control['risk_per_trade_pct']:g}\n")
+        from trading.agents.telemetry import human_reason,trace_outcome
+        account=self.accounts[account_id]
+        control=self.control(account_id)
+        snapshot=self.snapshot_provider(account_id) or {}
+        text=f"Sanal işlem paneli · {account.account_id}\nGerçek para ile emir gönderilmiyor.\n"
+        text+=self.positions_text(account_id,snapshot)
+        paper=snapshot.get('paper') or {}
+        if paper:
+            text+=(f"\nGüncel sanal kasa: {paper.get('equity',0):.4f} USDT\n"
+                   f"Açık işlemlerin kâr/zararı: {paper.get('unrealized',0):+.4f} USDT\n"
+                   f"Kapanan işlemlerin net sonucu: {paper.get('realized',0):+.4f} USDT\n")
+        else:
+            text+='\n'+self.capital_text(account_id)+'\n'
+        if control.get('stopped'):
+            text+='Bot / AI durduruldu: yeni model çağrısı yok. Kod ile SL/TP koruması sürer.\n'
+        elif not control['enabled']:
+            text+='İşlem arayışı duraklatıldı: yeni analiz çağrısı yok. Kod ile pozisyon takibi sürer.\n'
+        else:
+            text+='Yeni işlem arayışı açık.\n'
         if not snapshot:
-            return text+'Henüz worker gözlemi yok.\nBaşlat düğmesi canlı emri etkinleştirmez.'
-        observed = snapshot.get('observed_at', 0)
-        age = max(0, time.time()-observed)
-        text += f"Son gözlem: {age:.0f} saniye önce | {snapshot.get('reason','bilinmiyor')}\n"
-        text += self.progress_text(snapshot)
+            return text+'Henüz piyasa gözlemi yok. Ayrıntı ve yenileme aşağıdaki düğmelerde.'
+        age=max(0,time.time()-snapshot.get('observed_at',0))
+        text+=f"Son durum: {human_reason(snapshot.get('reason'))}\nVeri yaşı: {age:.0f} saniye\n"
+        text+=self.progress_text(snapshot)
         trace=snapshot.get('analysis_trace') or {}
         if trace:
-            text += f"Son aday: {trace.get('symbol','?')} | {trace.get('strategy','?')} | {trace.get('status','?')} | Sağlayıcı denemesi: {len(trace.get('attempts',[]))}\n"
-        real = snapshot.get('real_account')
+            text+=f"Son aday: {trace.get('symbol','?')} · {trace_outcome(trace)}\n"
+        real=snapshot.get('real_account')
         if real:
-            account_age = max(0, time.time()-real.get('observed_at', 0))
-            text += (f"Gerçek futures: {real['equity']:.4f} USDT | Kullanılabilir: {real['available']:.4f} USDT\n"
-                     f"Hesap verisi yaşı: {account_age:.0f} saniye\n")
-        paper = snapshot.get('paper')
-        if paper:
-            text += (f"Paper: {paper['equity']:.4f} USDT | Açık PnL: {paper.get('unrealized',0):+.4f}\n"
-                     f"Gerçekleşen: {paper.get('realized',0):+.4f} | Açık pozisyon: {paper.get('open_positions',0)}\n")
-        budget = snapshot.get('ai_budget', {})
-        reserved = sum(float(row.get('amount',0)) for row in budget.get('reservations',{}).values())
-        settled = max(0.,float(budget.get('total',0))-reserved)
-        text += (f"Ortak Claude · yanıt kullanımından hesaplanan tahmini maliyet: ${settled:.4f}\n"
-                 f"Sonucu belirsiz / bekleyen rezervasyon: ${reserved:.4f} (harcama doğrulaması değil)\n"
-                 'Sağlayıcının gerçek bakiyesi/faturası bu ekrandan okunmaz.\n')
-        text += f"AI sağlayıcı: {snapshot.get('ai_provider','henüz çağrılmadı')} | Model: {snapshot.get('ai_model') or 'henüz seçilmedi'}\n"
-        if snapshot.get('ai_fallback'):
-            text += f"Yedek geçiş nedeni: {snapshot['ai_fallback']}\n"
-        usage=snapshot.get('groq_usage',{})
-        text += f"Ortak Groq geçerli yanıt: {usage.get('successful_calls',0)} | Girdi/çıktı tokenı: {usage.get('input_tokens',0)}/{usage.get('output_tokens',0)}\nGroq ücreti burada hesaplanmaz; ücretsiz kota ve limitler hesabına bağlıdır.\n"
-        for version, view in snapshot.get('variants', {}).items():
-            metric=view.get('paper')
-            if metric:
-                text += f"{version}: {metric['equity']:.4f} USDT | Pozisyon: {metric['open_positions']}\n"
-        if positions:
-            for version, view in snapshot.get('variants', {}).items():
-                if version != control['version']:
-                    for symbol, p in view.get('positions', {}).items():
-                        text += f"{version} {symbol} {p['side']} | PnL {p.get('unrealized',0):+.4f} | SL {p.get('stop')} TP {p.get('target')}\n"
-            for symbol, p in snapshot.get('positions', {}).items():
-                text += (f"{symbol} {p['side']} | Giriş {p['entry']:.6g} | SL {p['stop']:.6g} | TP {p['target']:.6g}\n"
-                         f"Açık PnL {p.get('unrealized',0):+.4f} USDT | {p.get('leverage','?')}x\n"
-                         f"İlk risk bazında R: {p.get('current_r',0):+.2f} | Gözlenen en iyi {p.get('mfe_r',0):.2f}R | En kötü {p.get('mae_r',0):.2f}R\n")
+            text+=f"\nMEXC gerçek futures bakiyesi (yalnız okuma): {real['equity']:.4f} USDT\n"
+        budget=snapshot.get('ai_budget',{})
+        reserved=sum(float(row.get('amount',0)) for row in budget.get('reservations',{}).values())
+        settled=max(0.,float(budget.get('total',0))-reserved)
+        text+=(f"\nOrtak Claude tahmini maliyet: ${settled:.4f}\n"
+               f"Sonucu belirsiz / bekleyen rezervasyon: ${reserved:.4f} (kesin harcama değil)\n"
+               'Sağlayıcının gerçek bakiyesi/faturası burada okunmaz.\n')
+        text+='Yenilemek için aşağıdaki düğmeleri kullan. İstek/token ayrıntısı: Son analiz / AI istekleri.'
         return text
 
     def _authorize(self, message, user):
@@ -468,9 +482,12 @@ class TelegramController:
             message=self.status_text(account_id,command=='positions')
         else:
             message=self.settings_text(account_id)
-        self.send(account_id, message, buttons=True)
         if command=='positions':
+            panel_keyboard={'inline_keyboard':[[{'text':'🔄 Açık işlemleri yenile','callback_data':'control:positions'}, {'text':'Ana menü','callback_data':'control:menu'}]]}
+            self.send(account_id,message,keyboard=panel_keyboard)
             self.position_buttons(account_id)
+        else:
+            self.send(account_id, message, buttons=True)
 
     def position_targets(self, account_id):
         snapshot = self.snapshot_provider(account_id) or {}
