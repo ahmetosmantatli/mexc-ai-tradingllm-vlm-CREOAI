@@ -1,6 +1,6 @@
-# MEXC AI — persistent paper worker
+# MEXC AI — PAPER default, explicitly gated LIVE worker
 
-Current implementation is **PAPER ONLY**. No live order execution. No measured profitability claim.
+**PAPER is the default.** A separate opt-in LIVE worker is now wired to the Telegram control loop; it can submit real orders only after explicit server gates, a single-account allowlist and a fresh Telegram Start grant. Read [live-readiness](docs/live-readiness.md) before changing modes. Tests use mock exchanges; no real account execution or measured profitability was validated here.
 
 The worker reads the actual MEXC USDT futures account with read-only credentials. It seeds a separate simulation once from observed available USDT; restarts restore the simulation ledger. Subsequent real deposits are shown as real account changes, and never overwrite simulated PnL. Legacy `STARTING_CAPITAL_TRY` does not size worker trades. TRY conversion is not used by this worker.
 
@@ -118,7 +118,7 @@ Profiles are effective paper risk presets, not promised returns:
 - Balanced: 1% planned stop loss/trade, maximum 5x, three positions, 3.5% daily loss halt, 12% peak drawdown halt.
 - Aggressive: 3% planned stop loss/trade, maximum 10x, four positions, 5.5% daily loss halt, 22.5% peak drawdown halt.
 
-Exchange contract limits, margin availability and stop-to-liquidation checks may reduce size or reject the setup. Profiles share the same candidate strategies and typed analysis pipeline; aggressive is a risk posture, not a new proven strategy. No settings enable live orders. Existing positions retain their recorded SL/TP/leverage when changing settings; newly proposed risk uses the new profile. A settings change while AI runs invalidates that in-flight entry.
+Exchange contract limits, margin availability and stop-to-liquidation checks may reduce size or reject the setup. Profiles share the same candidate strategies and typed analysis pipeline; aggressive is a risk posture, not a new proven strategy. These profile descriptions apply to PAPER; LIVE additionally requires the separate explicit deployment gates. Existing positions retain their recorded SL/TP/leverage when changing settings; newly proposed risk uses the new profile. A settings change while AI runs invalidates that in-flight entry.
 
 Messages resembling API credentials sent without a live `/connect` session are best-effort deleted and explicitly reported as **not saved**. The bot no longer responds to such input with a misleading generic menu. Do not post keys in screenshots; revoke/replace any exposed key on MEXC.
 
@@ -130,7 +130,7 @@ Telegram now starts with a PAPER capital choice, before analysis version/trader 
 - `/capital 1000`: after MEXC link, seed an independent 1,000 USDT paper session from the account reference; reject if this exceeds observed available Futures USDT.
 - `/capital full`: snapshot the currently observed available Futures USDT as the paper seed. This does not transfer funds or continuously copy wallet changes.
 
-All amounts are **USDT**, not TRY. Both text/VLM variants receive the same chosen starting seed for a session. The choice is a simulation budget, not per-order notional or exchange margin. Existing paper PnL evolves independently. Capital changes pause entries, require no open positions and wait for in-flight jobs; each confirmed change creates a new session rather than rewriting old outcomes. Old sessions remain on disk for audit. Legacy accounts must choose capital explicitly before restarting entries. There is no live toggle or live order broker in this release.
+All amounts are **USDT**, not TRY. Both text/VLM variants receive the same chosen starting seed for a session. The choice is a simulation budget, not per-order notional or exchange margin. Existing paper PnL evolves independently. Capital changes pause entries, require no open positions and wait for in-flight jobs; each confirmed change creates a new session rather than rewriting old outcomes. Old sessions remain on disk for audit. Legacy accounts must choose capital explicitly before restarting entries. A separate LIVE mode uses actual account state and never copies this simulation ledger; see live-readiness.md.
 
 `/report` shows today's closed-trade results for both variants, trade direction/strategy/leverage, costs, reasons and observed R excursions. `/history` summarizes the latest seven days; `/report YYYY-MM-DD` selects a cached day within that window. Current equity and open PnL are separate from realized daily net PnL. Reports use Europe/Istanbul closure dates, include delayed funding corrections and label incomplete legacy records. Previous capital sessions are retained but not combined into current-session reports.
 
@@ -156,7 +156,7 @@ systemctl status mexc-paper-worker --no-pager
 journalctl -u mexc-paper-worker -n 30 --no-pager
 ```
 
-Use `systemctl restart mexc-paper-worker` after a successful code/config update. Do not launch another foreground worker while this service runs. Telegram `/stop` pauses new simulated entries while supervision remains active; `systemctl stop mexc-paper-worker` stops the whole application and all simulated position supervision. This release has no live exchange orders. The service unit has not been executed on Hetzner in this session.
+Use `systemctl restart mexc-paper-worker` after a successful code/config update. Do not launch another foreground worker while this service runs. Telegram `/stop` pauses new simulated entries while supervision remains active; `systemctl stop mexc-paper-worker` stops the whole application and all simulated position supervision. The default PAPER mode has no real exchange orders. In explicit LIVE mode the same service entry point selects LiveFleet. The service unit has not been executed on Hetzner in this session.
 
 The Fleet worker now logs successful startup and one per-account status heartbeat per minute (account identifier, version and reason; no balances or secrets). An integration test covers Telegram demo selection → plan acceptance → paper entry → tighter stop event → SL close → notification queue/report → restart with preserved balance and paused control, without calling an exchange or AI provider.
 
@@ -276,12 +276,20 @@ Each symbol has a revisioned canonical plan across strategies. A review receives
 
 Telegram `/takip` or `/watchlist` and the **Takip listesi** button show active conditions, timeframe, expiry and invalidation. Watch creation, trigger, expiry and invalidation events are delivered through the durable notification outbox. No new API keys or watch-specific `.env` switches are required; the existing run/pause/stop and quota scheduling controls apply.
 
-## Operator-reviewed live building blocks
+## LIVE integration
 
-See [live-readiness](docs/live-readiness.md) for the opt-in signed private client,
-real-account reconciliation and exact-proposal approval executor. These modules
-are not wired to the Telegram PAPER worker and do not enable unattended live
-trading. All live tests use fake exchange responses; no real order is sent.
-A server connectivity check is available with
-`python -m trading.control.live_preflight --account ACCOUNT_ID --symbol BTC_USDT`.
-It is read-only and does not approve execution. Keep the existing PAPER gates.
+The generic entry point selects `LiveFleet` only when `BROKER_MODE=live`,
+`LIVE_TRADING_ENABLED=true`, `LIVE_AUTOMATIC_ENABLED=true`, a nonempty
+`LIVE_ALLOWED_ACCOUNTS` allowlist and the documented readiness acknowledgement
+all match. `PaperRunner` still rejects live mode: simulated fills never become
+real execution by flipping that class's flag. `LiveRunner` has a dedicated
+per-account live store shared by text/VLM; every proposal is sized again from
+fresh exchange equity and available margin.
+
+Telegram Start grants the configured account's automatic policy for up to7days;
+there is no per-trade human approval in that path. Changing settings, pausing,
+stopping or changing credential binding revokes the current grant. Monitoring,
+reconciliation and identified native closing continue independently of new AI
+entry permission. Native order acknowledgements are not reported as fills or
+protection. See [live-readiness](docs/live-readiness.md) for configuration,
+mock validation, operational limits and rollback.

@@ -1,11 +1,11 @@
-"""Single persistent paper worker. Never submits real exchange orders."""
+"""Single persistent worker; PAPER default, LIVE requires explicit deployment gates."""
 import fcntl
 import logging
 from pathlib import Path
 import signal
 import time
 
-from trading.config import get_settings
+from trading.config import get_settings, BrokerMode
 from trading.runtime.runner import PaperRunner
 
 logger = logging.getLogger('worker')
@@ -33,10 +33,14 @@ def main():
             return 2
         try:
             if Path(cfg.accounts_file).is_file():
-                from trading.runtime.fleet import Fleet
-                fleet = Fleet(cfg)
+                if cfg.broker_mode == BrokerMode.LIVE:
+                    from trading.runtime.live_fleet import LiveFleet
+                    fleet = LiveFleet(cfg)
+                else:
+                    from trading.runtime.fleet import Fleet
+                    fleet = Fleet(cfg)
                 fleet.start()
-                logger.info("Telegram PAPER worker started | accounts=%s | real orders disabled", len(fleet.accounts))
+                logger.info("Telegram worker started | mode=%s | accounts=%s", cfg.broker_mode.value, len(fleet.accounts))
                 last_heartbeat = 0.0
                 signal.signal(signal.SIGINT, _stop)
                 signal.signal(signal.SIGTERM, _stop)
@@ -46,12 +50,14 @@ def main():
                         if time.monotonic()-last_heartbeat>=60:
                             for account in fleet.accounts:
                                 snapshot=fleet.control_store.get(f"account:{account.account_id}:status",{})
-                                logger.info("paper status | account=%s version=%s reason=%s",account.account_id,snapshot.get('version','pending'),snapshot.get('reason','awaiting_setup'))
+                                logger.info("%s status | account=%s version=%s reason=%s",cfg.broker_mode.value,account.account_id,snapshot.get('version','pending'),snapshot.get('reason','awaiting_setup'))
                             last_heartbeat=time.monotonic()
                         time.sleep(1)
                 finally:
                     fleet.stop()
                 return 0
+            if cfg.broker_mode == BrokerMode.LIVE:
+                raise ValueError('LIVE requires the multi-account registry and explicit account allowlist')
             runner = PaperRunner(cfg)
         except ValueError as exc:
             logger.error('startup refused: %s', exc)

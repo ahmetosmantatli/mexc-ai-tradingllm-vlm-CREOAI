@@ -41,6 +41,13 @@ class Settings(BaseSettings):
         description="Active broker. Paper never hits private order endpoints.",
     )
 
+    # Live code is inert unless every deployment gate and account allowlist matches.
+    live_max_leverage: int = Field(default=10,ge=1,le=25)
+    live_max_positions: int = Field(default=4,ge=1,le=4)
+    live_automatic_enabled: bool = False
+    live_allowed_accounts: tuple[str, ...] = ()
+    live_readiness_ack: str = Field(default='', repr=False)
+
     # --- Product default profile ---
     risk_profile: RiskProfile = Field(
         default=RiskProfile.AGGRESSIVE_GROWTH,

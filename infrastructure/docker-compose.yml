@@ -55,9 +55,8 @@ services:
     command: ["python", "-m", "apps.worker.main"]
     env_file:
       - ../.env
+    # Explicit live gates are read from ../.env; image defaults remain PAPER/OFF.
     environment:
-      LIVE_TRADING_ENABLED: "false"
-      BROKER_MODE: paper
       RUNTIME_DB_PATH: /app/data/runtime.sqlite3
       KILL_SWITCH_PATH: /app/data/STOP
       DATABASE_URL: postgresql+psycopg://mexc:${POSTGRES_PASSWORD:-mexc}@postgres:5432/${POSTGRES_DB:-mexc_ai}

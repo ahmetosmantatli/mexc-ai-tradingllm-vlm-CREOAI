@@ -34,7 +34,8 @@ class ConnectionFlow:
             self.controller.send(ident,'MEXC bağlama: 3 dakika içinde tek mesajda JSON gönder:\n'
                 '{"api_key":"...","api_secret":"..."}\n'
                 'Telegram bot mesajları uçtan uca şifreli değildir. Mesajı silmeyi deneyeceğim; '
-                'sunucuda şifreli saklanır. Yalnız futures okuma izinli anahtar kullan. '
+                'sunucuda şifreli saklanır. '+
+                ('LIVE: Futures hesap/emir okuma ve emir verme izinleri gerekir. ' if getattr(self.controller,'live_mode',False) else 'PAPER: yalnız Futures okuma izinli anahtar kullan. ')+
                 'Alternatif: anahtarları sunucudan tanımla. İptal: /cancel')
         elif command in ('/disconnect','/baglantiyikes','control:disconnect'):
             self.controller.set_control(ident,enabled=False)

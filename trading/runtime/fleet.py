@@ -34,6 +34,8 @@ class Fleet:
         self.accounts = load_accounts(cfg.accounts_file, environment)
         self.root = Path(cfg.runtime_db_path).parent
         self.control_store = RuntimeStore(str(self.root/'control.sqlite3'))
+        for account in self.accounts:
+            self.control_store.put(f'account:{account.account_id}:worker_mode','paper')
         self.controller = TelegramController(cfg.telegram_bot_token, self.accounts, self.control_store)
         if not cfg.telegram_bot_token:
             raise ValueError('TELEGRAM_BOT_TOKEN required for fleet')

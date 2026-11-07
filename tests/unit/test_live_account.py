@@ -170,3 +170,16 @@ def test_requested_position_mode_requires_exact_integer(tmp_path,mode):
     reconciler,client,clock=setup(tmp_path)
     reconciler.refresh(client,symbols=['BTC_USDT'])
     assert preflight(reconciler,position_mode=mode).reasons==('UNKNOWN_REQUESTED_POSITION_MODE',)
+
+
+def test_risk_peak_observation_while_paused_is_not_lost_before_next_entry(tmp_path):
+    from trading.runtime.live_account import observe_risk_reference
+    store=RuntimeStore(str(tmp_path/'risk'))
+    start=1794080000
+    observe_risk_reference(store,'binding',500,now=start)
+    observe_risk_reference(store,'binding',600,now=start+1)
+    result=observe_risk_reference(store,'binding',510,now=start+2)
+    assert result['initial']==500 and result['peak']==600
+    assert result['drawdown_pct']==pytest.approx(.15)
+    again=observe_risk_reference(RuntimeStore(str(tmp_path/'risk')),'binding',510,now=start+3)
+    assert again['peak']==600 and again['drawdown_pct']==pytest.approx(.15)

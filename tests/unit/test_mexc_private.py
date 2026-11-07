@@ -160,3 +160,13 @@ def test_native_position_protection_no_reverse_market_order_and_modify():
     client.modify_protection(protection_id=67,stop_loss=95,take_profit=110,request_id='modify_123')
     assert requests[-1].url.path=='/api/v1/private/stoporder/change_plan_price'
     assert json.loads(requests[-1].content)['stopPlanOrderId']==67
+
+
+def test_history_and_deal_queries_are_signed_read_only():
+    def handler(request):
+        data={'resultList':[{'positionId':1}]} if 'history_positions' in request.url.path else [{'orderId':22}]
+        return httpx.Response(200,json={'success':True,'code':0,'data':data})
+    client,requests=setup(handler)
+    assert client.historical_positions('BTC_USDT')==[{'positionId':1}]
+    assert client.order_deals('22')==[{'orderId':22}]
+    assert all(request.method=='GET' and request.headers.get('signature') for request in requests)

@@ -159,6 +159,18 @@ class MexcPrivateClient:
         return self._request('GET','/api/v1/private/order/external/'+_symbol(symbol)+'/'+_identifier(external_id),
             operation='external_order',expected=dict)
 
+    def historical_positions(self,symbol=None,page_num=1,page_size=100):
+        params={**self._page(page_num,page_size),'symbol':_symbol(symbol) if symbol else None}
+        data=self._request('GET','/api/v1/private/position/list/history_positions',
+            operation='historical_positions',params=params,expected=(list,dict))
+        rows=data.get('resultList') if isinstance(data,dict) else data
+        if not isinstance(rows,list):raise MexcPrivateError('historical_positions')
+        return rows
+
+    def order_deals(self,order_id):
+        return self._request('GET','/api/v1/private/order/deal_details/'+_identifier(order_id),
+            operation='order_deals',expected=list)
+
     def leverage(self,symbol):
         return self._request('GET','/api/v1/private/position/leverage',operation='leverage',params={'symbol':_symbol(symbol)},expected=list)
 

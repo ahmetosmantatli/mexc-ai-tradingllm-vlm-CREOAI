@@ -90,7 +90,8 @@ def _positions(rows):
             entry=_number(row.get('holdAvgPrice'),'position_entry',positive=True),
             margin=_number(row.get('im'),'position_margin',minimum=0),
             unrealized=_number(row['unRealizedPnl'],'position_unrealized') if 'unRealizedPnl' in row else None,
-            liquidation_price=_number(row['liquidatePrice'],'liquidation_price',minimum=0) if 'liquidatePrice' in row else None))
+            liquidation_price=_number(row['liquidatePrice'],'liquidation_price',minimum=0) if 'liquidatePrice' in row else None,
+            opened_at=_number(row['createTime'],'position_open_time',minimum=0) if 'createTime' in row else None))
     ids=[row['position_id'] for row in result]
     if len(ids)!=len(set(ids)):
         raise LiveAccountError('DUPLICATE_POSITION_IDS')
@@ -308,3 +309,32 @@ class LiveAccountReconciler:
         except (LiveAccountError,KeyError,TypeError,StopIteration) as exc:
             reason=str(exc) if isinstance(exc,LiveAccountError) else 'SYMBOL_CONFIGURATION_UNAVAILABLE'
             return LivePreflight(False,(reason,),self.account_id,None,None,None,None,None)
+
+
+def observe_risk_reference(store,binding_id,equity,*,now=None):
+    """Persist risk peaks on every account observation, including while paused.
+
+    Calendar day/week are UTC and explicit. Deposits/withdrawals are not inferred
+    from market PnL; these are equity circuit breakers, not a return calculation.
+    """
+    from datetime import datetime,timezone
+    now=time() if now is None else now
+    equity=_number(equity,'equity',minimum=0)
+    stamp=datetime.fromtimestamp(now,timezone.utc)
+    day=stamp.date().isoformat()
+    iso=stamp.isocalendar();week=f'{iso.year}-{iso.week}'
+    key='live:risk_reference:'+binding_id
+    with store.lock:
+        state=store.get(key,dict(initial=equity,peak=equity,day=day,day_start=equity,week=week,week_start=equity))
+        if state.get('day')!=day:state.update(day=day,day_start=equity)
+        if state.get('week')!=week:state.update(week=week,week_start=equity)
+        if state.get('initial',0)<=0 and equity>0:state['initial']=equity
+        if state.get('day_start',0)<=0 and equity>0:state['day_start']=equity
+        if state.get('week_start',0)<=0 and equity>0:state['week_start']=equity
+        state['peak']=max(state.get('peak',0),equity)
+        state['observed_at']=now
+        store.put(key,state)
+    state=dict(state)
+    for field,basis in [('daily_loss_pct','day_start'),('weekly_loss_pct','week_start'),('drawdown_pct','peak')]:
+        state[field]=max(0,1-equity/state[basis]) if state.get(basis,0)>0 else 0
+    return state

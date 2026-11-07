@@ -84,7 +84,7 @@ def human_reason(reason):
 def trace_outcome(trace):
     execution=trace.get('execution_status')
     if execution=='opened':
-        return 'Sanal işlem açıldı'
+        return 'Gerçek işlem açıldı; borsa koruması doğrulandı' if trace.get('mode')=='LIVE' else 'Sanal işlem açıldı'
     if execution in ('rejected','not_opened'):
         if trace.get('status')=='invalid_or_unavailable_model':
             return 'İşlem açılmadı — analiz başarısız'

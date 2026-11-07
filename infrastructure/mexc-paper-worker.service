@@ -1,5 +1,5 @@
 [Unit]
-Description=MEXC Telegram paper trading worker
+Description=MEXC Telegram trading worker (PAPER default)
 Wants=network-online.target
 After=network-online.target
 

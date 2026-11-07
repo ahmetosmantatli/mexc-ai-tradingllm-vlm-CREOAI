@@ -255,7 +255,23 @@ def economic_review_key(account,positions):
     """
     stable={key:value for key,value in account.items() if key not in ('equity','operating_context')}
     operating=account.get('operating_context') or {}
-    if not operating.get('ledger_available'):
+    if operating.get('mode')=='LIVE':
+        ignored_live={'observed_at','generation','started_at','equity','current_equity','equity_snapshot_usdt',
+            'available','available_usdt','position_margin','unrealized','open_unrealized_usdt','managed_capital',
+            'current_return_pct','daily_loss_pct','drawdown_pct','daily_equity_change_usdt'}
+        stable['operating_context']={key:value for key,value in operating.items() if key not in ignored_live}
+        for name in ('risk_limits','leverage'):
+            limits=stable['operating_context'].get(name)
+            if isinstance(limits,dict):
+                stable['operating_context'][name]={symbol:[{key:value for key,value in row.items() if key!='max_contracts'}
+                    for row in rows] for symbol,rows in limits.items()}
+        if not positions:
+            stable['flat_equity']=account.get('equity')
+        objective=stable['operating_context'].get('objective')
+        if isinstance(objective,dict):
+            stable['operating_context']['objective']={key:value for key,value in objective.items() if key not in
+                ('remaining_usdt','remaining_multiple','progress_fraction','remaining_seconds','target_reached')}
+    elif not operating.get('ledger_available'):
         # A caller without a persisted paper basis may be supplying actual new
         # capital. Do not silently suppress those externally observed changes.
         stable['equity']=account.get('equity')

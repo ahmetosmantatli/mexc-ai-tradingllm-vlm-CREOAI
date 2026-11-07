@@ -28,7 +28,7 @@ SYSTEM_POLICY = (
     'Tables use explicit column names. What_changed explains why this review was scheduled; do not assume hidden chat memory. '
     'Treat confirmed swing/BOS/sweep/FVG evidence as hypotheses, never guaranteed edge. HOLD is normal. '
     'Never force a weekly return, raise risk after losses, invent prices/IDs, or place orders. '
-    'Account operating_context describes observed paper balance, closed outcomes and an optional research objective. '
+    'Account operating_context identifies PAPER or LIVE mode, observed balance, closed outcomes and an optional research objective. '
     'A research objective is reporting context only, never a reason to force a trade or exceed risk limits. '
     'Only the supplied candidate may be traded and only when cross-timeframe evidence is coherent. '
     'Return exactly JSON: action (trade/watch/hold), signal_id (supplied candidate ID or null), '
@@ -123,6 +123,8 @@ class ContextEvaluator:
         candidate = max(candidates, key=lambda c:c.confidence)
         symbol = candidate.symbol
         scope = f'{candidate.strategy.value}:{candidate.side.value}'
+        if context.get('live_account_context') is not None:
+            scope=f'{self.cfg.analysis_version}:'+scope
         self.store.put('stage','fetching_multitimeframe_context')
         bundle = build_bundle(self.public, symbol)
         chart_context = bundle.to_context()
@@ -140,13 +142,17 @@ class ContextEvaluator:
             memory['last_outcome']=copy.deepcopy(legacy['last_outcome'])
         coordinator=WatchCoordinator(self.store)
         prior_watch=coordinator.card(symbol)
-        positions = self.store.get('paper', {}).get('positions', {})
+        live_account=context.pop('live_account_context',None)
+        live_positions=context.pop('live_positions',None)
+        if live_account is not None and (not isinstance(live_account,dict) or live_account.get('mode')!='LIVE' or live_account.get('currency')!='USDT'):
+            return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_live_account_context',metadata={'provider_called':False})
+        positions = live_positions if live_account is not None and isinstance(live_positions,dict) else self.store.get('paper', {}).get('positions', {})
         account=dict(equity=equity,risk_per_trade_pct=risk_per_trade_pct,leverage=target_leverage,**context)
         exchange_cap=target_leverage
         if callable(getattr(self.public,'get_contract_rules',None)):
             exchange_cap=self.public.get_contract_rules(symbol).max_leverage
         account['sizing_limits']=dict(max_risk_fraction=risk_per_trade_pct,policy_max_leverage=target_leverage,exchange_max_leverage=exchange_cap)
-        account['operating_context']=account_research_context(self.store,equity,self.cfg)
+        account['operating_context']=copy.deepcopy(live_account) if live_account is not None else account_research_context(self.store,equity,self.cfg)
         account['canonical_watch']=canonical_watch_card(prior_watch)
         economic_basis=economic_review_key(account,positions)
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
@@ -168,7 +174,7 @@ class ContextEvaluator:
         charts=render_bundle(bundle,Path(self.cfg.analysis_chart_dir)/symbol/fingerprint[:16])
         paths=[str(c.path) for c in charts]
         started=time.time()
-        trace=dict(id=uuid4().hex,symbol=symbol,strategy=candidate.strategy.value,confidence=candidate.confidence,
+        trace=dict(id=uuid4().hex,mode='LIVE' if live_account is not None else 'PAPER',symbol=symbol,strategy=candidate.strategy.value,confidence=candidate.confidence,
             started_at=started,status='pending',attempts=[],provider='none',model='',
             why_reconsidered=changes,market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))

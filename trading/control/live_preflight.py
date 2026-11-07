@@ -3,6 +3,7 @@ import argparse
 from dataclasses import replace
 import json
 import os
+import re
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -35,31 +36,26 @@ def resolve_account(cfg, account_id, env_file='.env'):
 
 def inspect_account(client, symbol):
     """Minimal safe output; unknown fields remain unknown rather than guessed."""
-    from trading.exchange.account import FuturesAccount
-    assets=client.account_assets()
-    account=FuturesAccount.parse(dict(success=True,code=0,data=assets))
-    positions=client.open_positions()
-    mode=client.position_mode()
-    leverage=client.leverage(symbol)
-    risk=client.risk_limits(symbol)
-    orders=[]
-    complete=False
-    for page in range(1,101):
-        rows=client.current_orders(page_num=page,page_size=100)
-        if not isinstance(rows,list):
-            raise ValueError('unknown_open_orders')
-        orders.extend(rows)
-        if len(rows)<100:
-            complete=True
-            break
-    if not complete:
-        raise ValueError('open_orders_pagination_incomplete')
-    return dict(account_currency='USDT',equity=account.equity,available=account.available,
-        position_margin=account.position_margin,unrealized=account.unrealized,
-        symbol=symbol,position_mode=mode,open_positions=len(positions),open_orders=len(orders),
-        account_leverage_data_present=bool(leverage),account_risk_data_present=bool(risk),
-        writes_enabled=False,automatic_live_worker_available=False,
-        note='Read-only connectivity check, not execution approval or a guarantee of trading permission.')
+    from trading.runtime.live_account import LiveAccountReconciler
+    store=RuntimeStore(':memory:')
+    try:
+        snapshot=LiveAccountReconciler('preflight',store,binding_id='read-only-inspection').refresh(client,symbols=[symbol])
+        balance=snapshot['balance']
+        caps=[]
+        for risk in snapshot['risk_limits'][symbol]:
+            setting=next(row for row in snapshot['leverage'][symbol] if row['side']==risk['side'])
+            caps.append(dict(side='long' if risk['side']==1 else 'short',configured_leverage=setting['leverage'],
+                account_max_leverage=min(risk['max_leverage'],setting['max_leverage']),
+                max_contracts=min(risk['max_contracts'],setting['max_contracts']),
+                isolated=setting['open_type']==1,maintenance_rate=max(risk['maintenance_rate'],setting['maintenance_rate'])))
+        return dict(account_currency='USDT',equity=balance['equity'],available=balance['available'],
+            position_margin=balance['position_margin'],unrealized=balance['unrealized'],symbol=symbol,
+            position_mode=snapshot['position_mode'],open_positions=len(snapshot['positions']),open_orders=len(snapshot['orders']),
+            account_leverage_data_present=True,account_risk_data_present=True,account_leverage=caps,
+            writes_enabled=False,automatic_live_worker_available=True,execution_enabled_by_this_check=False,
+            note='Read-only connectivity check, not execution approval or a guarantee of trading permission.')
+    finally:
+        store.db.close()
 
 
 def main(argv=None):
@@ -86,7 +82,9 @@ def main(argv=None):
     except Exception as exc:
         # Neither raw transport exceptions nor provider response bodies contain
         # material that should be echoed to a shared terminal/chat transcript.
-        print(json.dumps(dict(status='preflight_failed',error_type=type(exc).__name__,
+        from trading.runtime.live_account import LiveAccountError
+        reason=str(exc) if isinstance(exc,LiveAccountError) and re.fullmatch('[A-Z0-9_]{1,128}',str(exc)) else None
+        print(json.dumps(dict(status='preflight_failed',error_type=type(exc).__name__,reason=reason,
             code=getattr(exc,'code',None),http_status=getattr(exc,'status_code',None),
             writes_enabled=False),ensure_ascii=False))
         return 2
