@@ -56,7 +56,11 @@ def main():
             if mode == 'live':
                 from trading.runtime.live_runner import LiveRunner
                 runner = LiveRunner(cfg)
-                logger.info('LIVE worker started disarmed; no new entries until an allowlisted operator sends /arm')
+                logger.info('LIVE worker started disarmed; this process is the only Telegram poller; Arm or /arm from an allowlisted operator')
+                try:
+                    runner.present_controls()
+                except Exception as exc:
+                    logger.warning('live telegram controls not sent (%s)', type(exc).__name__)
                 signal.signal(signal.SIGINT, _stop)
                 signal.signal(signal.SIGTERM, _stop)
                 while _RUNNING:

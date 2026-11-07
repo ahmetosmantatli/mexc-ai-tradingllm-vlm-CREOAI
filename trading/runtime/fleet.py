@@ -12,7 +12,7 @@ import sqlite3
 import time
 
 from trading.agents.provider_router import ProviderRouter
-from trading.config import Settings
+from trading.config import BrokerMode, Settings
 from trading.control import load_accounts, TelegramController
 from trading.evaluation.service import ContextEvaluator
 from trading.exchange.mexc_public import MexcPublicClient
@@ -468,7 +468,11 @@ class Fleet:
 
     def tick(self):
         # Only this thread polls Telegram and changes its durable outbox.
-        self.controller.tick()
+        # Live mode owns getUpdates in LiveRunner. This fleet must not call it.
+        if self.cfg.broker_mode == BrokerMode.LIVE or self.cfg.live_trading_enabled is True:
+            logger.warning('paper telegram poll skipped; live worker owns getUpdates')
+        else:
+            self.controller.tick()
         for account in self.accounts:
             self.execute_commands(account)
             control = self.controller.control(account.account_id)

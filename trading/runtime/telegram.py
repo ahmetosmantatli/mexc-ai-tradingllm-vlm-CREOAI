@@ -3,7 +3,14 @@ import logging
 import time
 import httpx
 
+from trading.config import BrokerMode
+
 logger = logging.getLogger(__name__)
+
+
+def paper_updates_allowed(cfg):
+    """Paper getUpdates runs only while the process is not the live worker."""
+    return cfg.broker_mode != BrokerMode.LIVE and cfg.live_trading_enabled is not True
 
 
 class Telegram:
@@ -24,11 +31,17 @@ class Telegram:
             raise ValueError('Telegram request unsuccessful')
         return payload['result']
 
-    def send(self, text):
-        self.call('sendMessage', chat_id=self.cfg.telegram_chat_id, text=text[:4000])
+    def send(self, text, reply_markup=None):
+        payload = dict(chat_id=self.cfg.telegram_chat_id, text=text[:4000])
+        if reply_markup is not None:
+            payload['reply_markup'] = reply_markup
+        self.call('sendMessage', **payload)
 
     def tick(self, ledger, status_text):
         if not self.enabled:
+            return
+        if not paper_updates_allowed(self.cfg):
+            logger.warning('paper telegram poll skipped; live worker owns getUpdates')
             return
         try:
             for event in ledger.state['events']:
