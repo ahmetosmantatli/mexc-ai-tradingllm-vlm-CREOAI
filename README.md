@@ -43,12 +43,15 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, then send `/start` to your bot.
 ## Hetzner paper deployment
 
 ```sh
-docker compose --env-file .env -f infrastructure/docker-compose.yml config --quiet
-docker compose --env-file .env -f infrastructure/docker-compose.yml up --build -d
-docker compose --env-file .env -f infrastructure/docker-compose.yml ps
+cd /opt/mexc-ai-trading
+docker compose --env-file .env -f infrastructure/docker-compose.yml -p mexc-ai config --quiet
+docker compose --env-file .env -f infrastructure/docker-compose.yml -p mexc-ai up --build -d
+docker compose --env-file .env -f infrastructure/docker-compose.yml -p mexc-ai ps
 curl --fail http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/status
 ```
+
+`docker compose -p mexc-ai up` from this directory fails with `no configuration file provided` because the compose file is `infrastructure/docker-compose.yml`, not the repo root. That file already sets project name `mexc-ai`, publishes the API only on `127.0.0.1:8080`, and does not publish Postgres or Redis.
 
 Compose forces paper mode and live=false, binds API to localhost, and persists the SQLite worker ledger in `mexc_ai_runtime`. Run exactly one worker for this database; a process lock rejects duplicates. Back up the runtime volume with SQLite backup facilities. Never use `down -v` on a funded simulation you want to retain. Keep API private behind SSH/VPN. Deployment has not been exercised on Hetzner in this session.
 

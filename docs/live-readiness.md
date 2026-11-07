@@ -3,10 +3,13 @@
 `BROKER_MODE=live` and `LIVE_TRADING_ENABLED=true` together start `LiveRunner`
 instead of the paper worker. The first boot of that live generation is
 disarmed. A model `TradeProposal` is handed to the live executor only when
-both gates are on and an operator has armed this generation. Switching
-live → paper → live clears the arm and the running flag.
+both gates are on and an allowlisted operator has sent `/arm` from
+`TELEGRAM_CHAT_ID`. The sender is `message.from.id`, checked against
+`LIVE_OPERATOR_IDS`. An id in the message text is ignored. `/start` only
+resumes entries after this generation is already armed. Switching
+live → paper → live clears the arm and the running flag until a new `/arm`.
 
-Stop or pause blocks new entries only. Reconciliation of orders that were
+`/stop` or `/pause` blocks new entries only. Reconciliation of orders that were
 already sent, and protection of those positions, keeps running. Reported
 equity, available margin, and positions come from the exchange snapshot.
 Paper cash is not the live equity.

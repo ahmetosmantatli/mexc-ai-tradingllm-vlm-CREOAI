@@ -56,7 +56,7 @@ def main():
             if mode == 'live':
                 from trading.runtime.live_runner import LiveRunner
                 runner = LiveRunner(cfg)
-                logger.info('LIVE worker started disarmed; no new entries until an operator arms this generation')
+                logger.info('LIVE worker started disarmed; no new entries until an allowlisted operator sends /arm')
                 signal.signal(signal.SIGINT, _stop)
                 signal.signal(signal.SIGTERM, _stop)
                 while _RUNNING:

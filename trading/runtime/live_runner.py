@@ -3,13 +3,15 @@
 Constructed only when BROKER_MODE=live and LIVE_TRADING_ENABLED=true.
 The first boot of a live generation is disarmed: equity, margin, positions,
 and already-sent orders are still reconciled, but a model TradeProposal is
-not handed to the executor until an operator arms this generation.
+not handed to the executor until an allowlisted operator sends /arm.
+
+/start only resumes entries for a generation that is already armed.
+/stop and /pause block new entries only. Reconciliation and native protection
+of an order that was already sent keep running. live → paper → live clears
+the arm until a new /arm.
 
 Equity, available margin, and positions come from the authenticated exchange
 snapshot. Paper cash and STARTING_CAPITAL_TRY are not read.
-
-Stop / pause blocks new entries only. Reconciliation and native protection
-of an order that was already sent keep running.
 """
 import hashlib
 import json
@@ -52,6 +54,7 @@ class LiveRunner:
             account_id=account_id, binding_id=self.binding_id, can_execute=self.entries_open)
         self.executor.entries_armed = self.entries_open
         self._telegram = None
+        self.last_arm_result = None
 
     def _control_key(self):
         return f'account:{self.account_id}:control'
@@ -87,6 +90,12 @@ class LiveRunner:
             self.store.put(self._control_key(), control)
         return self.permission.view()
 
+    _COMMANDS = frozenset({'/stop', '/pause', '/start', '/arm'})
+
+    @staticmethod
+    def _command_text(text):
+        return str(text or '').split('@', 1)[0].strip().lower()
+
     def _commands(self):
         if self.command_source is not None:
             return list(self.command_source())
@@ -103,9 +112,10 @@ class LiveRunner:
                 message = update.get('message') or {}
                 chat = message.get('chat') or {}
                 if str(chat.get('id')) == str(self.cfg.telegram_chat_id):
-                    text = str(message.get('text') or '').split('@')[0].strip().lower()
-                    if text in ('/stop', '/pause', '/start'):
-                        commands.append(text)
+                    text = self._command_text(message.get('text'))
+                    if text in self._COMMANDS:
+                        sender = message.get('from') or {}
+                        commands.append({'command': text, 'operator_id': sender.get('id')})
                 if 'update_id' in update:
                     self.store.put('live_telegram_offset', update['update_id']+1)
             return commands
@@ -113,11 +123,46 @@ class LiveRunner:
             return []
 
     def _apply_commands(self):
-        for command in self._commands():
+        for raw in self._commands():
+            if isinstance(raw, str):
+                command, operator_id = self._command_text(raw), None
+            elif isinstance(raw, dict):
+                command = self._command_text(raw.get('command'))
+                operator_id = raw.get('operator_id')
+            else:
+                continue
             if command in ('/stop', '/pause', 'stop', 'pause'):
                 self.stop_new_entries()
             elif command in ('/start', 'start'):
                 self.resume_entries()
+            elif command in ('/arm', 'arm'):
+                self._arm_command(operator_id)
+
+    def _arm_command(self, operator_id):
+        """Arm only from the Telegram sender id. The message text is not an identity."""
+        if operator_id is None or str(operator_id).strip() == '':
+            self._arm_reply('operator_not_allowed')
+            return self.permission.view()
+        try:
+            view = self.arm(str(operator_id).strip())
+        except LivePermissionError as exc:
+            self._arm_reply(str(exc))
+            return self.permission.view()
+        control = dict(self.store.get(self._control_key()) or {})
+        control.update(enabled=True, stopped=False)
+        self.store.put(self._control_key(), control)
+        self._arm_reply('armed')
+        return view
+
+    def _arm_reply(self, code):
+        self.last_arm_result = code
+        text = {
+            'armed': 'Live generation armed. New entries can run. /stop still blocks new entries.',
+            'operator_not_allowed': 'Arm refused. This Telegram user cannot arm live entries.',
+            'live_gates_required': 'Arm refused. BROKER_MODE=live and LIVE_TRADING_ENABLED=true are still required.',
+        }.get(code)
+        if text:
+            self._deliver(text)
 
     def _intents(self):
         with self.store.lock:
