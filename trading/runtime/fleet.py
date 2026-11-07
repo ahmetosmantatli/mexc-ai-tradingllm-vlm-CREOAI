@@ -80,7 +80,11 @@ class Fleet:
                 mexc_api_key=account.mexc_api_key, mexc_api_secret=account.mexc_api_secret,
                 telegram_bot_token='', telegram_chat_id='')
             settings = cfg.model_copy(update=overrides)
-            llm = ProviderRouter(settings, Budget(self.budget_store,cfg), self.budget_store)
+            if settings.ai_provider_pool_enabled:
+                from trading.agents.provider_pool import ProviderPool
+                llm=ProviderPool(settings,Budget(self.budget_store,cfg),self.budget_store)
+            else:
+                llm = ProviderRouter(settings, Budget(self.budget_store,cfg), self.budget_store)
             runner = PaperRunner(settings,llm=llm)
             runner.external_scan = True
             runner.graph = ContextEvaluator(llm, runner.store, runner.public, settings)
@@ -229,11 +233,18 @@ class Fleet:
         snapshot['analysis_trace']=runner.store.get('analysis_trace',{})
         snapshot['analysis_history']=runner.store.get('analysis_history',[])
         snapshot['ai_request_stats']=self.budget_store.get('ai_request_stats',{})
-        trace=snapshot['analysis_trace']
-        if trace.get('completed_at') and trace.get('execution_status') in ('opened','rejected','not_opened'):
-            # One candidate-scoped result notification, no stale-status error spam.
-            from trading.agents.telemetry import format_trace
-            self.controller.enqueue(account.account_id,format_trace(trace),event_id=f"analysis:{selected}:{trace['id']}",buttons=True)
+        # Concurrent candidate reviews each retain their own result and notification.
+        from trading.agents.telemetry import format_trace
+        traces={row['id']:row for row in snapshot['analysis_history']}
+        latest=snapshot['analysis_trace']
+        if latest.get('id'):
+            traces[latest['id']]=latest
+        for trace in traces.values():
+            if trace.get('completed_at') and trace.get('execution_status') in ('opened','rejected','not_opened'):
+                self.controller.enqueue(account.account_id,format_trace(trace),event_id=f"analysis:{selected}:{trace['id']}",buttons=True)
+        snapshot['parallel_candidates']=self.cfg.ai_parallel_candidates if self.cfg.ai_provider_pool_enabled else 1
+        pool_snapshot=getattr(runner.llm,'snapshot',None)
+        snapshot['provider_pool']=pool_snapshot() if pool_snapshot else []
         if snapshot.get('real_account') and not self.control_store.get(f'account:{account.account_id}:disconnected',False):
             self.control_store.put(f'account:{account.account_id}:linked',True)
         from trading.runtime.reports import daily_trade_report

@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 import sqlite3
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from trading.agents.anthropic_client import AnthropicClient
 from trading.agents.graph import EvaluationGraph, size_proposal_from_signal
@@ -104,9 +105,12 @@ class PaperRunner:
             raise ValueError('position monitoring incomplete: '+','.join(errors))
         self.ledger.roll_day()
 
-    def status(self, reason):
+    def status(self, reason, trace_id=None, finalize_latest=True):
+        if trace_id:
+            from trading.evaluation.service import finalize_trace
+            finalize_trace(self.store,trace_id,'opened' if reason=='PAPER_OPENED' else 'rejected',reason)
         trace=self.store.get('analysis_trace',{})
-        if trace.get('execution_status')=='awaiting_risk':
+        if not trace_id and finalize_latest and trace.get('execution_status')=='awaiting_risk':
             from trading.runtime.usage import archive_trace
             trace.update(execution_status='opened' if reason=='PAPER_OPENED' else 'rejected',execution_reason=reason)
             self.store.put('analysis_trace',trace)
@@ -299,44 +303,116 @@ class PaperRunner:
         queue=self.candidate_queue()
         if not self.external_scan and time.time()-self.store.get('last_scan_at',0)>=self.cfg.worker_loop_interval_seconds:
             self.scan_market()
+        if self.cfg.ai_provider_pool_enabled and time.time()<self.store.get('provider_defer_until',0):
+            return self.status('HOLD_PROVIDER_POOL_WAIT',finalize_latest=False)
         if time.time()-self.store.get('last_evaluation_at',0)<self.cfg.anthropic_min_interval_seconds:
             return self.status('HOLD_EVALUATION_INTERVAL')
         with self.lock:
             open_symbols=set(ledger.positions)
             seen=set(ledger.state['seen'])
-        selected=queue.next(open_symbols=open_symbols,seen=seen)
-        if selected is None:
-            return self.status('HOLD_NO_QUALIFIED_SIGNAL')
-        ticker=self.quote(selected.symbol)
-        if abs(ticker.last_price/selected.entry_price-1)>min(selected.stop_distance_pct/2,0.005):
-            queue.drop(selected)
-            return self.status('HOLD_CANDIDATE_PRICE_DRIFT')
-        eligible=[selected]
+        parallel=(getattr(self.cfg,'ai_provider_pool_enabled',False)
+            and getattr(self.cfg,'ai_parallel_candidates',1)>1 and callable(getattr(self.llm,'fork',None)))
+        count=min(getattr(self.cfg,'ai_parallel_candidates',1),4) if parallel else 1
+        selected=[]
+        price_drift=False
+        for _ in range(count):
+            candidate=queue.next(open_symbols=open_symbols|{c.symbol for c in selected},seen=seen,
+                lease_seconds=max(120,self.cfg.decision_ttl_seconds+30) if parallel else 0)
+            if candidate is None:
+                break
+            ticker=self.quote(candidate.symbol)
+            if abs(ticker.last_price/candidate.entry_price-1)>min(candidate.stop_distance_pct/2,0.005):
+                queue.drop(candidate)
+                price_drift=True
+                continue
+            selected.append(candidate)
+        if not selected:
+            return self.status('HOLD_CANDIDATE_PRICE_DRIFT' if price_drift else 'HOLD_NO_QUALIFIED_SIGNAL')
         evaluation_started=time.time()
-        risk_pct = min(self.cfg.risk_per_trade_pct, self.risk.preset.risk_per_trade_pct)
-        result = self.graph.evaluate_candidates(eligible, equity=analysis_equity,
-            open_risk=sum(p['risk'] for p in risk_positions.values()), open_positions=len(risk_positions),
-            risk_profile=self.cfg.risk_profile.value, risk_per_trade_pct=risk_pct,
-            target_leverage=min(self.cfg.default_target_leverage, self.cfg.paper_max_leverage))
-        # Identical-data HOLD consumes no provider cadence. Rotation still advances
-        # so another queued pair can be considered on the next worker tick.
-        provider_called=result.metadata.get('provider_called')
-        if provider_called is not False:
+        risk_pct=min(self.cfg.risk_per_trade_pct,self.risk.preset.risk_per_trade_pct)
+        parameters=dict(equity=analysis_equity,
+            open_risk=sum(p['risk'] for p in risk_positions.values()),open_positions=len(risk_positions),
+            risk_profile=self.cfg.risk_profile.value,risk_per_trade_pct=risk_pct,
+            target_leverage=min(self.cfg.default_target_leverage,self.cfg.paper_max_leverage))
+        if not parallel:
+            result=self.graph.evaluate_candidates(selected,**parameters)
+            return self._apply_evaluation(selected[0],result,account,evaluation_control,risk_pct,evaluation_started)
+        # Network/model work overlaps, but every ledger mutation/risk decision is
+        # applied serially on this account's worker after a fresh state read.
+        outcomes=[]
+        with ThreadPoolExecutor(max_workers=len(selected),thread_name_prefix='candidate-ai') as pool:
+            jobs={pool.submit(self._evaluate_in_fork,candidate,parameters):candidate for candidate in selected}
+            for future in as_completed(jobs):
+                candidate=jobs[future]
+                result=None
+                try:
+                    result,client_state=future.result()
+                    for key,value in client_state.items():
+                        setattr(self.llm,key,value)
+                    outcomes.append(self._apply_evaluation(candidate,result,account,evaluation_control,risk_pct,evaluation_started))
+                except sqlite3.Error:
+                    raise
+                except Exception as exc:
+                    logger.warning('candidate evaluation held (%s)',type(exc).__name__)
+                    outcomes.append(self.status('HOLD_CANDIDATE_EVALUATION_ERROR',
+                        trace_id=result.metadata.get('analysis_trace_id') if result is not None else None,finalize_latest=False))
+                finally:
+                    queue.release(candidate)
+        # Do not conceal a successful entry just because the other candidate held.
+        if any(outcome['reason']=='PAPER_OPENED' for outcome in outcomes):
+            return self.status('PAPER_OPENED',finalize_latest=False)
+        return outcomes[-1]
+
+    def _evaluate_in_fork(self,candidate,parameters):
+        from trading.evaluation.service import ContextEvaluator
+        llm=self.llm.fork()
+        public=self.public
+        owned=type(public) is MexcPublicClient and not public.use_fixtures and public.transport is None
+        if owned:
+            public=MexcPublicClient(base_url=self.cfg.mexc_base_url,timeout_seconds=3)
+        try:
+            evaluator=ContextEvaluator(llm,self.store,public,self.cfg)
+            result=evaluator.evaluate_candidates([candidate],**parameters)
+            state={name:getattr(llm,name) for name in ('last_status','last_provider','last_model','last_fallback_reason') if hasattr(llm,name)}
+            return result,state
+        finally:
+            if owned:
+                public.close()
+            close=getattr(llm,'close',None)
+            if close:
+                close()
+
+    def _apply_evaluation(self,selected,result,account,evaluation_control,risk_pct,evaluation_started):
+        ledger=self.ledger
+        queue=self.candidate_queue()
+        trace_id=result.metadata.get('analysis_trace_id')
+        def finish(reason):
+            return self.status(reason,trace_id=trace_id,finalize_latest=False)
+        if (self.cfg.ai_provider_pool_enabled and result.metadata.get('provider_called') is False
+                and result.hold_reason=='invalid_or_unavailable_model'):
+            # Quota/cooldown without any HTTP is not a new paid attempt. Avoid
+            # re-rendering and notifying every worker tick while scans continue.
+            self.store.put('provider_defer_until',time.time()+60)
+        if result.metadata.get('provider_called') is not False:
             self.store.put('last_evaluation_at',evaluation_started)
             queue.evaluated(selected)
+        with self.lock:
+            metrics=ledger.metrics()
+            risk_positions=copy.deepcopy(ledger.positions)
+            analysis_equity=ledger.equity
         if result.action != GraphAction.TRADE or not all(note and note.mode=='llm' for note in (result.market, result.strategy, result.portfolio)):
-            return self.status('HOLD_CLAUDE_DECISION_OR_FAILURE')
+            return finish('HOLD_CLAUDE_DECISION_OR_FAILURE')
         signal = result.selected_signal
         if signal is None:
-            return self.status('HOLD_MISSING_SELECTED_SIGNAL')
+            return finish('HOLD_MISSING_SELECTED_SIGNAL')
         ticker = self.quote(signal.symbol)
         # Do not execute a proposal after material price drift during AI latency.
         if abs(ticker.last_price/signal.entry_price-1) > min(signal.stop_distance_pct/2, 0.005):
-            return self.status('HOLD_PRICE_DRIFT')
+            return finish('HOLD_PRICE_DRIFT')
         if account:
             account = self.account()
             if account.available <= 0 or time.time()-account.observed_at > self.cfg.market_max_age_seconds:
-                return self.status('HOLD_ACCOUNT_STALE_OR_NO_MARGIN')
+                return finish('HOLD_ACCOUNT_STALE_OR_NO_MARGIN')
         rules = self.public.get_contract_rules(signal.symbol)
         proposal = size_proposal_from_signal(signal, equity=ledger.equity, risk_per_trade_pct=risk_pct,
             target_leverage=min(self.cfg.paper_max_leverage, self.cfg.default_target_leverage, rules.max_leverage))
@@ -346,37 +422,37 @@ class PaperRunner:
         decision = self.risk.evaluate(proposal, context)
         self.store.put('last_risk_decision', decision.model_dump(mode='json'))
         if not decision.accepted:
-            return self.status('HOLD_RISK_REJECT')
+            return finish('HOLD_RISK_REJECT')
         ticker = self.quote(signal.symbol)
         if abs(ticker.last_price/signal.entry_price-1) > min(signal.stop_distance_pct/2, 0.005):
-            return self.status('HOLD_PRICE_DRIFT')
+            return finish('HOLD_PRICE_DRIFT')
         with self.lock:
             if result.metadata.get('decision_started_at') and time.time()-result.metadata['decision_started_at'] > self.cfg.decision_ttl_seconds:
-                return self.status('HOLD_DECISION_EXPIRED')
+                return finish('HOLD_DECISION_EXPIRED')
             if self.external_control:
                 latest_control=self.external_control()
                 if not latest_control.get('enabled') or latest_control.get('updated_at')!=evaluation_control.get('updated_at'):
-                    return self.status('HOLD_SETTINGS_CHANGED')
+                    return finish('HOLD_SETTINGS_CHANGED')
             if Path(self.cfg.kill_switch_path).exists():
-                return self.status('HOLD_KILL_SWITCH')
+                return finish('HOLD_KILL_SWITCH')
             if not queue.is_current(signal):
-                return self.status('HOLD_CANDIDATE_STALE')
+                return finish('HOLD_CANDIDATE_STALE')
             if self.protection:
                 self.protection.assert_ready()
             if getattr(self,'management_fatal',False):
-                return self.status('HOLD_MANAGEMENT_PERSISTENCE_FAILURE')
+                return finish('HOLD_MANAGEMENT_PERSISTENCE_FAILURE')
             current = ledger.metrics()
             if current['liquidation_count'] or current['daily_loss_pct'] >= self.cfg.daily_loss_limit_pct or current['drawdown_pct'] >= self.cfg.drawdown_limit_pct:
-                return self.status('HOLD_LOSS_CIRCUIT_BREAKER')
+                return finish('HOLD_LOSS_CIRCUIT_BREAKER')
             # Recheck risk against fresh equity after AI, not the original snapshot.
             context.equity = ledger.equity
             context.open_risk = sum(p['risk'] for p in ledger.positions.values())
             context.open_positions = len(ledger.positions)
             if context.open_positions >= self.cfg.paper_max_positions or not self.risk.evaluate(proposal, context).accepted:
-                return self.status('HOLD_RISK_CHANGED')
+                return finish('HOLD_RISK_CHANGED')
             opened = ledger.open(proposal, rules, ticker.bid1, ticker.ask1, signal.features['dedup_key'], risk_pct, self.cfg.liquidation_buffer_pct)
             if opened is None:
-                return self.status('HOLD_DUPLICATE_OR_ALREADY_OPEN')
+                return finish('HOLD_DUPLICATE_OR_ALREADY_OPEN')
             if opened:
                 opened['decision_ai'] = copy.deepcopy(result.metadata.get('decision_ai',dict(provider='unknown',model='unknown',fallback_reason='')))
                 ledger.state['events'][-1]['decision_ai'] = copy.deepcopy(opened['decision_ai'])
@@ -388,4 +464,4 @@ class PaperRunner:
                 ledger.state['events'][-1]['charts'] = opened['charts']
                 ledger.state['events'][-1]['analysis_version'] = self.cfg.analysis_version
                 ledger.save()
-        return self.status('PAPER_OPENED')
+        return finish('PAPER_OPENED')

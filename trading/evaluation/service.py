@@ -33,6 +33,62 @@ SYSTEM_POLICY = (
 )
 
 
+def _publish_latest(store, trace):
+    """Keep the newest-started review visible without reverting a finished one.
+
+    Caller owns store.lock. Provider callbacks can arrive after another review
+    started or the final execution check completed.
+    """
+    current=store.get('analysis_trace',{})
+    if (trace.get('started_at',0),trace.get('id','')) < (current.get('started_at',0),current.get('id','')):
+        return
+    if current.get('id')==trace.get('id') and current.get('completed_at') and not trace.get('completed_at'):
+        return
+    if current.get('id')==trace.get('id') and current.get('execution_status') in ('opened','rejected'):
+        trace={**trace,'execution_status':current['execution_status'],'execution_reason':current.get('execution_reason')}
+    store.put('analysis_trace',copy.deepcopy(trace))
+
+
+def publish_progress(store, trace):
+    with store.lock:
+        _publish_latest(store,trace)
+
+
+def finalize_trace(store, trace_id, status, reason):
+    """Apply an execution result to exactly the proposed review, never its sibling.
+
+    Returns False for an absent/already-finalized/non-trade review. No model HOLD
+    or unfinished provider call can accidentally become an OPEN notification.
+    """
+    if status not in ('opened','rejected','not_opened'):
+        raise ValueError('invalid execution status')
+    from trading.runtime.usage import archive_trace
+    with store.lock:
+        history=store.get('analysis_history',[])
+        trace=next((row for row in history if row.get('id')==trace_id),None)
+        if trace is None:
+            latest=store.get('analysis_trace',{})
+            if latest.get('id')==trace_id:
+                trace=latest
+        if trace is None:
+            table=store.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_usage_events'").fetchone()
+            row=store.db.execute('SELECT payload FROM ai_usage_events WHERE id=?',(trace_id,)).fetchone() if table else None
+            if row:
+                import json
+                trace=json.loads(row[0])
+        if trace is None or trace.get('action')!='trade' or trace.get('execution_status')!='awaiting_risk':
+            return False
+        trace=copy.deepcopy(trace)
+        trace.update(execution_status=status,execution_reason=reason)
+        archive_trace(store,trace)
+        for row in history:
+            if row.get('id')==trace_id:
+                row.update(trace)
+        store.put('analysis_history',history)
+        _publish_latest(store,trace)
+        return True
+
+
 class ContextEvaluator:
     """Self-contained current evidence + bounded application-owned setup memory.
 
@@ -87,12 +143,12 @@ class ContextEvaluator:
             started_at=started,status='pending',attempts=[],provider='none',model='',
             why_reconsidered=changes,market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))
-        self.store.put('analysis_trace',trace)
+        publish_progress(self.store,trace)
         self.store.put('stage','model_evaluation')
         if hasattr(self.llm,'deadline'):
             self.llm.deadline=started+self.cfg.decision_ttl_seconds
         if hasattr(self.llm,'on_trace'):
-            self.llm.on_trace=lambda update:self.store.put('analysis_trace',{**trace,**copy.deepcopy(update)})
+            self.llm.on_trace=lambda update:publish_progress(self.store,{**trace,**copy.deepcopy(update)})
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
             if decision.action=='trade' and decision.signal_id!=candidate.signal_id:
@@ -108,7 +164,7 @@ class ContextEvaluator:
         provider_called=(any(a.get('generation_requests',0) or a.get('count_requests',0) for a in attempts)
                          if attempts is not None else True)
         trace['completed_at']=time.time()
-        metadata=dict(charts=paths,analysis_version=self.cfg.analysis_version,provider_called=provider_called,
+        metadata=dict(charts=paths,analysis_version=self.cfg.analysis_version,provider_called=provider_called,analysis_trace_id=trace['id'],
             decision_created_at=time.time(),decision_started_at=started,fingerprint=fingerprint,
             input_fingerprint=trace['input_fingerprint'],context_policy=POLICY_VERSION,
             why_reconsidered=changes,prompt_bytes=trace['prompt_bytes'])
@@ -123,7 +179,8 @@ class ContextEvaluator:
             execution_status='awaiting_risk' if decision.action=='trade' else 'not_opened')
         self._save_trace(trace)
         decision_ai=dict(provider=getattr(self.llm,'last_provider','unknown'),model=getattr(self.llm,'last_model','unknown'),
-            fallback_reason=getattr(self.llm,'last_fallback_reason',''))
+            fallback_reason=getattr(self.llm,'last_fallback_reason',''),
+            credential_id=getattr(self.llm,'last_credential_id',''),quota_group=getattr(self.llm,'last_quota_group',''))
         record=dict(at=time.time(),action=decision.action,rationale=decision.rationale,decision_ai=decision_ai,
             invalidation=decision.invalidation,charts=paths,fingerprint=fingerprint)
         card=setup_card(memory)
@@ -151,7 +208,11 @@ class ContextEvaluator:
 
     def _save_trace(self,trace):
         from trading.runtime.usage import archive_trace
-        archive_trace(self.store,trace)
-        self.store.put('analysis_trace',trace)
-        self.store.put('analysis_history',(self.store.get('analysis_history',[])+[copy.deepcopy(trace)])[-30:])
-        self.store.put('stage','model_'+trace['status'])
+        with self.store.lock:
+            archive_trace(self.store,trace)
+            _publish_latest(self.store,trace)
+            history=[row for row in self.store.get('analysis_history',[]) if row.get('id')!=trace['id']]
+            history.append(copy.deepcopy(trace))
+            history.sort(key=lambda row:(row.get('started_at',0),row['id']))
+            self.store.put('analysis_history',history[-30:])
+            self.store.put('stage','model_'+trace['status'])

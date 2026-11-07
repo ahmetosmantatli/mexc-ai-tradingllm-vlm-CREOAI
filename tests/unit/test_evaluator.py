@@ -29,7 +29,7 @@ def test_variant_same_policy_bounded_memory_and_exact_charts(tmp_path,monkeypatc
     assert first.action==GraphAction.TRADE
     assert store.get('analysis_trace')['execution_status']=='awaiting_risk'
     assert first.metadata['charts']==paths
-    assert first.metadata['decision_ai']==dict(provider='anthropic',model='claude-sonnet-4-6',fallback_reason='groq_http_429')
+    assert first.metadata['decision_ai']==dict(provider='anthropic',model='claude-sonnet-4-6',fallback_reason='groq_http_429',credential_id='',quota_group='')
     assert store.get('memory:BTC_USDT')['history'][-1]['decision_ai']==first.metadata['decision_ai']
     assert calls[0]['images']==(paths if version=='vlm' else None)
     assert store.get('memory:BTC_USDT')['watch_note']=='track structure'

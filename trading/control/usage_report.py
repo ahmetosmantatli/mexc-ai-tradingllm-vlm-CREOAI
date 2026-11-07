@@ -43,13 +43,13 @@ def summarize(rows):
     groups=defaultdict(list)
     for trace in rows:
         for a in trace['attempts']:
-            groups[(trace['account'],trace['variant'],a.get('provider','?'),a.get('model','?'))].append(a)
+            groups[(trace['account'],trace['variant'],a.get('provider','?'),a.get('model','?'),a.get('credential_id','legacy'),a.get('quota_group','legacy'))].append(a)
     result=[]
-    for (account,variant,provider,model),attempts in sorted(groups.items()):
+    for (account,variant,provider,model,credential_id,quota_group),attempts in sorted(groups.items()):
         sent=[a for a in attempts if a.get('generation_requests',0)>0]
         known=[a for a in sent if a.get('input_tokens') is not None and a.get('output_tokens') is not None]
         costs=[a['estimated_cost_usd'] for a in sent if a.get('estimated_cost_usd') is not None]
-        result.append(dict(account=account,variant=variant,provider=provider,model=model,
+        result.append(dict(account=account,variant=variant,provider=provider,model=model,credential_id=credential_id,quota_group=quota_group,
             generation_requests=sum(a.get('generation_requests',0) for a in attempts),
             count_requests=sum(a.get('count_requests',0) for a in attempts),
             successful_replies=sum(a.get('status')=='success' for a in sent),

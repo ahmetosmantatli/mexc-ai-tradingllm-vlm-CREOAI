@@ -48,6 +48,7 @@ def human_reason(reason):
     known={
         'HOLD_EVALUATION_INTERVAL':'Bir sonraki analiz zamanı bekleniyor; şu anda yeni AI isteği gönderilmiyor.',
         'HOLD_SCAN_INTERVAL':'Yeni piyasa taraması bekleniyor.',
+        'HOLD_PROVIDER_POOL_WAIT':'Ücretsiz sağlayıcı kotası veya erişimi bekleniyor; tarama ve açık işlem koruması sürüyor.',
         'HOLD_QUEUE_EMPTY':'Güncel aday kuyruğu boş; bağımsız tarama sürüyor.',
         'HOLD_CANDIDATE_STALE':'Aday analiz sırasında eskidi veya taramada değişti; işlem açılmadı.',
         'HOLD_DUPLICATE_OR_ALREADY_OPEN':'Bu mum için işlem zaten kaydedilmiş veya paritede açık işlem var; yeni işlem açılmadı.',
@@ -156,7 +157,8 @@ def format_trace(trace):
         text+=human_reason(trace.get('execution_reason'))+'\n'
     for attempt in trace.get('attempts',[]):
         provider={'groq':'Groq','gemini':'Gemini','anthropic':'Claude'}.get(attempt.get('provider'),'AI')
-        text+=f"• {provider} ({attempt.get('model','model bilgisi yok')}): {provider_result(attempt)}.\n"
+        label=f" / {attempt['credential_id']}" if attempt.get('credential_id') else ''
+        text+=f"• {provider}{label} ({attempt.get('model','model bilgisi yok')}): {provider_result(attempt)}.\n"
     known=[a['estimated_cost_usd'] for a in trace.get('attempts',[]) if a.get('estimated_cost_usd') is not None]
     pending=sum(a.get('pending_usd') or 0 for a in trace.get('attempts',[]))
     if known:

@@ -276,3 +276,35 @@ def test_fleet_scanning_continues_while_model_is_blocked_and_pause_stops_new_sca
     finally:
         release.set()
         fleet.stop()
+
+
+def test_pool_mode_preserves_every_parallel_analysis_notification(tmp_path,monkeypatch):
+    from trading.agents.provider_pool import ProviderPool
+    account=Account('demo',7,7,'','')
+    monkeypatch.setattr('trading.runtime.fleet.load_accounts',lambda *a,**kw:[account])
+    cfg=Settings(_env_file=None,runtime_db_path=str(tmp_path/'runtime'),shared_budget_db_path=str(tmp_path/'budget'),
+        telegram_bot_token='fake',ai_provider_pool_enabled=True,groq_api_key='private-one',groq_api_key_2='private-two')
+    fleet=Fleet(cfg)
+    try:
+        runner=fleet.runners[('demo','text')]
+        assert isinstance(runner.llm,ProviderPool)
+        runner.ledger=PaperLedger(runner.store,500)
+        runner.status('HOLD_EVALUATION_INTERVAL')
+        traces=[dict(id=str(i),symbol=symbol,started_at=i,completed_at=i+1,execution_status='not_opened',
+                     status='completed',action='hold',attempts=[]) for i,symbol in enumerate(('AAA_USDT','BBB_USDT'),1)]
+        runner.store.put('analysis_history',traces)
+        runner.store.put('analysis_trace',traces[-1])
+        fleet.last_publish['demo']=float('inf')
+        fleet.publish(account)
+        fleet.publish(account)
+        rows=fleet.control_store.get('account:demo:outbox')
+        analyses=[r for r in rows if r['id'].startswith('analysis:')]
+        assert len(analyses)==2
+        assert any('AAA_USDT' in r['text'] for r in analyses)
+        assert any('BBB_USDT' in r['text'] for r in analyses)
+        assert 'private-one' not in str(rows) and 'private-two' not in str(rows)
+        snapshot=fleet.control_store.get('account:demo:status')
+        assert snapshot['parallel_candidates']==2
+        assert snapshot['provider_pool']['groups']
+    finally:
+        fleet.stop()

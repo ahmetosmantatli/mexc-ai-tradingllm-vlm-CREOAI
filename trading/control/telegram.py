@@ -169,6 +169,8 @@ class TelegramController:
                 text+=f"Sıradaki aday: {queue['next_symbol']}\n"
         if snapshot.get('scan_stage')=='scanning_market':
             text+='Yeni tarama arka planda sürüyor; AI bekleme aralığından bağımsız.\n'
+        if snapshot.get('parallel_candidates'):
+            text+=f"Aynı anda en fazla {snapshot['parallel_candidates']} farklı aday analizi. İşlem açılışları ortak risk kontrolünden geçer.\n"
         next_at=snapshot.get('next_evaluation_at')
         if next_at:
             text += f"Sonraki AI değerlendirmesine en az {max(0,next_at-time.time()):.0f} sn; uygun yeni aday gerekir.\n"
@@ -180,6 +182,14 @@ class TelegramController:
         for provider,counts in snapshot.get('ai_request_stats',{}).items():
             text+=(f"Ortak {provider}: üretim isteği {counts.get('generation_requests',0)}, token sayımı {counts.get('count_requests',0)}, "
                    f"başarılı {counts.get('successes',0)}, başarısız {counts.get('failures',0)}\n")
+        groups=(snapshot.get('provider_pool') or {}).get('groups',[]) if isinstance(snapshot.get('provider_pool'),dict) else []
+        if groups:
+            text+='Yerel kota havuzu (sağlayıcı paneli değil; günlük sayaç son24 saat):\n'
+            for group in groups:
+                text+=(f"{group['provider']} / {group['model']} / {group['quota_group']} | "
+                       f"Kalan dk istek {group.get('requests_minute_remaining','?')}, tahmini token {group.get('tokens_minute_remaining_estimate','?')} | "
+                       f"Kalan24s istek {group.get('requests_rolling_24h_remaining','?')} | "
+                       f"Meşgul: {'evet' if group.get('in_flight') else 'hayır'}\n")
         latest=snapshot.get('analysis_trace') or {}
         history=snapshot.get('analysis_history') or []
         traces=history[-3:] if history else ([latest] if latest else [])
@@ -212,6 +222,8 @@ class TelegramController:
                     text+=f"Yanıt bitiş nedeni: {attempt['output_stop_reason']}\n"
                 if attempt.get('validation_issues'):
                     text+='Karar doğrulama alanları: '+str(attempt['validation_issues'])[:250]+'\n'
+                if attempt.get('credential_id'):
+                    text+=f"Erişim: {attempt['credential_id']} | Kota grubu: {attempt.get('quota_group','?')}\n"
                 incoming,outgoing=attempt.get('input_tokens'),attempt.get('output_tokens')
                 if incoming is not None or outgoing is not None:
                     text+=f"Token girdi/çıktı: {incoming if incoming is not None else '?'} / {outgoing if outgoing is not None else '?'}\n"

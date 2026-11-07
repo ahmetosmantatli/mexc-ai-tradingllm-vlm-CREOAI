@@ -12,7 +12,7 @@ import re
 import os
 import threading
 
-_RENDER_LOCK = threading.Lock()
+_RENDER_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
