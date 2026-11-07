@@ -45,3 +45,30 @@ def test_cli_errors_do_not_echo_transport_secrets(monkeypatch,capsys):
     assert command.main(['--account','ahmet'])==2
     output=capsys.readouterr().out
     assert 'secret-should-not-be-printed' not in output and 'writes_enabled' in output
+
+
+@pytest.mark.parametrize('reason',['account_credentials_missing','account_disconnected','unknown_account'])
+def test_local_failure_exposes_fixed_reason_and_stage_without_raw_credentials(tmp_path,monkeypatch,capsys,reason):
+    import json
+    from types import SimpleNamespace
+    import trading.control.live_preflight as command
+    monkeypatch.setattr(command,'Settings',lambda **kw:SimpleNamespace())
+    monkeypatch.setattr(command,'resolve_account',lambda *a,**kw:(_ for _ in ()).throw(command.PreflightIssue(reason)))
+    monkeypatch.setattr(command,'MexcPrivateClient',lambda *a,**kw:pytest.fail('No exchange request before resolution'))
+    assert command.main(['--account','friend'])==2
+    result=json.loads(capsys.readouterr().out)
+    assert result['reason']==reason and result['stage']=='account_resolution'
+    assert result['hint'] and result['writes_enabled'] is False
+
+
+def test_local_missing_credentials_are_not_replaced_by_unrelated_global_key(tmp_path,monkeypatch):
+    import json
+    from trading.config import Settings
+    from trading.control.live_preflight import resolve_account,PreflightIssue
+    registry=tmp_path/'accounts.json'
+    registry.write_text(json.dumps({'accounts':[dict(id='friend',telegram_user_id=7,telegram_chat_id=7,mexc_key_env='FRIEND_KEY',mexc_secret_env='FRIEND_SECRET')]}))
+    monkeypatch.delenv('FRIEND_KEY',raising=False);monkeypatch.delenv('FRIEND_SECRET',raising=False)
+    monkeypatch.setenv('MEXC_API_KEY','unrelated-key');monkeypatch.setenv('MEXC_API_SECRET','unrelated-secret')
+    cfg=Settings(_env_file=None,accounts_file=str(registry),runtime_db_path=str(tmp_path/'data/runtime.sqlite3'),account_vault_key='')
+    with pytest.raises(PreflightIssue,match='account_credentials_missing'):
+        resolve_account(cfg,'friend',str(tmp_path/'absent.env'))

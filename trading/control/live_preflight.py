@@ -15,20 +15,28 @@ from trading.exchange.mexc_private import MexcPrivateClient
 from trading.runtime.store import RuntimeStore
 
 
+class PreflightIssue(ValueError):
+    """Only fixed local diagnostic codes, never submitted values."""
+
+
 def resolve_account(cfg, account_id, env_file='.env'):
     environment={**dotenv_values(env_file),**os.environ}
-    account=next((a for a in load_accounts(cfg.accounts_file,environment) if a.account_id==account_id),None)
+    try:
+        accounts=load_accounts(cfg.accounts_file,environment)
+    except Exception:
+        raise PreflightIssue('account_registry_invalid_or_unavailable') from None
+    account=next((a for a in accounts if a.account_id==account_id),None)
     if account is None:
-        raise ValueError('unknown_account')
+        raise PreflightIssue('unknown_account')
     store=RuntimeStore(str(Path(cfg.runtime_db_path).parent/'control.sqlite3'))
     try:
         if store.get(f'account:{account_id}:disconnected',False):
-            raise ValueError('account_disconnected')
+            raise PreflightIssue('account_disconnected')
         saved=Vault(store,cfg.account_vault_key).get(account_id) if cfg.account_vault_key else None
         if saved:
             account=replace(account,mexc_api_key=saved.api_key,mexc_api_secret=saved.api_secret)
         if not account.mexc_api_key or not account.mexc_api_secret:
-            raise ValueError('account_credentials_missing')
+            raise PreflightIssue('account_credentials_missing')
         return account
     finally:
         store.db.close()
@@ -66,6 +74,7 @@ def main(argv=None):
     parser.add_argument('--env-file',default='.env')
     args=parser.parse_args(argv)
     client=None
+    stage='settings'
     try:
         cfg=Settings(_env_file=args.env_file)
         if args.list_accounts:
@@ -73,9 +82,12 @@ def main(argv=None):
             print(json.dumps([a.account_id for a in load_accounts(cfg.accounts_file,environment)]))
             return 0
         if not args.account:
-            raise ValueError('account_required')
+            raise PreflightIssue('account_required')
+        stage='account_resolution'
         account=resolve_account(cfg,args.account,args.env_file)
+        stage='private_client_setup'
         client=MexcPrivateClient(account.mexc_api_key,account.mexc_api_secret,writes_enabled=False)
+        stage='exchange_read'
         report=inspect_account(client,args.symbol)
         print(json.dumps(report,ensure_ascii=False,indent=2))
         return 0
@@ -83,8 +95,17 @@ def main(argv=None):
         # Neither raw transport exceptions nor provider response bodies contain
         # material that should be echoed to a shared terminal/chat transcript.
         from trading.runtime.live_account import LiveAccountError
-        reason=str(exc) if isinstance(exc,LiveAccountError) and re.fullmatch('[A-Z0-9_]{1,128}',str(exc)) else None
-        print(json.dumps(dict(status='preflight_failed',error_type=type(exc).__name__,reason=reason,
+        from trading.control.vault import VaultError
+        reason=str(exc) if isinstance(exc,(PreflightIssue,LiveAccountError)) and re.fullmatch('[A-Za-z0-9_]{1,128}',str(exc)) else None
+        if isinstance(exc,VaultError):reason='account_vault_key_or_saved_record_invalid'
+        hints={
+            'account_credentials_missing':'Bu hesap için container vault kaydı veya kayıt dosyasının işaret ettiği ortam anahtarları bulunamadı. Global MEXC anahtarı otomatik olarak başka hesaba atanmaz.',
+            'account_disconnected':'Bu hesap daha önce bağlantısı kaldırılmış olarak kayıtlı; Telegram üzerinden doğru hesaba yeniden bağla.',
+            'unknown_account':'Bu hesap etiketi container hesap kayıt dosyasında yok.',
+            'account_registry_invalid_or_unavailable':'Container hesap kayıt dosyası veya ortam referansları doğrulanamadı.',
+            'account_vault_key_or_saved_record_invalid':'Mevcut ACCOUNT_VAULT_KEY ile şifreli kayıt açılamadı; anahtarı değiştirme veya kayıt silme.',
+        }
+        print(json.dumps(dict(status='preflight_failed',error_type=type(exc).__name__,stage=stage,reason=reason,hint=hints.get(reason),
             code=getattr(exc,'code',None),http_status=getattr(exc,'status_code',None),
             writes_enabled=False),ensure_ascii=False))
         return 2
