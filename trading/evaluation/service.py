@@ -106,6 +106,8 @@ class ContextEvaluator:
             portfolio=PortfolioAnalystNote(mode='llm'),metadata=metadata)
 
     def _save_trace(self,trace):
+        from trading.runtime.usage import archive_trace
+        archive_trace(self.store,trace)
         self.store.put('analysis_trace',trace)
         self.store.put('analysis_history',(self.store.get('analysis_history',[])+[copy.deepcopy(trace)])[-30:])
         self.store.put('stage','model_'+trace['status'])

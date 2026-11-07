@@ -1,0 +1,13 @@
+"""Durable, allowlisted usage journal; no prompts, secrets or chart content."""
+import json
+
+TRACE_FIELDS=('id','symbol','strategy','confidence','started_at','completed_at','status','action','provider','model','fallback_reason')
+ATTEMPT_FIELDS=('provider','model','status','phase','http_status','error_category','error_code','error_param','latency_ms','generation_requests','count_requests','input_tokens','output_tokens','estimated_cost_usd','pending_usd')
+
+
+def archive_trace(store, trace):
+    safe={key:trace[key] for key in TRACE_FIELDS if key in trace}
+    safe['attempts']=[{key:a[key] for key in ATTEMPT_FIELDS if key in a} for a in trace.get('attempts',[])]
+    with store.lock,store.db:
+        store.db.execute('CREATE TABLE IF NOT EXISTS ai_usage_events (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        store.db.execute('INSERT OR REPLACE INTO ai_usage_events VALUES (?,?)',(trace['id'],json.dumps(safe,allow_nan=False)))

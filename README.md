@@ -187,3 +187,14 @@ The cost display separates token-based **Claude estimated settled cost** from **
 Only allowlisted provider error codes/parameter names and fixed error categories are retained. Raw provider error messages, `failed_generation`, prompts, authorization headers and URLs are never persisted or sent to Telegram. A bare HTTP400 from an older version has no recoverable cause here: inspect the next candidate's safe diagnostic category instead. GPT-OSS requests explicitly use `include_reasoning=false` and low reasoning effort with JSON output per [Groq reasoning documentation](https://console.groq.com/docs/reasoning); no claim is made that this resolves an unobserved historical400.
 
 Settings now show the profile's maximum risk percentage and a USDT amount computed from the selected variant's last observed paper equity, falling back to an explicitly labeled initial seed before the first observation. Execution always recomputes against current ledger equity. OPEN notifications include the algorithm, heuristic score and planned stop-loss percentage/USDT estimate after contract rounding and paper cost assumptions. Aggressive mode changes risk limits, not the candidate-generation algorithm or proven expectancy. No strategy percentage allocation or calibrated success probability exists. The current generators remain simple SMA8/21 trend, ROC12 momentum and SMA20 mean-reversion rules; this is not a completed discretionary ICT strategy engine.
+
+## Export observed provider usage (no AI calls)
+
+```sh
+.venv/bin/python -m trading.control.usage_report --output-dir data/reports
+# Optional start date/time, e.g. --since 2026-11-07T00:00:00+03:00
+```
+
+This reads account/session/text-or-VLM SQLite journals and writes private `ai-usage-summary.txt`, `ai-requests.csv`, and `ai-usage.json` files. Summary groups include provider/model, actual generation and token-count request counters, failures, cooldown skips, known/unknown token usage, mean tokens for known-usage requests, known Claude cost estimates and uncertain reservations. Export performs no provider or exchange call, can run alongside the service and does not change account control. Output includes private account labels/symbols but excludes prompts, raw errors, images and credentials. Files are regenerated with mode0600.
+
+New completed evaluations are archived separately from the rolling last30 Telegram history. Older retained history is included and deduplicated, but previously discarded history cannot be reconstructed. Interrupted/in-flight requests may be missing; token usage missing from failed requests is not assumed zero. Means apply only to the recorded known-usage samples, not the whole lifetime or a forecast of future daily spend. Groq billed cost and other applications' usage remain unknown. A service restart preserves account controls, balances and journals; client `not_called` resets for the new process and does not mean historical provider usage was zero.
