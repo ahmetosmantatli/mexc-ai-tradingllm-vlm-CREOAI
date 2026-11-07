@@ -275,3 +275,13 @@ A triggered watch requests another analysis, never an order. Runtime must obtain
 Each symbol has a revisioned canonical plan across strategies. A review receives the prior plan; stale concurrent results cannot overwrite a newer revision. Reversing an active opposing plan requires explicit acknowledgement of its revision and a concrete explanation. Final execution validates the committed revision again. These guards prevent stale conflicting execution, not all changes of opinion when new evidence appears. Accounts, variants and paper sessions remain isolated.
 
 Telegram `/takip` or `/watchlist` and the **Takip listesi** button show active conditions, timeframe, expiry and invalidation. Watch creation, trigger, expiry and invalidation events are delivered through the durable notification outbox. No new API keys or watch-specific `.env` switches are required; the existing run/pause/stop and quota scheduling controls apply.
+
+## Operator-reviewed live building blocks
+
+See [live-readiness](docs/live-readiness.md) for the opt-in signed private client,
+real-account reconciliation and exact-proposal approval executor. These modules
+are not wired to the Telegram PAPER worker and do not enable unattended live
+trading. All live tests use fake exchange responses; no real order is sent.
+A server connectivity check is available with
+`python -m trading.control.live_preflight --account ACCOUNT_ID --symbol BTC_USDT`.
+It is read-only and does not approve execution. Keep the existing PAPER gates.
