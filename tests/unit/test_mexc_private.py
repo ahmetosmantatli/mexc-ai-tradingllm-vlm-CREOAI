@@ -118,6 +118,16 @@ def test_business_rejection_safe_numeric_code():
     assert 'PRIVATE' not in str(caught.value)
 
 
+def test_finished_protection_filter_is_read_only_and_validated():
+    client,requests=setup(lambda req:httpx.Response(200,json=dict(success=True,code=0,data=[])))
+    client.protection_orders('BTC_USDT',finished=1)
+    assert requests[-1].method=='GET'
+    assert requests[-1].url.params['is_finished']=='1'
+    for value in (True,2,'1'):
+        with pytest.raises(ValueError):client.protection_orders('BTC_USDT',finished=value)
+    assert len(requests)==1
+
+
 @pytest.mark.parametrize('updates',[dict(contracts=True),dict(leverage=True),dict(leverage=2.5),
     dict(contracts=float('nan')),dict(symbol='../transfer'),dict(external_id='x?PRIVATE_KEY'),
     dict(stop_loss=0),dict(stop_loss=111),dict(entry_price=0),dict(entry_price=float('nan')),

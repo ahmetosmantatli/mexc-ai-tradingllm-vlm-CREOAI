@@ -185,9 +185,11 @@ class MexcPrivateClient:
         return self._request('GET','/api/v1/private/account/risk_limit',operation='risk_limits',
             params={'symbol':_symbol(symbol) if symbol else None},expected=(dict,list))
 
-    def protection_orders(self,symbol=None,page_num=1,page_size=100):
+    def protection_orders(self,symbol=None,page_num=1,page_size=100,*,finished=0):
+        if type(finished) is not int or finished not in (0,1):
+            raise ValueError('invalid protection completion filter')
         return self._request('GET','/api/v1/private/stoporder/list/orders',operation='protection_orders',
-            params=dict(self._page(page_num,page_size),symbol=_symbol(symbol) if symbol else None,is_finished=0),expected=list)
+            params=dict(self._page(page_num,page_size),symbol=_symbol(symbol) if symbol else None,is_finished=finished),expected=list)
 
     def submit_market(self,*,symbol,side,contracts,leverage,external_id,stop_loss,take_profit,entry_price,position_mode=1):
         order=MarketOrder(symbol=symbol,side=side,contracts=contracts,leverage=leverage,external_id=external_id,

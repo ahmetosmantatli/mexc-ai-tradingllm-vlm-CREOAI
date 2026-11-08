@@ -166,8 +166,14 @@ def test_failed_native_protection_closes_identified_exposure_once(tmp_path):
     assert len(private.protects)==1 and len(private.closes)==1
     result=executor.reconcile(intent['intent_id'])
     assert result['status']=='closed' and result['net_pnl']==4.3
+    assert store.get('live:halt')['requires_review'] is True
+    assert store.get('live:halt')['reason']=='emergency_close_requires_review'
     executor.reconcile(intent['intent_id'])
     assert len(private.submits)==1 and len(private.closes)==1
+    next_intent=approve(executor,proposal())
+    with pytest.raises(LiveExecutionError,match='live_halt_latched'):
+        executor.execute(next_intent['intent_id'])
+    assert len(private.submits)==1
 
 
 def test_pause_blocks_new_entry_but_does_not_block_normal_close_reconciliation(tmp_path):

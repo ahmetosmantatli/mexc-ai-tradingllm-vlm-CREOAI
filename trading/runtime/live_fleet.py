@@ -335,6 +335,11 @@ class LiveFleet:
             text+=f"Kararı veren AI: {ai.get('provider','kayıtlı değil')} / {ai.get('model','kayıtlı değil')}\n"
         if state=='closed':
             text+=f"Kapanış nedeni: {row.get('close_reason','borsa kaydı')}\n"
+            if row.get('close_reason')=='EMERGENCY':
+                reasons={'native_protection_not_confirmed':'Borsadaki SL/TP koruması doğrulanamadı.',
+                    'filled_position_risk_exceeds_plan':'Gerçek dolum sonrası risk/likidasyon kontrolü geçmedi.'}
+                text+=reasons.get(row.get('halt_reason'),'Acil kapanışın teknik ayrıntıları denetim kaydında.')+'\n'
+                text+='Acil kapanış sonrası yeni giriş engeli kaldırılmaz; teknik inceleme gerekir.\n'
             if row.get('realized_complete') is True and isinstance(row.get('net_pnl'),(int,float)):
                 text+=f"MEXC net sonuç: {row['net_pnl']:+.4f} USDT\n"
             else:

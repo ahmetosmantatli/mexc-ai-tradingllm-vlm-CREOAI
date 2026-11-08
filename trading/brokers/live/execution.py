@@ -102,6 +102,13 @@ class ApprovedLiveExecutor(PositionManagementMixin):
 
     def _resolved(self,row):
         halt=self.store.get('live:halt',{})
+        # Closing the exposure does not repair the protection failure. Persist
+        # the entry circuit breaker across restarts and other intent resolution.
+        if row.get('close_reason')=='EMERGENCY':
+            if not halt or halt.get('intent_id')==row['intent_id']:
+                self.store.put('live:halt',dict(intent_id=row['intent_id'],
+                    reason='emergency_close_requires_review',at=time(),requires_review=True))
+            return self._save(row)
         if halt.get('intent_id')==row['intent_id']:
             self.store.put('live:halt',{})
         return self._save(row)
