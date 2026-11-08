@@ -14,6 +14,7 @@ from math import isfinite
 from time import time
 from uuid import uuid4
 
+from trading.brokers.live.management import PositionManagementMixin
 from trading.models.domain import TradeProposal
 from trading.risk.engine import RiskContext
 from trading.runtime.live_account import LiveAccountReconciler,LiveAccountError,observe_risk_reference
@@ -31,7 +32,7 @@ class LiveExecutionGates:
     reviewed: bool = False
 
 
-class ApprovedLiveExecutor:
+class ApprovedLiveExecutor(PositionManagementMixin):
     def __init__(self,gates,store,private,public,risk_engine,*,account_id='manual',
                  max_quote_age_seconds=30,max_price_drift_pct=.005,fee_rate=.0006,
                  slippage_bps=5,liquidation_buffer_pct=.02,can_execute=None,binding_id=None,allowed_capital=None):
@@ -257,7 +258,7 @@ class ApprovedLiveExecutor:
         matches=[p for p in self.private.open_positions(proposal['symbol'])
             if str(p.get('positionId'))==str(position_id) and p.get('symbol')==proposal['symbol']
             and p.get('positionType')==expected and p.get('state')==1 and p.get('openType')==1
-            and p.get('autoAddIm') in (False,0) and self._number(p.get('holdVol'))==row.get('effective_contracts',row['contracts'])]
+            and p.get('autoAddIm') in (False,0) and self._number(p.get('holdVol'))==self.remaining_contracts(row)]
         return matches[0] if len(matches)==1 else None
 
     def _protected(self,row,position):
@@ -283,16 +284,16 @@ class ApprovedLiveExecutor:
                     volumes=protection.get('profitLossVolType')
                     if volumes not in ('SAME','SEPARATE'):
                         return None
-                    volume_ok=(self._number(protection.get('vol'))==row.get('effective_contracts',row['contracts']) if volumes=='SAME' else
-                        volumes=='SEPARATE' and self._number(protection.get('stopLossVol'))==row.get('effective_contracts',row['contracts'])
-                        and self._number(protection.get('takeProfitVol'))==row.get('effective_contracts',row['contracts']))
+                    volume_ok=(self._number(protection.get('vol'))==self.remaining_contracts(row) if volumes=='SAME' else
+                        volumes=='SEPARATE' and self._number(protection.get('stopLossVol'))==self.remaining_contracts(row)
+                        and self._number(protection.get('takeProfitVol'))==self.remaining_contracts(row))
                     if (str(protection.get('positionId'))==str(position['positionId']) and protection.get('state')==1
                             and protection.get('isFinished')==0 and protection.get('lossTrend')==2 and protection.get('profitTrend')==2
                             and protection.get('stopLossType')==0 and protection.get('takeProfitType')==0
                             and protection.get('stopLossReverse')==2 and protection.get('takeProfitReverse')==2
                             and volume_ok
-                            and self._number(protection.get('stopLossPrice'))==row['proposal']['stop_loss']['price']
-                            and self._number(protection.get('takeProfitPrice'))==row['proposal']['take_profit_price']):
+                            and self._number(protection.get('stopLossPrice'))==self.protection_levels(row)[0]
+                            and self._number(protection.get('takeProfitPrice'))==self.protection_levels(row)[1]):
                         return True
                     return None # Existing same-position protection is not safe to duplicate.
                 except (AttributeError,LiveExecutionError):
@@ -322,13 +323,15 @@ class ApprovedLiveExecutor:
                 except Exception:return row
             return row
         try:
+            if row.get('management_pending'):
+                return self._reconcile_management(row,token)
             if row.get('close_write_attempted') or row.get('emergency_close_attempted'):
                 close=self.private.order_by_external_id(row['proposal']['symbol'],'close-'+row['intent_id'][:24])
                 expected_close_side=4 if row['proposal']['side']=='long' else 2
                 remaining=self.private.open_positions(row['proposal']['symbol'])
                 if (isinstance(close,dict) and close.get('externalOid')=='close-'+row['intent_id'][:24]
                         and close.get('symbol')==row['proposal']['symbol'] and close.get('side')==expected_close_side
-                        and close.get('state')==3 and self._number(close.get('dealVol'))==row['contracts']
+                        and close.get('state')==3 and self._number(close.get('dealVol'))==row.get('close_contracts',self.remaining_contracts(row))
                         and not any(str(p.get('positionId'))==row['position_id'] and self._number(p.get('holdVol'))>0 for p in remaining)):
                     closed=self._historical_close(row,dict(positionId=row['position_id']))
                     if closed:return self._resolved(closed)
@@ -373,11 +376,11 @@ class ApprovedLiveExecutor:
             self._save(row)
             fill_price=row['entry_fill_price']
             liquidation=self._number(position.get('liquidatePrice'))
-            stop=row['proposal']['stop_loss']['price']
+            stop=self.protection_levels(row)[0]
             stop_buffer=(stop-liquidation)/fill_price if row['proposal']['side']=='long' else (liquidation-stop)/fill_price
             worst_stop=stop*(1-self.slip if row['proposal']['side']=='long' else 1+self.slip)
-            qty=row.get('effective_contracts',row['contracts'])*row['contract_size']
-            actual_risk=abs(fill_price-worst_stop)*qty+self.fee*qty*(fill_price+worst_stop)
+            qty=self.remaining_contracts(row)*row['contract_size']
+            actual_risk=max(0,fill_price-worst_stop if row['proposal']['side']=='long' else worst_stop-fill_price)*qty+self.fee*qty*(fill_price+worst_stop)
             if liquidation<=0 or stop_buffer<self.liq_buffer or actual_risk>row['proposal']['max_loss_if_stopped']+1e-8:
                 self._halt(row,'filled_position_risk_exceeds_plan')
                 return self._close_once(row,position,token,'EMERGENCY')
@@ -395,8 +398,8 @@ class ApprovedLiveExecutor:
                 try:
                     self._gate(entry=False)
                     self._check_lease(token)
-                    self.private.place_protection(position_id=row['position_id'],contracts=row.get('effective_contracts',row['contracts']),
-                        stop_loss=row['proposal']['stop_loss']['price'],take_profit=row['proposal']['take_profit_price'],
+                    self.private.place_protection(position_id=row['position_id'],contracts=self.remaining_contracts(row),
+                        stop_loss=self.protection_levels(row)[0],take_profit=self.protection_levels(row)[1],
                         request_id='sl-'+row['intent_id'][:24])
                 except Exception:
                     pass # One write only; confirm by read before deciding exposure status.
@@ -442,6 +445,9 @@ class ApprovedLiveExecutor:
         try:
             row=self.state(intent_id)
             if row.get('binding_id')!=self.binding_id:raise LiveExecutionError('credential_binding_changed')
+            if row.get('management_pending'):
+                row=self._reconcile_management(row,token)
+                if row.get('management_pending') or row.get('status')=='closed':return row
             if row.get('close_write_attempted') or row.get('emergency_close_attempted'):
                 return self._reconcile(row,token)
             order=self.private.order_by_external_id(row['proposal']['symbol'],row['external_id'])
@@ -456,14 +462,14 @@ class ApprovedLiveExecutor:
             return self.state(row['intent_id'])
         self._gate(entry=False)
         self._check_lease(token)
-        row.update(close_write_attempted=True,close_reason=reason,status='close_write_unknown')
+        row.update(close_write_attempted=True,close_reason=reason,status='close_write_unknown',close_contracts=self.remaining_contracts(row))
         if reason=='EMERGENCY':row['emergency_close_attempted']=True
         self._save(row)
         try:
             self._gate(entry=False)
             self._check_lease(token)
             self.private.close_position(symbol=row['proposal']['symbol'],side=row['proposal']['side'],
-                contracts=row.get('effective_contracts',row['contracts']),position_id=row['position_id'],external_id='close-'+row['intent_id'][:24],
+                contracts=self.remaining_contracts(row),position_id=row['position_id'],external_id='close-'+row['intent_id'][:24],
                 position_mode=row['position_mode'])
         except Exception:
             return self.state(row['intent_id'])

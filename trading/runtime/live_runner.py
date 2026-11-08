@@ -39,6 +39,9 @@ class LiveRunner:
         self.risk=RiskEngine(settings=settings)
         self.graph=ContextEvaluator(llm,store,public,settings)
         self._cycle_lock,self._monitor_lock,self._scan_lock=threading.Lock(),threading.Lock(),threading.Lock()
+        self._management_lock=threading.Lock()
+        from trading.runtime.live_management import LivePositionManager
+        self.position_manager=LivePositionManager(self)
 
     def candidate_queue(self):
         return CandidateQueue(self.store)
@@ -126,9 +129,11 @@ class LiveRunner:
             intent=next((value for value in intents if str(value.get('position_id'))==str(row['position_id'])),{})
             proposal=intent.get('proposal',{})
             metadata=proposal.get('metadata',{})
+            levels=intent.get('current_protection') or {}
+            stop,target=levels.get('stop',proposal.get('stop_loss',{}).get('price')),levels.get('target',proposal.get('take_profit_price'))
             result[row['symbol']]=dict(row,symbol=row['symbol'],side='long' if row['side']==1 else 'short',
                 entry=row['entry'],leverage=row['leverage'],unrealized=row['unrealized'],
-                stop=proposal.get('stop_loss',{}).get('price'),target=proposal.get('take_profit_price'),
+                stop=stop,target=target,
                 risk=proposal.get('max_loss_if_stopped'),notional=proposal.get('notional'),
                 initial_stop=proposal.get('stop_loss',{}).get('price'),decision_ai=metadata.get('decision_ai',{}),
                 strategy=metadata.get('strategy'),analysis_version=metadata.get('analysis_version'))
@@ -179,6 +184,10 @@ class LiveRunner:
             if self.executor is not None:
                 self.executor.reconcile_all()
             self._refresh()
+            if self.cfg.live_position_management_enabled:
+                for intent in self._intents():
+                    try:self.position_manager.observe(intent)
+                    except Exception:pass # Quote sampling must not interrupt native reconciliation.
             return self.status('LIVE_RECONCILED')
         except sqlite3.Error:
             raise
@@ -187,6 +196,18 @@ class LiveRunner:
             return self.status('HOLD_LIVE_RECONCILIATION')
         finally:
             self._monitor_lock.release()
+
+    def manage_positions(self):
+        return self.position_manager.tick()
+
+    def management_llm(self):
+        if callable(getattr(self.llm,'fork',None)):
+            return self.llm.fork()
+        # Isolate validators/provider state from concurrent entry reviews.
+        from trading.agents.provider_router import ProviderRouter
+        if isinstance(self.llm,ProviderRouter):
+            return ProviderRouter(self.cfg,self.llm.claude.budget,self.llm.store)
+        raise ValueError('request-local management model required')
 
     def _watch_candidates(self):
         coordinator=WatchCoordinator(self.store)
@@ -476,9 +497,12 @@ class LiveRunner:
             intent=next((value for value in intents if str(value.get('position_id'))==str(row['position_id'])),{})
             proposal=intent.get('proposal',{})
             metadata=proposal.get('metadata',{})
+            levels=intent.get('current_protection') or {}
+            stop,target=levels.get('stop',proposal.get('stop_loss',{}).get('price')),levels.get('target',proposal.get('take_profit_price'))
             key=row['symbol'] if row['symbol'] not in positions else row['symbol']+':'+str(row['position_id'])
             positions[key]=dict(row,symbol=row['symbol'],side='long' if row['side']==1 else 'short',
-                stop=proposal.get('stop_loss',{}).get('price'),target=proposal.get('take_profit_price'),
+                stop=stop,target=target,management_revision=intent.get('management_revision',0),
+                remaining_contracts=intent.get('managed_contracts',intent.get('effective_contracts',intent.get('contracts'))),
                 opened_at=row.get('opened_at'),intent_id=intent.get('intent_id'),
                 protection_status=intent.get('status','unmanaged'),analysis_version=metadata.get('analysis_version'),
                 decision_ai=metadata.get('decision_ai',{}),price_source=metadata.get('price_source','quant'))
@@ -486,6 +510,7 @@ class LiveRunner:
         snapshot=dict(mode='LIVE',live_orders_enabled=bool(self.executor is not None),observed_at=time.time(),reason=reason,
             account=dict(ready=account.get('ready',False),**account.get('balance',{})),
             live_account=account,real_account=account,balance=account.get('balance'),positions=positions,closed=closed,intents=intents,
+            management_status=self.store.get('management_status',{}),management_trace=self.store.get('management_trace',{}),
             analysis_trace=self.store.get('analysis_trace',{}),analysis_history=self.store.get('analysis_history',[]),
             watchlist=watch_snapshot(self.store),leverage_mode=self.cfg.live_leverage_mode,analysis_version=self.cfg.analysis_version,
             ai_status=getattr(self.llm,'last_status','not_called'),live_halt=self.store.get('live:halt'),is_simulated=False)

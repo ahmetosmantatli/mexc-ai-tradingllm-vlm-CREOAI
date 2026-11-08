@@ -191,3 +191,37 @@ def test_live_paper_live_roundtrip_revokes_old_start_and_pending_commands(tmp_pa
         assert second.control_store.get('account:a:live_grant_revision') is None
         assert second.control_store.get('account:a:commands')[0]['status']=='cancelled_mode_change'
     finally:second.stop()
+
+
+def test_management_job_has_its_own_schedule_and_stops_with_ai(tmp_path):
+    f=fleet(tmp_path,live_position_management_enabled=True)
+    f.runners['a'].manage_positions=lambda:f.runners['a'].calls.append('management')
+    try:
+        f.controller.set_control('a',enabled=True,stopped=False,capital_chosen=True,
+            capital_mode='account',version_chosen=True,profile_chosen=True)
+        f.tick()
+        for job in f.jobs.values():job.result(timeout=2)
+        assert ('a','management') in f.jobs
+        assert 'management' in f.runners['a'].calls and 'monitor' in f.runners['a'].calls
+        f.controller.set_control('a',enabled=False,stopped=True)
+        f.last_schedule={};f.tick()
+        for job in f.jobs.values():job.result(timeout=2)
+        assert f.runners['a'].calls.count('management')==1
+        assert f.runners['a'].calls.count('monitor')==2
+    finally:f.stop()
+
+
+def test_management_message_distinguishes_confirmed_stop_from_uncertain_action(tmp_path):
+    f=fleet(tmp_path)
+    row=dict(binding_id='b',intent_id='i',proposal=dict(symbol='BTC_USDT'),
+        management_events=[dict(decision_id='d',action='move_stop',status='confirmed',reason='Yeni destek teyit edildi.',
+            old_stop=98,new_stop=99,target=104,ai=dict(provider='gemini',model='test'))])
+    try:
+        f._publish_management('a',row)
+        text=f.controller.messages[-1][0][1]
+        assert '98 → 99' in text and 'gemini / test' in text and 'doğrulandı' in text
+        assert f.controller.messages[-1][1]['event_id']=='live-management:b:i:d'
+        row['management_events']=[];row['management_pending']=dict(decision_id='pending')
+        f._publish_management('a',row)
+        assert 'henüz doğrulanmadı' in f.controller.messages[-1][0][1]
+    finally:f.stop()

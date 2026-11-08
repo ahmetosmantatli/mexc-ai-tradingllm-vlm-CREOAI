@@ -125,11 +125,10 @@ normal close followed by another entry, independent paused reconciliation,
 manual native closing, loss circuit breakers and exact SL/TP readback.
 They do not demonstrate profitability or exact live exchange behavior.
 
-This is not a complete discretionary ICT strategy or continuous AI position
-management. Existing quant algorithms propose setups; native SL/TP protects
-owned exposure. PAPER structural stop-tightening is not silently reused as a
-LIVE cash/fill simulator, and automatic LIVE partial-profit/trailing changes
-are not introduced by this release. Unsupported manual partial exits, exchange
+This is not a complete discretionary ICT strategy. Existing quant algorithms
+propose setups; optional model price planning and event-driven position
+management are described below. Native SL/TP protects owned exposure. PAPER
+structural stop-tightening is not silently reused as a LIVE cash/fill simulator. Unsupported manual partial exits, exchange
 mode changes and unidentified exposure may require operator reconciliation;
 new entries fail closed. API outages, order limits, funding and slippage can
 produce losses beyond a plan. Small balances may fail contract minimums.
@@ -190,5 +189,61 @@ verification uses the final model prices, not the original quant levels.
 The setup card and canonical symbol plan record the model's actual proposed
 levels. Telegram identifies **AI plan** versus **algorithm levels**, and reports
 the model's plan reason. Existing open positions are not rewritten by enabling
-this option. Continuous model-driven native stop/TP changes and arbitrary
-pending/limit-entry plans are still not provided by this option.
+this option. Event-driven native stop/exit management requires the separate
+position-management flag below; arbitrary pending/limit-entry plans remain unsupported.
+
+## Optional AI position management
+
+`LIVE_POSITION_MANAGEMENT_ENABLED=true` enables a separate account management
+job while the same operator Start grant is active. `LIVE_MANAGEMENT_MIN_INTERVAL_SECONDS`
+(default 60, range 15..3600) is a per-position call floor, not periodic permission
+to call on unchanged evidence. First review, a newly closed review-timeframe bar,
+or a new sampled favorable integer-R milestone may trigger a call. Entry plan
+TF defaults to 15m if absent; the model may select 5m/15m/4h for subsequent reviews.
+The monitor samples executable quotes for excursions; sampled MAE/MFE is explicitly
+not tick-exact. No automatic fixed-R stop move or mandatory profit taking exists.
+
+A request-local provider client uses the same quota groups, shared paid budget,
+unchanged-context fallback, VLM/text evidence and deadline as entry reviews. A
+self-contained card includes initial thesis/entry/stop/risk, current native
+levels and remaining contracts, actual account snapshot, elapsed bars, bounded
+previous decisions and confirmed actions, plus current compact closed candles.
+Management usage is archived under strategy `position_management` in the same
+usage database. HOLD/failure on the same event is not repeatedly submitted;
+there is no assumption of provider-side conversational memory.
+
+Supported typed actions are HOLD, tighten SL, reduce a fraction of CURRENT
+remaining contracts, and close. Tightened stops reference a supplied closed
+candle wick, obey tick/fair/executable-price/liquidation checks, and never widen
+initial risk. Existing targets remain unchanged; no adds, reversals, leverage
+changes, or arbitrary TP extensions are supported. Initial proposal/fingerprint
+is immutable; current protection, remaining size and management revision are
+separate state. PnL reconciliation uses cumulative original filled exposure,
+including partial exits, and never fabricates separate partial-exit net profit.
+
+The account executor lease serializes writes with entries/manual closes/monitor.
+Ownership, native protection, revision, permission and deadline are checked
+again after inference and before a write. Durable records precede POSTs. Timeout,
+crash or missing read-back never causes blind resubmission. Stop modifications
+use the identified native pair, without cancelling protection. Partial closes
+are confirmed by original external ID and actual remaining position, including
+terminal partial fills; the remaining pair is read back and, if necessary,
+resized with one same-price placement. No additional AI write is allowed during
+an unresolved action; new entries halt while read-only reconciliation continues.
+
+MEXC documents in-place stop price modification and asynchronous same-price
+quantity updates: [modify native TP/SL](https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/modify-tpsl-prices-on-a-tpsl-planned-order),
+[place TP/SL by position](https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/place-tpsl-order-by-position).
+These are exchange capabilities, not atomic execution guarantees. During delayed
+resize confirmation the previous pair is retained and protection is explicitly
+unverified for the remaining size. After the executor read-back window (default
+30s), a confirmed remainder still lacking verified protection is emergency-closed
+once under the existing emergency permission. That close is separately read back;
+an exchange outage may still require a manual exchange check.
+
+Telegram shows current levels/remaining size, last management rationale, provider
+and model, confirmed stop/partial/full-exit events, or explicit uncertain-action
+notifications. Bot/AI Stop (and Pause in the current LIVE panel) cuts new management
+calls/actions; already-sent writes still reconcile, including protective resize.
+Native SL/TP monitoring is independent of model calls and continues while stopped.
+This release is verified with fake exchanges only, not a live-account execution test.

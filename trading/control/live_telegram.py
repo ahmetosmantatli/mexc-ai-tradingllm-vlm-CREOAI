@@ -64,7 +64,8 @@ class LiveTelegramController(TelegramController):
             if price_planning else 'Giriş/SL/TP: algoritma seviyeleri.\n')
         return (text+f"Analiz: {'VLM' if state['version']=='vlm' else 'Görselsiz'} | Profil: {mode.get('label','?')}\n"
             f"Planlanan işlem riski üst sınırı: %{state['risk_per_trade_pct']*100:g}\n"
-            +leverage_text+price_text+
+            +leverage_text+price_text+('Açık pozisyon: olay bazlı AI stop taşıma/kısmi kapatma/kapatma yönetimi etkin.\n'
+                if (self.snapshot_provider(account_id) or {}).get('position_management_enabled') else '')+
             'Başlat sonrasında model ve risk motoru işlem başına Telegram onayı beklemez. Başlat yetkisi 7 gün geçerlidir.\n'
             'Durdur yeni girişleri/AI çağrılarını keser; açık pozisyonların uzlaştırması ve borsa koruması sürer.')
 
@@ -100,6 +101,7 @@ class LiveTelegramController(TelegramController):
             origin=p.get('decision_ai') or {}
             if origin:text+=f"Karar: {origin.get('provider','?')} / {origin.get('model','?')}\n"
             text+=f"Koruma: {p.get('protection_status','borsa uzlaştırması bekleniyor')}\n"
+            if p.get('remaining_contracts') is not None:text+=f"Kalan kontrat: {p['remaining_contracts']} | Yönetim sürümü: {p.get('management_revision',0)}\n"
         return text
 
     def status_text(self,account_id,positions=False):
@@ -112,6 +114,10 @@ class LiveTelegramController(TelegramController):
               f"Pozisyon marjini: {number(balance.get('position_margin'))} USDT\n"
               f"Açık PnL: {number(balance.get('unrealized'))} USDT\n")
         text+=self.positions_text(account_id,snapshot)
+        management=snapshot.get('management_status') or {}
+        if snapshot.get('position_management_enabled'):
+            text+='Açık pozisyon AI yönetimi etkin (olay bazlı).\n'
+            if management:text+=f"Son yönetim: {management.get('symbol','?')} · {management.get('reason','henüz değerlendirme yok')}\n"
         text+=('Yeni AI/işlem arayışı açık.\n' if state.get('enabled') and not state.get('stopped') else
                'Yeni AI/işlem arayışı kapalı; açık pozisyon uzlaştırması sürer.\n')
         reason=snapshot.get('reason','')
@@ -129,7 +135,16 @@ class LiveTelegramController(TelegramController):
         return super().watchlist_text(account_id).replace('Takip listesi · PAPER','Takip listesi · LIVE',1)
 
     def diagnostics_text(self,account_id):
-        return super().diagnostics_text(account_id).replace('PAPER','LIVE')
+        text=super().diagnostics_text(account_id).replace('PAPER','LIVE')
+        trace=(self.snapshot_provider(account_id) or {}).get('management_trace') or {}
+        if trace:
+            text+=f"\nAçık pozisyon AI yönetimi: {trace.get('symbol','?')}\nModel: {trace.get('provider','?')} / {trace.get('model','?')}\n"
+            actions={'hold':'Koru / bekle','move_stop':'Stop taşı','reduce':'Kısmi kapat','close':'Kapat'}
+            text+=f"Karar: {actions.get(trace.get('action'), 'Yanıt veya doğrulama bekleniyor')}\n{trace.get('rationale','')}\n"
+            for attempt in trace.get('attempts',[]):
+                text+=f"{attempt.get('provider','?')}: {attempt.get('status','?')} | Girdi/çıktı token: {attempt.get('input_tokens','?')}/{attempt.get('output_tokens','?')}\n"
+            text+='Yönetim kararı, borsada gerçekleşme anlamına gelmez; doğrulanmış aksiyon ayrıca bildirilir.\n'
+        return text
 
     def report_text(self,account_id):
         rows=(self.snapshot_provider(account_id) or {}).get('closed',[])
@@ -155,7 +170,7 @@ class LiveTelegramController(TelegramController):
             text='Canlı işlem arayışı istendi. Güncel hesap, risk ve koruma kontrolleri geçerse model önerileri yürütülür.'
         elif command in ('pause','stop'):
             self.set_control(account_id,enabled=False,stopped=command=='stop')
-            text='Yeni işlem/AI arayışı durdu. Açık pozisyonların uzlaştırması sürer; bu düğme pozisyonları kapatmaz.'
+            text='Yeni girişler ve açık pozisyonlar için AI yönetim çağrıları durdu. Açık pozisyonların borsa SL/TP koruması ve uzlaştırması sürer; bu düğme pozisyonları kapatmaz.'
         elif command in ('text','vlm'):
             self.set_control(account_id,enabled=False,version=command,version_chosen=True,profile_chosen=False)
             text=self.settings_text(account_id)

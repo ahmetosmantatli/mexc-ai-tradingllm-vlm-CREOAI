@@ -282,6 +282,7 @@ class LiveFleet:
         snapshot=copy.deepcopy(runner.status(runner.store.get('status',{}).get('reason','LIVE_STATUS')) if runner else dict(mode='LIVE',reason='ACCOUNT_UNAVAILABLE',positions={},account={'ready':False}))
         snapshot['mode']='LIVE'
         snapshot['price_planning_enabled']=self.cfg.live_price_plan_enabled
+        snapshot['position_management_enabled']=self.cfg.live_position_management_enabled
         snapshot['control']=self.controller.control(ident)
         snapshot['version']=snapshot['control'].get('version','text')
         snapshot['ai_budget']=self.budget_store.get('ai_budget',{})
@@ -293,6 +294,7 @@ class LiveFleet:
         if executor is not None and callable(getattr(executor,'intents',None)):
             for row in executor.intents():
                 self._publish_intent(ident,row)
+                self._publish_management(ident,row)
         return snapshot
 
     def _publish_intent(self, ident, row):
@@ -344,6 +346,32 @@ class LiveFleet:
                     photos.append(str(path))
         self.controller.enqueue(ident,text,photos=photos,event_id=f"live:{row.get('binding_id')}:{row.get('intent_id')}:{state}")
 
+    def _publish_management(self,ident,row):
+        proposal=row.get('proposal',{})
+        for event in row.get('management_events',[]):
+            labels={'move_stop':'AI stop değişikliği','reduce':'AI kısmi kapatma','close':'AI kapatma'}
+            confirmed=event.get('status')=='confirmed'
+            text=(f"CANLI | {proposal.get('symbol','?')} | {labels.get(event['action'],event['action'])}\n"
+                +('Borsa sonucu doğrulandı.\n' if confirmed else 'Yönetim sırasında pozisyon borsada kapandı; değişiklik uygulanmış sayılmadı.\n' if event.get('status')=='position_closed' else 'Pozisyon koruması doğrulanamadı; acil kapatma sonucu uzlaştırılıyor.\n' if event.get('status')=='protection_failed' else 'İstek reddedildi; değişiklik doğrulanmadı.\n'))
+            if event['action']=='move_stop':text+=f"SL: {event['old_stop']} → {event.get('new_stop','doğrulanmadı')} | TP: {event['target']}\n"
+            else:
+                text+=f"Kapanan kontrat: {event.get('filled_contracts','doğrulanmadı')} | Kalan: {event.get('remaining_contracts','doğrulanmadı')}\n"
+                if event['action']=='reduce' and confirmed:text+='Kısmi kapanışın ayrı net kârı henüz hesaplanmadı; kasa borsadan okunur.\n'
+            ai=event.get('ai',{})
+            text+=f"Gerekçe: {event['reason']}\nModel: {ai.get('provider','?')} / {ai.get('model','?')}\n"
+            snapshot=self.control_store.get(f'account:{ident}:status',{})
+            balance=(snapshot.get('live_account') or {}).get('balance',{})
+            if isinstance(balance.get('equity'),(int,float)):text+=f"Son gözlenen kasa: {balance['equity']:.4f} USDT\n"
+            positions=snapshot.get('positions',{})
+            observed=next((p for p in positions.values() if str(p.get('position_id'))==row.get('position_id')),None)
+            if observed is not None:text+=f"Son gözlenen açık PnL: {observed.get('unrealized','doğrulanmadı')} USDT\n"
+            self.controller.enqueue(ident,text,event_id=f"live-management:{row.get('binding_id')}:{row['intent_id']}:{event['decision_id']}")
+        pending=row.get('management_pending')
+        if pending:
+            self.controller.enqueue(ident,f"CANLI | {proposal.get('symbol','?')}\nAI yönetim isteğinin borsa sonucu henüz doğrulanmadı. "
+                'Aynı emir tekrar gönderilmiyor; yeni girişler sonuç uzlaştırılana kadar bekliyor.',
+                event_id=f"live-management-pending:{row.get('binding_id')}:{row['intent_id']}:{pending['decision_id']}")
+
     def start(self):
         self.started=True
 
@@ -354,7 +382,7 @@ class LiveFleet:
         now=time.time()
         for account in self.accounts:
             ident=account.account_id
-            for kind in ('analysis','scan','monitor'):
+            for kind in ('analysis','scan','monitor','management'):
                 future=self.jobs.get((ident,kind))
                 if future and future.done():
                     try:
@@ -373,6 +401,7 @@ class LiveFleet:
                 permission=self.entry_control(ident)
                 for kind,method,interval,enabled in (
                     ('monitor',runner.monitor,max(1,getattr(self.cfg,'position_poll_seconds',5)),True),
+                    ('management',getattr(runner,'manage_positions',lambda:None),max(1,getattr(self.cfg,'position_poll_seconds',5)),permission['enabled'] and self.cfg.live_position_management_enabled),
                     ('scan',runner.scan_market,max(1,self.cfg.worker_loop_interval_seconds),permission['enabled']),
                     ('analysis',runner.cycle,max(1,getattr(self.cfg,'position_poll_seconds',5)),permission['enabled'])):
                     key=(ident,kind)

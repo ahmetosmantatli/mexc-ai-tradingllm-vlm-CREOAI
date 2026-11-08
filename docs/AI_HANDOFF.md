@@ -67,8 +67,9 @@ singleGroq8krequest even with two keys. No silent image/data dropping.
 Quant candidates remain SMA8/21trend, ROC12momentum and SMA20mean-reversion on
 closed15m data. Model reviews deterministic4h/15m/5m swing/BOS/sweep/FVG evidence;
 this is not a validated discretionary ICT edge. Model may select leverage and
-risk fraction within profile/private/exchange caps; entry/SL/TP still originate
-fromquant candidates. Actual size is recomputed from fresh equity, fees, margin
+risk fraction within profile/private/exchange caps. LIVE_LEVERAGE_MODE=exchange
+uses verified account/symbol caps. LIVE_PRICE_PLAN_ENABLED=true permits grounded
+model entry/SL/TP proposals; null retains quant levels. Actual size is recomputed from fresh equity, fees, margin
 and contract steps. No minimum-quantity upsize beyond risk allowance.
 
 Typed conditional watch plans have threshold/candlecross, price invalidation and
@@ -76,9 +77,11 @@ expiry<=24h. They persist outside candidatequeue; max40active. Scanner observes
 withoutAI; triggers require fresh matchingquant setup before review. Canonical
 symbolrevision prevents late analysis overriding newer plans; oppositeactive
 plans require explicitrevision acknowledgement and rationale. Watches aren't
-orders. Native LIVE SL/TP is verified; automatic LIVE trailing/partial-profit
-management is not implemented by this release. PAPER has separate structural
-stop tightening; do not pretend it moves native live stops.
+orders. Native LIVE SL/TP is verified. LIVE_POSITION_MANAGEMENT_ENABLED=true
+enables separate event-driven HOLD/tighten-SL/reduce/close reviews using request-local
+provider state and durable position cards. No adds/reversals or TP extensions.
+Bot/AI Stop cuts new management calls; native reconciliation remains independent.
+See docs/live-readiness.md for protection readback and timeout behavior.
 
 ## Real execution and failure behavior
 

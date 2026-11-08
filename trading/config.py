@@ -43,6 +43,8 @@ class Settings(BaseSettings):
 
     # Live code is inert unless every deployment gate and account allowlist matches.
     live_price_plan_enabled: bool = False
+    live_position_management_enabled: bool = False
+    live_management_min_interval_seconds: float = Field(default=60, ge=15, le=3600)
     live_leverage_mode: str = Field(default='profile',pattern='^(profile|exchange)$')
     live_max_leverage: int = Field(default=10,ge=1,le=25)
     live_max_positions: int = Field(default=4,ge=1,le=4)
