@@ -23,6 +23,33 @@ def market(client,**kwargs):
         external_id='intent_123',stop_loss=90.,take_profit=110.),**kwargs))
 
 
+def test_ioc_entry_is_documented_type_three_at_the_limit_price(monkeypatch):
+    monkeypatch.setattr('trading.exchange.mexc_private.time.time',lambda:1700000000.)
+    client,requests=setup(writes_enabled=True)
+    market(client)
+    market_body=json.loads(requests[0].content)
+    client.submit_ioc(symbol='HOT_USDT',side='long',contracts=18607,leverage=10,external_id='intent_123',
+        stop_loss=0.0004266,take_profit=0.00048,price=0.0004438)
+    request=requests[-1]
+    assert request.url.path=='/api/v1/private/order/create'
+    body=json.loads(request.content)
+    assert body['type']==3 and body['price']==0.0004438
+    assert body['side']==1 and body['vol']==18607 and body['openType']==1
+    assert set(body)==set(market_body)
+    assert 'priceProtect' not in body and 'marketCeiling' not in body and 'bboTypeNum' not in body
+    signed=b'PRIVATE_KEY1700000000000'+request.content
+    assert request.headers['signature']==hmac.new(b'PRIVATE_SECRET',signed,hashlib.sha256).hexdigest()
+
+
+@pytest.mark.parametrize('price', [0, -1, 0.0004266, 0.00048])
+def test_ioc_rejects_a_price_that_cannot_bound_the_entry(price):
+    client,requests=setup(writes_enabled=True)
+    with pytest.raises((ValidationError,ValueError)):
+        client.submit_ioc(symbol='HOT_USDT',side='long',contracts=1,leverage=10,external_id='intent_123',
+            stop_loss=0.0004266,take_profit=0.00048,price=price)
+    assert not requests
+
+
 def test_exact_post_signed_bytes_and_native_protection(monkeypatch):
     monkeypatch.setattr('trading.exchange.mexc_private.time.time',lambda:1700000000.)
     client,requests=setup(writes_enabled=True)

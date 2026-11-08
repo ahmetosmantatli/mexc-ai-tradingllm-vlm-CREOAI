@@ -49,6 +49,12 @@ class MarketOrder(BaseModel):
         return value
 
 
+class IocOrder(MarketOrder):
+    """Same documented order fields as a market entry, plus a positive limit price."""
+
+    price: float = Field(gt=0)
+
+
 def _symbol(value):
     if not isinstance(value,str) or not re.fullmatch(r'[A-Z0-9]{1,30}_USDT',value):
         raise ValueError('invalid USDT contract')
@@ -204,6 +210,22 @@ class MexcPrivateClient:
         return self._request('POST','/api/v1/private/order/create',operation='submit_market',expected=dict,
             body=dict(symbol=order.symbol,price=0,vol=order.contracts,leverage=order.leverage,
                 side=1 if side=='long' else 3,type=5,openType=1,externalOid=external_id,
+                stopLossPrice=order.stop_loss,takeProfitPrice=order.take_profit,lossTrend=2,profitTrend=2,
+                positionMode=order.position_mode,reduceOnly=False))
+
+    def submit_ioc(self,*,symbol,side,contracts,leverage,external_id,stop_loss,take_profit,price,position_mode=1):
+        """IOC limit. Documented place-order type 3. The fill cannot trade past `price`.
+
+        Official type enum: 1 limit, 2 post-only, 3 IOC, 4 FOK, 5 market.
+        No price-cap field exists on this endpoint; `price` is the limit.
+        """
+        order=IocOrder(symbol=symbol,side=side,contracts=contracts,leverage=leverage,external_id=external_id,
+            stop_loss=stop_loss,take_profit=take_profit,price=price,position_mode=position_mode)
+        if not (order.stop_loss<order.price<order.take_profit if side=='long' else order.take_profit<order.price<order.stop_loss):
+            raise ValueError('invalid protection direction')
+        return self._request('POST','/api/v1/private/order/create',operation='submit_ioc',expected=dict,
+            body=dict(symbol=order.symbol,price=order.price,vol=order.contracts,leverage=order.leverage,
+                side=1 if side=='long' else 3,type=3,openType=1,externalOid=external_id,
                 stopLossPrice=order.stop_loss,takeProfitPrice=order.take_profit,lossTrend=2,profitTrend=2,
                 positionMode=order.position_mode,reduceOnly=False))
 
