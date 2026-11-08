@@ -59,8 +59,10 @@ class LiveRunner:
     def _risk_engine(self):
         preset=get_preset(self.cfg.risk_profile)
         limit=self.cfg.live_aggressive_daily_loss_limit_pct
-        if preset.profile==RiskProfile.AGGRESSIVE_GROWTH and limit is not None:
-            preset=replace(preset,daily_loss_halt_pct=limit)
+        if preset.profile==RiskProfile.AGGRESSIVE_GROWTH:
+            preset=replace(preset,
+                daily_loss_halt_pct=preset.daily_loss_halt_pct if limit is None else limit,
+                weekly_loss_halt_enabled=self.cfg.live_aggressive_weekly_loss_limit_enabled)
         return RiskEngine(settings=self.cfg,preset=preset)
 
     def configure(self,control):
@@ -437,7 +439,8 @@ class LiveRunner:
             if snapshot['balance']['equity']<=0 or snapshot['balance']['available']<=0:
                 return self.status('HOLD_LIVE_NO_FUNDS')
             risk=observe_risk_reference(self.store,self.binding_id,snapshot['balance']['equity'])
-            if (risk['daily_loss_pct']>=self.risk.preset.daily_loss_halt_pct or risk['weekly_loss_pct']>=self.risk.preset.weekly_loss_halt_pct
+            if (risk['daily_loss_pct']>=self.risk.preset.daily_loss_halt_pct
+                    or self.risk.preset.weekly_loss_halt_enabled and risk['weekly_loss_pct']>=self.risk.preset.weekly_loss_halt_pct
                     or risk['drawdown_pct']>=self.risk.preset.max_drawdown_kill_pct):
                 return self.status('HOLD_LIVE_LOSS_CIRCUIT_BREAKER')
             if not self.external_scan:
@@ -552,7 +555,10 @@ class LiveRunner:
             analysis_trace=self.store.get('analysis_trace',{}),analysis_history=self.store.get('analysis_history',[]),
             watchlist=watch_snapshot(self.store),leverage_mode=self.cfg.live_leverage_mode,analysis_version=self.cfg.analysis_version,
             runner_id=self.runner_id,
-            entry_risk_policy=dict(profile=self.risk.preset.profile.value,daily_loss_limit_pct=self.risk.preset.daily_loss_halt_pct),
+            entry_risk_policy=dict(profile=self.risk.preset.profile.value,daily_loss_limit_pct=self.risk.preset.daily_loss_halt_pct,
+                weekly_loss_limit_enabled=self.risk.preset.weekly_loss_halt_enabled,
+                weekly_loss_limit_pct=self.risk.preset.weekly_loss_halt_pct,
+                drawdown_limit_pct=self.risk.preset.max_drawdown_kill_pct),
             ai_status=getattr(self.llm,'last_status','not_called'),live_halt=self.store.get('live:halt'),is_simulated=False)
         with self.lock:
             events=self.store.get('live_events',[])

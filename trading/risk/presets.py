@@ -24,6 +24,7 @@ class RiskPreset:
     fee_free_preference: bool
     capital_floor_enabled: bool
     stop_required: bool = True
+    weekly_loss_halt_enabled: bool = True
 
 
 PRESETS: dict[RiskProfile, RiskPreset] = {

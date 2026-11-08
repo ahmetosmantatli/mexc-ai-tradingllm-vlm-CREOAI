@@ -90,6 +90,13 @@ class LiveTelegramController(TelegramController):
         risk_policy=snapshot.get('entry_risk_policy') or {}
         daily_limit=risk_policy.get('daily_loss_limit_pct') if risk_policy.get('profile')==state['risk_profile'] else None
         daily_text=f'Günlük kayıp eşiği: %{daily_limit*100:g}\n' if daily_limit is not None else ''
+        if daily_limit is not None:
+            if risk_policy.get('weekly_loss_limit_enabled') is False:
+                daily_text+='Haftalık kayıp durdurması kapalı.\n'
+            elif risk_policy.get('weekly_loss_limit_pct') is not None:
+                daily_text+=f"Haftalık kayıp eşiği: %{risk_policy['weekly_loss_limit_pct']*100:g}\n"
+            if risk_policy.get('drawdown_limit_pct') is not None:
+                daily_text+=f"Zirveden düşüş eşiği: %{risk_policy['drawdown_limit_pct']*100:g}\n"
         leverage_text=('Kaldıraç: parite ve hesabın güncel borsa üst sınırı; model seçim yapar. Stop/likidasyon, marjin ve risk kontrolleri geçerlidir.\n'
             if leverage_mode=='exchange' else f"Profil kaldıraç üst sınırı: {state.get('max_leverage','?')}x; gerçek hesap/borsa sınırı daha düşük olabilir.\n")
         price_planning=snapshot.get('price_planning_enabled',False)

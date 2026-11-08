@@ -120,7 +120,7 @@ class RiskEngine:
         if context.daily_loss_pct >= preset.daily_loss_halt_pct:
             reasons.append("DAILY_LOSS_HALT")
 
-        if context.weekly_loss_pct >= preset.weekly_loss_halt_pct:
+        if preset.weekly_loss_halt_enabled and context.weekly_loss_pct >= preset.weekly_loss_halt_pct:
             reasons.append("WEEKLY_LOSS_HALT")
 
         if context.drawdown_pct >= preset.max_drawdown_kill_pct:

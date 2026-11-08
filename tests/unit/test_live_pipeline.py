@@ -142,10 +142,36 @@ def test_live_aggressive_daily_limit_override_reaches_entry_and_executor(tmp_pat
     private.equity = 11.5854 * .85
     assert runner.cycle()['reason'] == 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
 
+    monkeypatch.setenv('LIVE_AGGRESSIVE_DAILY_LOSS_LIMIT_PCT', '0.50')
+    monkeypatch.setenv('LIVE_AGGRESSIVE_WEEKLY_LOSS_LIMIT_ENABLED', 'false')
+    cfg=Settings(_env_file=None)
+    runner.cfg.live_aggressive_daily_loss_limit_pct=cfg.live_aggressive_daily_loss_limit_pct
+    runner.cfg.live_aggressive_weekly_loss_limit_enabled=cfg.live_aggressive_weekly_loss_limit_enabled
+    status=runner.cycle()
+    assert status['reason']=='HOLD_LIVE_NO_CANDIDATE'
+    assert status['entry_risk_policy']['daily_loss_limit_pct']==.50
+    assert status['entry_risk_policy']['weekly_loss_limit_enabled'] is False
+    assert executor.risk is runner.risk
+    from trading.risk.engine import RiskContext
+    from .test_risk_engine import _proposal
+    from trading.risk.presets import get_preset
+    from trading.config import RiskProfile
+    proposal=_proposal(max_loss_if_stopped=5.)
+    context=RiskContext(equity=700.,starting_capital=700.,capital_floor=0.,
+                        daily_loss_pct=.15,weekly_loss_pct=.15,drawdown_pct=.15)
+    assert executor.risk.evaluate(proposal,context).accepted
+    context.daily_loss_pct=.50
+    assert 'DAILY_LOSS_HALT' in executor.risk.evaluate(proposal,context).reason_codes
+    assert get_preset(RiskProfile.AGGRESSIVE_GROWTH).weekly_loss_halt_enabled
+    assert get_preset(RiskProfile.AGGRESSIVE_GROWTH).daily_loss_halt_pct==.055
+    private.equity=11.5854*.77
+    assert runner.cycle()['reason']=='HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
+
     control['risk_profile'] = 'balanced'
     private.equity = 10.87804108
     assert runner.cycle()['reason'] == 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
     assert executor.risk.preset.daily_loss_halt_pct == .035
+    assert executor.risk.preset.weekly_loss_halt_enabled is True
 
 
 @pytest.mark.parametrize('independent_watch',[False,True])

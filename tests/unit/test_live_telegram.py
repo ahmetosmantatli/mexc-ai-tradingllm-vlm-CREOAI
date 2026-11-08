@@ -37,6 +37,18 @@ def test_live_setup_has_no_demo_or_paper_cash_and_requires_explicit_start(tmp_pa
     assert not ctl.control('a')['enabled']
 
 
+def test_live_settings_explain_weekly_disabled_and_remaining_drawdown_limit(tmp_path):
+    snapshot=dict(entry_risk_policy=dict(profile='aggressive_growth',daily_loss_limit_pct=.50,
+        weekly_loss_limit_enabled=False,weekly_loss_limit_pct=.135,drawdown_limit_pct=.225))
+    ctl,_=setup(tmp_path,{'a':snapshot})
+    ready(ctl)
+    ctl.set_control('a',risk_profile='aggressive_growth',risk_per_trade_pct=.03)
+    text=ctl.settings_text('a')
+    assert 'Günlük kayıp eşiği: %50' in text
+    assert 'Haftalık kayıp durdurması kapalı.' in text
+    assert 'Zirveden düşüş eşiği: %22.5' in text
+
+
 def test_live_stop_blocks_ai_and_keeps_monitoring_description(tmp_path):
     ctl,calls=setup(tmp_path);ready(ctl)
     ctl._command('a','start');ctl._command('a','stop')
