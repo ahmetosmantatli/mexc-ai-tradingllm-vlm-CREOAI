@@ -396,15 +396,23 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             if row.get('management_pending'):
                 return self._reconcile_management(row,token)
             if row.get('close_write_attempted') or row.get('emergency_close_attempted'):
+                remaining=self.private.open_positions(row['proposal']['symbol'])
+                if not isinstance(remaining,list):
+                    return self._halt(row,'close_positions_not_confirmed')
+                position_open=any(str(p.get('positionId'))==row['position_id']
+                    and self._number(p.get('holdVol'))>0 for p in remaining)
+                if not position_open:
+                    # Historical position identity, direction, full size and
+                    # timestamp can settle a close even if its order lookup fails.
+                    closed=self._historical_close(row,dict(positionId=row['position_id']))
+                    if closed:
+                        return closed
                 close=self.private.order_by_external_id(row['proposal']['symbol'],'close-'+row['intent_id'][:24])
                 expected_close_side=4 if row['proposal']['side']=='long' else 2
-                remaining=self.private.open_positions(row['proposal']['symbol'])
                 if (isinstance(close,dict) and close.get('externalOid')=='close-'+row['intent_id'][:24]
                         and close.get('symbol')==row['proposal']['symbol'] and close.get('side')==expected_close_side
                         and close.get('state')==3 and self._number(close.get('dealVol'))==row.get('close_contracts',self.remaining_contracts(row))
-                        and not any(str(p.get('positionId'))==row['position_id'] and self._number(p.get('holdVol'))>0 for p in remaining)):
-                    closed=self._historical_close(row,dict(positionId=row['position_id']))
-                    if closed:return self._resolved(closed)
+                        and not position_open):
                     row.update(status='closed',realized_complete=False,net_pnl=None)
                     return self._resolved(row)
                 return self._halt(row,'emergency_close_not_confirmed')

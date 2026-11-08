@@ -188,6 +188,52 @@ def test_runner2_ioc_missing_attachment_closes_without_duplicating_protection(tm
     assert len(private.closes)==1 and not private.protects and calls==[100.]
 
 
+@pytest.mark.parametrize('close_reason',['EMERGENCY','MANUAL'])
+def test_close_history_settles_failed_order_lookup_without_another_write(tmp_path,close_reason):
+    executor,private,store=setup(tmp_path)
+    row=executor.execute(approve(executor)['intent_id'])
+    row.update(status='close_write_unknown',close_write_attempted=True,close_contracts=1000.,
+               close_reason=close_reason,emergency_close_attempted=close_reason=='EMERGENCY')
+    executor._save(row)
+    private.positions=[]
+    private.make_history(1000.)
+    private.order_by_external_id=lambda *args:pytest.fail('verified history must settle before order lookup')
+    result=executor.reconcile(row['intent_id'])
+    assert result['status']=='closed' and result['realized_complete'] is True
+    assert result['net_pnl']==4.3 and result['close_reason']==close_reason
+    assert not private.closes
+    assert len(private.submits)==1
+    if close_reason=='EMERGENCY':
+        assert store.get('live:halt')['reason']=='emergency_close_requires_review'
+    else:
+        assert not store.get('live:halt')
+
+
+@pytest.mark.parametrize('mismatch',['positionId','closeVol','positionType','updateTime','still_open','unavailable_positions'])
+def test_close_history_cannot_clear_mismatched_or_unreadable_exposure(tmp_path,mismatch):
+    executor,private,store=setup(tmp_path)
+    row=executor.execute(approve(executor)['intent_id'])
+    row.update(status='close_write_unknown',close_write_attempted=True,close_contracts=1000.,
+               close_reason='EMERGENCY',emergency_close_attempted=True)
+    executor._save(row)
+    private.make_history(1000.)
+    if mismatch!='still_open':
+        private.positions=[]
+    changes=dict(positionId=999,closeVol=999.,positionType=2,updateTime=0)
+    if mismatch in changes:
+        private.history[0][mismatch]=changes[mismatch]
+    if mismatch=='unavailable_positions':
+        private.open_positions=lambda *args:None
+    def unavailable(*args):
+        raise TimeoutError()
+    private.order_by_external_id=unavailable
+    result=executor.reconcile(row['intent_id'])
+    assert result['status']=='close_write_unknown'
+    assert not result.get('realized_complete')
+    assert store.get('live:halt')
+    assert not private.closes
+
+
 def test_definite_entry_rejection_preserves_safe_exchange_diagnostics(tmp_path):
     from trading.exchange.mexc_private import MexcPrivateError
     executor,private,store=setup(tmp_path)
