@@ -13,7 +13,7 @@ from trading.exchange.mexc_private import MexcPrivateClient
 NUMERIC_FIELDS=('positionId','id','orderId','lossTrend','profitTrend','stopLossPrice',
     'takeProfitPrice','state','positionType','vol','isFinished','takeProfitVol',
     'stopLossVol','volType','takeProfitReverse','stopLossReverse','takeProfitType',
-    'stopLossType','errorCode')
+    'stopLossType','errorCode','stopLossOrderPrice','orderType','type','side','dealVol')
 
 
 def safe_protection(row):
@@ -65,8 +65,17 @@ def main():
     client=MexcPrivateClient(account.mexc_api_key,account.mexc_api_secret,writes_enabled=False)
     try:
         result=inspect(client,args.symbol,{str(r['position_id']) for r in intents})
+        entries=[]
+        for intent in intents:
+            order=client.order_by_external_id(args.symbol,intent['external_id'])
+            entries.append(dict(
+                recorded_exchange_type=intent.get('entry_exchange_type'),
+                submitted_type=intent.get('entry_submitted_type'),
+                exchange_order={k:v for k,v in safe_protection(order).items()
+                    if k in ('orderId','positionId','orderType','type','side','state','vol','dealVol')},
+                exchange_order_id_matches=str(order.get('orderId'))==str(intent.get('exchange_order_id'))))
         print(json.dumps(dict(account=args.account,symbol=args.symbol,writes_enabled=False,
-            protections=result),ensure_ascii=False,indent=2))
+            protections=result,entries=entries),ensure_ascii=False,indent=2))
     except Exception as exc:
         from trading.runtime.execution_diagnostics import safe_execution_error
         print(json.dumps(dict(status='read_failed',details=safe_execution_error(exc),writes_enabled=False)))

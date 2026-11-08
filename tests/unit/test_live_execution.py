@@ -45,7 +45,7 @@ class Client:
         if self.on_submit:self.on_submit()
         self.order_row=dict(symbol=symbol,side=1 if side=='long' else 3,openType=1,positionMode=position_mode,
             externalOid=external_id,positionId=11,orderId=22,vol=contracts,dealVol=contracts*self.fill_fraction,
-            dealAvgPrice=100.,type=5,state=3 if self.fill_fraction==1 else 2)
+            dealAvgPrice=100.,orderType=5,state=3 if self.fill_fraction==1 else 2)
         self.positions=[dict(symbol=symbol,positionType=1 if side=='long' else 2,positionId=11,holdVol=contracts*self.fill_fraction,
             state=1,openType=1,autoAddIm=0,leverage=leverage,holdAvgPrice=100.,im=20.,unRealizedPnl=0.,liquidatePrice=80.)]
         if self.submit_unknown:raise SimpleError(ambiguous=True)
@@ -278,11 +278,37 @@ def test_attached_market_protection_without_stop_type_matches_documented_shape(t
     result=executor.execute(intent['intent_id'])
     assert result['status']=='protected'
     assert result['protection_verification']=='attached_market_entry_schema'
+    assert result['entry_exchange_type']==5 and result['entry_submitted_type']==5
+    assert 'type' not in private.order_row and private.order_row['orderType']==5
     assert not private.protects and not private.closes
     restarted=ApprovedLiveExecutor(executor.gates,store,private,executor.public,executor.risk,
         account_id='ahmet',binding_id='binding-1')
     assert restarted.reconcile(intent['intent_id'])['status']=='protected'
     assert len(private.submits)==1
+
+
+@pytest.mark.parametrize('order,expected',[
+    ({'orderType':5},5),({'type':5},5),({'orderType':5,'type':5},5),
+    ({'orderType':5,'type':1},None),({'orderType':None},None),
+    ({'orderType':'5'},None),({'orderType':True},None),
+    ({'category':1},None),({},None)])
+def test_entry_type_reads_exchange_response_without_guessing(order,expected):
+    assert ApprovedLiveExecutor._entry_order_type(order)==expected
+
+
+@pytest.mark.parametrize('fields',[{}, {'orderType':1}, {'orderType':5,'type':1}])
+def test_local_submitted_market_type_does_not_override_exchange_evidence(tmp_path,fields):
+    executor,private,store=setup(tmp_path);intent=approve(executor)
+    executor.execute(intent['intent_id'])
+    private.order_row.pop('orderType')
+    private.order_row.update(fields)
+    native=private.stops[0]
+    native.pop('stopLossType')
+    native.update(orderId=22,positionType=1,errorCode=0)
+    result=executor.reconcile(intent['intent_id'])
+    assert result['entry_submitted_type']==5
+    assert result['status']=='close_write_unknown'
+    assert len(private.closes)==1
 
 
 @pytest.mark.parametrize('changes',[

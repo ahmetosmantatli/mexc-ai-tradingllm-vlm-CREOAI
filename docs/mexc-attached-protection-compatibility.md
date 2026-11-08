@@ -20,6 +20,12 @@ This exception does not normalize the exchange field to 0 or apply to external
 or standalone protection orders. The accepted evidence is journaled as
 `protection_verification=attached_market_entry_schema`.
 
+Order create requests use `type`, but query responses use `orderType`:
+https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/get-order-information-by-order-id
+The response type is read from `orderType` (or a consistent legacy `type`).
+Missing, null or conflicting values stay unknown, never default to the local
+`entry_submitted_type`. Local submitted and exchange observed types are separate.
+
 Mocks cover this response shape and conflicting variants, but cannot prove
 actual future exchange stop execution. Emergency protection and persistent
 entry halts remain enabled.

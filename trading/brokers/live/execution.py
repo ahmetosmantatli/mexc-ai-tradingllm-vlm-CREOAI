@@ -245,7 +245,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             self._check_lease(token)
             if row['expires_at']<=time():raise LiveExecutionError('approval_expired_during_preflight')
             row.update(status='entry_write_unknown',entry_write_attempted=True,contracts=contracts,position_mode=mode,
-                entry_protection_schema='mexc_create_market_attached_v1')
+                entry_protection_schema='mexc_create_market_attached_v1',entry_submitted_type=5)
             self._save(row) # Durable before POST; crash requires read-only reconciliation.
             try:
                 self.private.submit_market(symbol=proposal.symbol,side=proposal.side.value,contracts=contracts,
@@ -273,6 +273,15 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             and p.get('positionType')==expected and p.get('state')==1 and p.get('openType')==1
             and p.get('autoAddIm') in (False,0) and self._number(p.get('holdVol'))==self.remaining_contracts(row)]
         return matches[0] if len(matches)==1 else None
+
+    @staticmethod
+    def _entry_order_type(order):
+        # create requests use `type`; order query responses use `orderType`.
+        # Never infer an exchange type from our submitted type or `category`.
+        values=[order[key] for key in ('orderType','type') if key in order]
+        if not values or any(type(v) is not int or v not in (1,2,3,4,5,6) for v in values):
+            return None
+        return values[0] if all(v==values[0] for v in values) else None
 
     def _protected(self,row,position):
         """True=matching native pair, False=complete list no pair, None=unknown."""
@@ -400,7 +409,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                 return self._halt(row,'entry_fill_not_fully_confirmed')
             row.update(effective_contracts=filled,exchange_order_id=str(order['orderId']),
                 entry_fill_price=self._number(order.get('dealAvgPrice')),partial_fill=filled<row['contracts'],
-                entry_exchange_type=order.get('type'))
+                entry_exchange_type=self._entry_order_type(order))
             position=self._position(row,order)
             if position is None:
                 closed=self._historical_close(row,order)
