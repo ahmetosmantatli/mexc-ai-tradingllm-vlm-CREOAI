@@ -245,7 +245,9 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                     take_profit=proposal.take_profit_price,position_mode=mode)
             except Exception as exc:
                 if getattr(exc,'ambiguous',True) is False:
-                    row.update(status='entry_rejected')
+                    from trading.runtime.execution_diagnostics import safe_execution_error
+                    row.update(status='entry_rejected',entry_rejection={
+                        **safe_execution_error(exc),'stage':'submit_market'})
                     return self._save(row)
                 self._halt(row,'entry_write_outcome_unknown')
                 return self.state(intent_id)
@@ -364,7 +366,9 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                         return self._halt(row,'partial_entry_cancel_unknown')
                 return self._halt(row,'partial_entry_cancel_confirmation_required')
             if filled==0 and order.get('state') in (4,5):
-                row.update(status='entry_rejected')
+                row.update(status='entry_rejected',entry_rejection={
+                    'code':'EXCHANGE_ORDER_UNFILLED','stage':'order_reconciliation',
+                    'order_state':order['state']})
                 return self._save(row)
             if not (filled==row['contracts'] and order.get('state')==3 or 0<filled<row['contracts'] and order.get('state') in (4,5)):
                 return self._halt(row,'entry_fill_not_fully_confirmed')

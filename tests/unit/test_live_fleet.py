@@ -157,6 +157,25 @@ def test_native_events_distinguish_pending_from_open_and_use_actual_net(tmp_path
     finally: f.stop()
 
 
+def test_entry_rejection_notification_includes_numeric_exchange_error(tmp_path):
+    f=fleet(tmp_path)
+    try:
+        row=dict(binding_id='generation',intent_id='rejected',status='entry_rejected',
+            proposal=dict(symbol='INJ_USDT'),entry_rejection=dict(
+                stage='submit_market',exchange_code=2001,http_status=200,
+                message='secret response must not be published'))
+        f._publish_intent('a',row)
+        text=f.controller.messages[-1][0][1]
+        assert 'MEXC hata kodu: 2001' in text
+        assert 'HTTP: 200' in text
+        assert 'Emir gönderimi' in text
+        assert 'secret response' not in text
+        row.update(intent_id='old',entry_rejection={})
+        f._publish_intent('a',row)
+        assert 'eski kayıtta saklanmamış' in f.controller.messages[-1][0][1]
+    finally:f.stop()
+
+
 def test_default_live_runner_and_executor_construct_without_network(tmp_path):
     f=LiveFleet(settings(tmp_path),accounts=[Account('a',1,1,'test-key','test-secret')],
         controller_factory=Controller,private_factory=lambda *args:SimpleNamespace(writes_enabled=True),

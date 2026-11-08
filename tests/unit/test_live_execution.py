@@ -109,6 +109,22 @@ def approve(executor,p=None):
     return executor.approve(intent['intent_id'],intent['proposal_fingerprint'],'7',allow_emergency_close=True)
 
 
+def test_definite_entry_rejection_preserves_safe_exchange_diagnostics(tmp_path):
+    from trading.exchange.mexc_private import MexcPrivateError
+    executor,private,store=setup(tmp_path)
+    intent=approve(executor)
+    def reject(**kwargs):
+        raise MexcPrivateError('submit_market',code=2001,status_code=200,ambiguous=False)
+    private.submit_market=reject
+    row=executor.execute(intent['intent_id'])
+    assert row['status']=='entry_rejected'
+    assert row['entry_rejection']['exchange_code']==2001
+    assert row['entry_rejection']['http_status']==200
+    assert row['entry_rejection']['stage']=='submit_market'
+    assert executor.state(intent['intent_id'])['entry_rejection']==row['entry_rejection']
+    assert not private.protects
+
+
 def test_defaults_refuse_entry_and_no_paper_or_seed_fallback(tmp_path):
     executor,private,store=setup(tmp_path,enabled=False)
     intent=executor.stage(proposal())

@@ -315,6 +315,14 @@ class LiveFleet:
         proposal=row.get('proposal') or {}
         metadata=proposal.get('metadata') or {}
         text=f"CANLI | {ident} | {proposal.get('symbol','?')}\n{labels[state]}\n"
+        if state=='entry_rejected':
+            rejection=row.get('entry_rejection') or {}
+            stages={'submit_market':'Emir gönderimi','order_reconciliation':'Emir sonucu kontrolü'}
+            text+='Ret aşaması: '+stages.get(rejection.get('stage'),'Eski kayıtta belirtilmemiş')+'\n'
+            for label,key in [('MEXC hata kodu','exchange_code'),('HTTP','http_status'),('Borsa emir durumu','order_state')]:
+                value=rejection.get(key)
+                if type(value) is int:text+=f'{label}: {value}\n'
+            if not rejection:text+='Kesin ret nedeni eski kayıtta saklanmamış.\n'
         if state in ('protected','entry_filled_unprotected'):
             stop=proposal.get('stop_loss') or {}
             text+=(f"Yön: {proposal.get('side','?')} | Kaldıraç: {proposal.get('leverage','?')}x\n"
