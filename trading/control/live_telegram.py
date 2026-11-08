@@ -2,6 +2,7 @@
 import time
 from uuid import uuid4
 from trading.control.telegram import TelegramController,TRADER_MODES
+from trading.agents.telemetry import human_reason
 
 
 def number(value, digits=4):
@@ -133,7 +134,7 @@ class LiveTelegramController(TelegramController):
             'HOLD_LIVE_RECONCILIATION':'Borsa durumu doğrulanamadı; yeni girişler bekliyor.', 'HOLD_LIVE_POSITION_LIMIT':'Açık pozisyon sınırına ulaşıldı.',
             'HOLD_LIVE_WATCH_CHANGED':'Parite planı değişti; eski kararla işlem açılmadı.', 'HOLD_LIVE_CONTROL_CHANGED':'Ayarlar değişti; eski karar uygulanmadı.'}
         entry_reason=(snapshot.get('entry_status') or {}).get('reason')
-        if entry_reason and entry_reason!=reason:text+='İşlem arayışı: '+labels.get(entry_reason,entry_reason)+'\n'
+        if entry_reason and entry_reason!=reason:text+='İşlem arayışı: '+labels.get(entry_reason,human_reason(entry_reason))+'\n'
         text+=f"Son durum: {snapshot.get('message') or labels.get(reason,'Canlı veri ve risk kontrolleri sürüyor; ayrıntı Son analiz ekranında.')}\n"
         if account.get('observed_at'):text+=f"Borsa verisinin yaşı: {max(0,time.time()-account['observed_at']):.0f} sn\n"
         if snapshot.get('halt') or snapshot.get('live_halt'):text+='Yeni işlem engeli var; belirsiz emir/koruma durumunu kontrol et.\n'

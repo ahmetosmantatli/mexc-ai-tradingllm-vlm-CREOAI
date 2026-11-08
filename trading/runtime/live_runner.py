@@ -430,6 +430,7 @@ class LiveRunner:
                 jobs={pool.submit(self._evaluate,candidate,snapshot,control):candidate for candidate in selected}
                 for future in as_completed(jobs):
                     candidate=jobs[future]
+                    result=None
                     try:
                         result=future.result()
                         if result.metadata.get('provider_called') is not False:
@@ -438,8 +439,13 @@ class LiveRunner:
                     except sqlite3.Error:
                         raise
                     except Exception as exc:
-                        self.store.put('live_candidate_error:'+candidate.symbol,dict(at=time.time(),type=type(exc).__name__))
-                        outcomes.append(self.status('HOLD_LIVE_CANDIDATE_ERROR'))
+                        from trading.runtime.execution_diagnostics import safe_execution_error
+                        details=safe_execution_error(exc)
+                        reason='HOLD_LIVE_EXECUTION_'+details['code']
+                        self.store.put('live_candidate_error:'+candidate.symbol,dict(at=time.time(),**details))
+                        if result is not None and result.action.value=='trade':
+                            finalize_trace(self.store,result.metadata.get('analysis_trace_id'),'rejected',reason,details)
+                        outcomes.append(self.status(reason))
             return next((row for row in outcomes if row['reason']=='LIVE_PROTECTED'),outcomes[-1])
         except sqlite3.Error:
             raise

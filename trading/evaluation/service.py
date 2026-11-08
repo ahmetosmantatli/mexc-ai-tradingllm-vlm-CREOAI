@@ -17,7 +17,7 @@ class ModelDecision(BaseModel):
     price_plan: MarketPricePlan | None = None
     watch_plan: WatchPlan | None = None
     reviewed_watch_revision: int | None = Field(default=None,ge=0,strict=True)
-    action: str = Field(pattern='^(trade|watch|hold)$')
+    action: str = Field(pattern='^(trade|watch|hold|cancel_watch)$')
     signal_id: str | None
     rationale: str = Field(max_length=1200)
     invalidation: str = Field(max_length=500)
@@ -36,13 +36,16 @@ SYSTEM_POLICY = (
     'A watch_review candidate is an independent watch/structure event, not a fresh SMA/ROC signal. '
     'Its old SL/TP are context only. Trading watch_review requires a new validated price_plan; otherwise HOLD or update the watch. '
     'canonical_watch.reason=structure_changed means reconsider the thesis, not that the entry threshold was reached. '
-    'Return exactly JSON: action (trade/watch/hold), signal_id (supplied candidate ID or null), '
+    'Return exactly JSON: action (trade/watch/hold/cancel_watch), signal_id (supplied candidate ID or null), '
     'rationale, invalidation, watch_note, sizing_plan, watch_plan, reviewed_watch_revision. '
     'For an actionable watch return watch_plan: trigger_condition (price_above/price_below/closed_candle_cross_above/closed_candle_cross_below), '
     'trigger_price, timeframe (5m/15m/4h, required for candle triggers), invalidation_condition (above/below), '
     'invalidation_price, expires_at (UTC epoch seconds within24h). Null watch_plan is a passive note without automatic triggers. '
     'canonical_watch is the current cross-strategy plan for this symbol. If proposing a trade or new watch opposite to its active side, '
     'explicitly set reviewed_watch_revision to that revision and explain concretely in Turkish why the old plan is invalid or superseded. '
+    'Use cancel_watch when the canonical active thesis is invalid: signal_id, sizing_plan, price_plan and watch_plan must be null; '
+    'reviewed_watch_revision must exactly match the canonical revision and explain why. HOLD preserves an active watch; '
+    'writing invalid/cancelled in rationale alone never cancels it. '
     'Never pretend to supersede an unseen plan. For trade choose sizing_plan with integer leverage and '
     'risk_per_trade_pct as an account fraction (.01 means 1%), within supplied limits; null retains policy sizing. '
     'In LIVE exchange leverage mode an explicit sizing_plan is mandatory: never default to the maximum. '
@@ -81,7 +84,7 @@ def publish_progress(store, trace):
         _publish_latest(store,trace)
 
 
-def finalize_trace(store, trace_id, status, reason):
+def finalize_trace(store, trace_id, status, reason, details=None):
     """Apply an execution result to exactly the proposed review, never its sibling.
 
     Returns False for an absent/already-finalized/non-trade review. No model HOLD
@@ -107,6 +110,7 @@ def finalize_trace(store, trace_id, status, reason):
             return False
         trace=copy.deepcopy(trace)
         trace.update(execution_status=status,execution_reason=reason)
+        if details is not None:trace['execution_details']=copy.deepcopy(details)
         archive_trace(store,trace)
         for row in history:
             if row.get('id')==trace_id:
@@ -177,7 +181,7 @@ class ContextEvaluator:
         account['canonical_watch']=canonical_watch_card(prior_watch)
         economic_basis=economic_review_key(account,positions)
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
-        evaluation_key=digest(dict(market=fingerprint,scope=scope,economic_basis=economic_basis))
+        evaluation_key=digest(dict(policy=POLICY_VERSION,market=fingerprint,scope=scope,economic_basis=economic_basis))
         if memory.get('last_evaluation_key')==evaluation_key:
             self.store.put('stage','unchanged_closed_candles')
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='unchanged_closed_candles',
@@ -211,6 +215,10 @@ class ContextEvaluator:
             self.llm.on_trace=lambda update:publish_progress(self.store,{**trace,**copy.deepcopy(update)})
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
+            if decision.action=='cancel_watch':
+                if (prior_watch.get('status') not in ACTIVE or decision.reviewed_watch_revision!=prior_watch['revision']
+                        or len(decision.rationale.strip())<12 or any(v is not None for v in (decision.signal_id,decision.sizing_plan,decision.price_plan,decision.watch_plan))):
+                    raise ValueError('cancel_watch requires active reviewed revision and no order fields')
             if (decision.action=='trade' and live_account is not None
                     and (live_account.get('leverage_policy') or {}).get('mode')=='exchange' and decision.sizing_plan is None):
                 raise ValueError('explicit model sizing required for exchange leverage mode')
@@ -262,6 +270,7 @@ class ContextEvaluator:
                 self.store.put(key,memory)
                 metadata['retry_at']=memory['last_failure']['retry_at']
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_or_unavailable_model',metadata=metadata)
+        trace['model_action']=decision.action
         def reject_coordinated(reason):
             trace.update(status=reason,action='hold',execution_status='not_opened',rationale=decision.rationale)
             self._save_trace(trace)
@@ -314,7 +323,7 @@ class ContextEvaluator:
         # Save dedup against the state our own successful commit created so HOLD
         # cannot invalidate its own cache through a coordinator revision bump.
         economic_basis['account']['canonical_watch']=watch_review_key(current_watch)
-        evaluation_key=digest(dict(market=fingerprint,scope=scope,economic_basis=economic_basis))
+        evaluation_key=digest(dict(policy=POLICY_VERSION,market=fingerprint,scope=scope,economic_basis=economic_basis))
         trace.update(status='completed',action=decision.action,rationale=decision.rationale,
             invalidation=decision.invalidation,watch_note=decision.watch_note,
             execution_status='awaiting_risk' if decision.action=='trade' else 'not_opened')

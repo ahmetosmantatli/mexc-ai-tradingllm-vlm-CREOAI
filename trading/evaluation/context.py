@@ -8,7 +8,7 @@ transcript or a promise that old detail remains in a model's hidden memory.
 import hashlib
 import json
 
-POLICY_VERSION = 'pa-context-v2'
+POLICY_VERSION = 'pa-context-v3'
 POSITION_FIELDS = ('symbol','side','entry','stop','target','quantity','leverage','risk',
                    'opened_at','initial_stop','current_r','mfe_r','mae_r','unrealized','margin','notional','stop_loss_estimate','stop_risk_pct')
 

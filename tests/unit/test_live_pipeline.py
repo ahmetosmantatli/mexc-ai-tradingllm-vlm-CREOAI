@@ -169,3 +169,22 @@ def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_p
     assert intent['proposal']['metadata']['price_source']=='model'
     assert private.stops[0]['stopLossPrice']==99.4 and private.stops[0]['takeProfitPrice']==103.9
     assert len(private.submits)==1 and store.get('paper') is None
+
+
+def test_execution_exception_finalizes_exact_trade_trace_with_safe_reason(tmp_path,monkeypatch):
+    from .test_live_runner import prepare,candidate,result as trade_result
+    from trading.agents.schemas import EvaluationResult,GraphAction
+    from trading.evaluation.service import ContextEvaluator
+    from trading.runtime.usage import archive_trace
+    runner,private,executor,control=prepare(tmp_path)
+    signal=candidate();runner.candidate_queue().refresh([signal])
+    trace=dict(id='trade-trace',symbol=signal.symbol,started_at=time(),status='completed',action='trade',execution_status='awaiting_risk',attempts=[])
+    runner.store.put('analysis_history',[trace]);runner.store.put('analysis_trace',trace);archive_trace(runner.store,trace)
+    decision=trade_result(runner,signal);decision.metadata['analysis_trace_id']='trade-trace'
+    runner._evaluate=lambda *args:decision
+    runner._apply=lambda *args:(_ for _ in ()).throw(ValueError('contract quantity outside exchange limits'))
+    result=runner.cycle()
+    assert result['reason']=='HOLD_LIVE_EXECUTION_CONTRACT_QUANTITY_LIMIT'
+    completed=runner.store.get('analysis_trace')
+    assert completed['execution_status']=='rejected'
+    assert completed['execution_details']['code']=='CONTRACT_QUANTITY_LIMIT'

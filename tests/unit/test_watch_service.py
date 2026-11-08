@@ -131,3 +131,34 @@ def test_already_satisfied_price_watch_cannot_create_immediate_rearm_loop(tmp_pa
     response[0]['watch_plan']['trigger_price']=99.
     assert run().hold_reason=='invalid_or_unavailable_model'
     assert WatchCoordinator(store).card('BTC_USDT')['status']=='none'
+
+
+def test_model_can_explicitly_cancel_invalid_watch_without_opening_order(tmp_path,monkeypatch):
+    store,response,calls,run=evaluate_setup(tmp_path,monkeypatch)
+    run();before=WatchCoordinator(store).card('BTC_USDT')
+    response[0]=dict(action='cancel_watch',signal_id=None,rationale='Önceki long tezi yeni yapısal kırılımla geçersiz oldu.',
+        invalidation='',watch_note='',reviewed_watch_revision=before['revision'])
+    # New closed evidence to legitimately reconsider the existing watch.
+    coordinator=WatchCoordinator(store);coordinator.observe('BTC_USDT',price=102.)
+    response[0]['reviewed_watch_revision']=coordinator.card('BTC_USDT')['revision']
+    result=run()
+    assert result.action.value=='hold' and result.hold_reason=='cancel_watch'
+    assert coordinator.card('BTC_USDT')['status']=='cancelled'
+    assert store.get('analysis_trace')['model_action']=='cancel_watch'
+
+
+def test_hold_never_parses_prose_as_cancellation(tmp_path,monkeypatch):
+    store,response,calls,run=evaluate_setup(tmp_path,monkeypatch)
+    run();coordinator=WatchCoordinator(store);coordinator.observe('BTC_USDT',price=102.)
+    response[0]=dict(action='hold',signal_id=None,rationale='Plan geçersiz, iptal edilmeli.',invalidation='',watch_note='')
+    run()
+    assert coordinator.card('BTC_USDT')['status']=='triggered' # prose cannot mutate lifecycle
+
+
+def test_cancel_watch_with_stale_revision_is_rejected(tmp_path,monkeypatch):
+    store,response,calls,run=evaluate_setup(tmp_path,monkeypatch)
+    run();coordinator=WatchCoordinator(store);coordinator.observe('BTC_USDT',price=102.)
+    response[0]=dict(action='cancel_watch',signal_id=None,rationale='Yeni yapı nedeniyle eski plan geçersiz oldu.',
+        invalidation='',watch_note='',reviewed_watch_revision=0)
+    assert run().hold_reason=='invalid_or_unavailable_model'
+    assert coordinator.card('BTC_USDT')['status']=='triggered'

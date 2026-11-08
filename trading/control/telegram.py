@@ -264,6 +264,10 @@ class TelegramController:
                 text+='Analiz saati: '+datetime.fromtimestamp(trace['started_at'],ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M:%S')+'\n'
             if trace.get('rationale'):
                 text+='Gerekçe: '+str(trace['rationale'])[:500]+'\n'
+            model_action=trace.get('model_action') or (trace.get('action') if trace.get('status')=='completed' else None)
+            if model_action:text+='Model kararı: '+{'trade':'İşlem öner','watch':'Takibe al','hold':'Bekle','cancel_watch':'Takibi iptal et'}.get(model_action,'Bilinmiyor')+'\n'
+            if trace.get('execution_reason'):text+='Yürütme sonucu: '+str(trace['execution_reason'])+'\n'
+            if trace.get('execution_details'):text+='Kontrol ayrıntısı: '+str(trace['execution_details'])[:400]+'\n'
             if trace.get('why_reconsidered'):
                 changed=trace['why_reconsidered']
                 text+='Değişiklik: '+str(changed.get('summary','') if isinstance(changed,dict) else changed)[:250]+'\n'

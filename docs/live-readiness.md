@@ -370,3 +370,25 @@ cumulative failures remain historical; old records do not gain new error fields.
 The Anthropic SDK minimum is declared in pyproject.toml as well as requirements.txt
 because the Dockerfile installs the package with `pip install -e .`.
 Reference: [MEXC error codes](https://www.mexc.io/api-docs/futures/error-code).
+
+
+### Retrospective entry audit and explicit watch cancellation
+
+Run inside the worker container (read-only SQLite, no exchange or AI calls):
+
+```sh
+python -m trading.control.live_audit --account friend --hours 12
+```
+
+The report separates validated model TRADE/HOLD/WATCH decisions, recorded
+execution rejections, unresolved historical proposals and durable entry/fill
+records. An entry-attempt marker is written before the POST and does not prove
+that a request reached MEXC. Old unfinalized proposals cannot establish a cause.
+New execution exceptions finalize the exact proposal trace with allowlisted
+categories and risk/preflight reasons; arbitrary exception text is excluded.
+
+Models may explicitly return `cancel_watch` with the current canonical revision,
+a substantive rationale and no order fields. This cancels the watch only, never
+an existing position. HOLD and prose containing “invalid” preserve the watch.
+The context policy is v3; the policy version participates in deduplication so the
+new action becomes available without clearing durable plans or order state.

@@ -117,7 +117,7 @@ class WatchCoordinator:
         HOLD preserves an active watch; TRADE supersedes it only after this guard.
         """
         now=time() if now is None else now
-        if action not in ('watch','trade','hold'):
+        if action not in ('watch','trade','hold','cancel_watch'):
             raise ValueError('unknown decision')
         plan=WatchPlan.model_validate(watch_plan.model_dump() if isinstance(watch_plan,WatchPlan) else watch_plan) if action=='watch' else None
         if plan and not now<plan.expires_at<=now+86400:
@@ -134,11 +134,15 @@ class WatchCoordinator:
             conflict=current.get('status') in ACTIVE and current.get('side')!=candidate.side.value
             if conflict and action in ('trade','watch') and reviewed_revision!=current['revision']:
                 return False
+            if action=='cancel_watch' and (current.get('status') not in ACTIVE or reviewed_revision!=current['revision'] or len(rationale.strip())<12):
+                return False
             state=copy.deepcopy(current)
             state.update(revision=current['revision']+1,last_action=action,last_rationale=rationale[:1200],updated_at=now)
             if action=='watch':
                 state.update(status='watching',side=candidate.side.value,candidate=_snapshot(candidate),
                     plan=plan.model_dump(),created_at=now,reason='model_watch',last_closed_at=None,triggered_at=None,structure_event=None,structure_events={})
+            elif action=='cancel_watch':
+                state.update(status='cancelled',reason='model_cancelled')
             elif action=='trade':
                 state.update(status='superseded',reason='trade_reviewed',side=candidate.side.value,candidate=_snapshot(candidate))
             self._put(self._key(candidate.symbol),state)

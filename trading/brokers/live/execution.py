@@ -22,6 +22,9 @@ from trading.runtime.live_account import LiveAccountReconciler,LiveAccountError,
 
 class LiveExecutionError(RuntimeError):
     """Safe fixed error category; never a raw exchange response or key."""
+    def __init__(self,code,*,reason_codes=()):
+        super().__init__(code)
+        self.reason_codes=tuple(reason_codes)
 
 
 @dataclass(frozen=True)
@@ -168,7 +171,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
         readiness=self.reconciler.preflight(symbol=proposal.symbol,side=1 if proposal.side.value=='long' else 2,
             contracts=contracts,leverage=proposal.leverage,notional=notional,allowed_capital=self.allowed_capital() if callable(self.allowed_capital) else self.allowed_capital,
             expected_generation=snapshot['generation'],position_mode=mode,managed_position_ids=managed_positions,managed_order_ids=managed_orders)
-        if not readiness.ready:raise LiveExecutionError('private_preflight_rejected')
+        if not readiness.ready:raise LiveExecutionError('private_preflight_rejected',reason_codes=readiness.reasons)
         available=readiness.available
         if abs(notional-proposal.notional)>max(1e-8,entry*rules.size*rules.step):raise LiveExecutionError('approved_notional_changed')
         worst_entry=entry*(1+self.slip if proposal.side.value=='long' else 1-self.slip)
@@ -192,7 +195,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             open_positions=len(snapshot['positions']),open_risk=sum(r.get('planned_loss',r['proposal']['max_loss_if_stopped']) for r in managed),
             daily_loss_pct=state['daily_loss_pct'],weekly_loss_pct=state['weekly_loss_pct'],drawdown_pct=state['drawdown_pct'])
         decision=self.risk.evaluate(proposal,context)
-        if not decision.accepted:raise LiveExecutionError('deterministic_risk_rejected')
+        if not decision.accepted:raise LiveExecutionError('deterministic_risk_rejected',reason_codes=getattr(decision,'reason_codes',()))
         row.update(planned_loss=planned_loss,equity_before=equity,entry_notional=notional,contract_size=rules.size,margin=readiness.planned_margin)
         return proposal,contracts,mode
 

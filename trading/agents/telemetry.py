@@ -46,6 +46,12 @@ def safe_error(response):
 def human_reason(reason):
     """Translate runtime codes without exposing opaque diagnostics in normal chat."""
     known={
+        'HOLD_LIVE_EXECUTION_CONTRACT_QUANTITY_LIMIT':'Önerilen işlem miktarı borsanın kontrat sınırına uymadı; işlem açılmadı.',
+        'HOLD_LIVE_EXECUTION_ENTRY_PRICE_DRIFT':'Analiz sonrasında fiyat değişti; işlem açılmadı.',
+        'HOLD_LIVE_EXECUTION_LIQUIDATION_BUFFER':'Kaldıraç/stop planı likidasyon mesafesi kontrolünü geçmedi.',
+        'HOLD_LIVE_EXECUTION_PRIVATE_PREFLIGHT':'Hesap, marjin veya parite ön kontrolü reddetti; ayrıntı Son analiz ekranında.',
+        'HOLD_LIVE_EXECUTION_RISK_REJECTED':'İşlem önerisi risk kontrolünden geçmedi; ayrıntı Son analiz ekranında.',
+        'HOLD_LIVE_EXECUTION_TARGET_COSTS':'Hedef tahmini işlem maliyetini karşılamıyor; işlem açılmadı.',
         'HOLD_EVALUATION_INTERVAL':'Bir sonraki analiz zamanı bekleniyor; şu anda yeni AI isteği gönderilmiyor.',
         'HOLD_SCAN_INTERVAL':'Yeni piyasa taraması bekleniyor.',
         'HOLD_PROVIDER_POOL_WAIT':'Ücretsiz sağlayıcı kotası veya erişimi bekleniyor; tarama ve açık işlem koruması sürüyor.',
@@ -82,11 +88,13 @@ def human_reason(reason):
 
 
 def trace_outcome(trace):
+    if trace.get('action')=='cancel_watch':return 'Takip planı AI kararıyla iptal edildi; işlem açılmadı'
     if trace.get('status')=='provider_wait':return 'Sağlayıcı kapasitesi bekleniyor; yeni AI isteği gönderilmedi'
     execution=trace.get('execution_status')
     if execution=='opened':
         return 'Gerçek işlem açıldı; borsa koruması doğrulandı' if trace.get('mode')=='LIVE' else 'Sanal işlem açıldı'
     if execution in ('rejected','not_opened'):
+        if trace.get('model_action')=='trade':return 'AI işlem önerdi; doğrulama/yürütme aşamasında açılmadı'
         if trace.get('status')=='invalid_or_unavailable_model':
             return 'İşlem açılmadı — analiz başarısız'
         if trace.get('action')=='watch':
@@ -189,6 +197,7 @@ def validation_issues(exc,schema=None):
             for value in node:collect(value)
     collect(schema)
     semantic={
+        'cancel_watch requires active reviewed revision and no order fields':'cancel_watch_revision_or_fields',
         'independent watch trade requires a fresh price plan':'watch_requires_fresh_price_plan',
         'explicit model sizing required for exchange leverage mode':'explicit_sizing_required',
         'watch price condition already satisfied; choose a future condition or trade/hold':'watch_condition_already_met',
