@@ -220,7 +220,7 @@ class LiveRunner:
             if not self._enabled():
                 return None
             scan=MarketScanner(self.public,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,
-                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store).scan()
+                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True).scan()
             errors=dict(scan.errors)
             quant_count=len(scan.candidates)
             try:
@@ -240,9 +240,9 @@ class LiveRunner:
                 eligible.append(candidate)
             if not self._enabled():
                 return None
-            touched=set(self.store.get('universe_rotation',{}).get('selected',[]))
+            touched=set(self.store.get('universe_rotation',{}).get('selected',[])) if scan.scanned else set()
             touched.update(row['symbol'] for row in watch_snapshot(self.store) if row['status'] in ('watching','triggered'))
-            size=self.candidate_queue().refresh(eligible,refreshed_symbols=touched or None)
+            size=self.candidate_queue().refresh(eligible,refreshed_symbols=touched)
             self.store.put('last_scan_at',time.time())
             summary=dict(at=time.time(),scanned=scan.scanned,kept=scan.kept,candidates=len(scan.candidates),
                 quant_candidates=quant_count,watch_candidates=len(scan.candidates)-quant_count,eligible=len(eligible),queue_size=size,
@@ -498,7 +498,8 @@ class LiveRunner:
                 protection_status=intent.get('status','unmanaged'),analysis_version=metadata.get('analysis_version'),
                 decision_ai=metadata.get('decision_ai',{}),price_source=metadata.get('price_source','quant'))
         closed=[row for row in intents if row.get('status')=='closed']
-        snapshot=dict(mode='LIVE',live_orders_enabled=bool(self.executor is not None),observed_at=time.time(),reason=reason,
+        public_data=self.public.rate_status() if callable(getattr(self.public,'rate_status',None)) else {}
+        snapshot=dict(stage=self.store.get('stage'),public_data=public_data,mode='LIVE',live_orders_enabled=bool(self.executor is not None),observed_at=time.time(),reason=reason,
             account=dict(ready=account.get('ready',False),**account.get('balance',{})),
             live_account=account,real_account=account,balance=account.get('balance'),positions=positions,closed=closed,intents=intents,
             entry_status=self.store.get('live_entry_status',{}),analysis_capacity=self.store.get('analysis_capacity',{}),scan_summary=self.store.get('scan_summary',{}),

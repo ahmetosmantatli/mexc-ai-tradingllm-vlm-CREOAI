@@ -251,7 +251,9 @@ class ContextEvaluator:
             decision=validate(payload)
         except Exception:
             metadata['provider_busy']=getattr(self.llm,'last_status','')=='paid_in_flight'
-            trace.update(status='invalid_or_unavailable_model',action='hold',execution_status='not_opened')
+            wait_statuses={'cooldown_skipped','quota_skipped','paid_in_flight','stopped','missing_key','budget_exhausted','budget_or_interval_hold'}
+            waiting_only=(attempts is not None and not provider_called and (not attempts or all(a.get('status') in wait_statuses for a in attempts)))
+            trace.update(status='provider_wait' if waiting_only else 'invalid_or_unavailable_model',action='hold',execution_status='not_opened')
             self._save_trace(trace)
             if provider_called:
                 # This is an error retry delay for identical inputs, never an

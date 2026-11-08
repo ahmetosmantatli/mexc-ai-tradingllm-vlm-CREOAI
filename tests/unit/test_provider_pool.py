@@ -384,3 +384,13 @@ def test_capacity_drops_for_busy_cooldown_and_oversize_requests_without_sending_
     store.put(key,dict(rows=[],retry_at=time.time()+30))
     assert p.analysis_capacity(prompt_bytes=100)['parallel_candidates']==0
     assert not calls
+
+
+def test_gemini_semantic_issue_survives_complete_pool_route(tmp_path):
+    p,_=pool(tmp_path,settings(groq_api_key='',gemini_api_key='test',ai_primary_provider='gemini'))
+    def reject(raw):raise ValueError('independent watch trade requires a fresh price plan')
+    p.response_validator=reject
+    assert p.complete_json(system='JSON',user='context') is None
+    attempt=p.last_trace['attempts'][0]
+    assert attempt['validation_issues']==[dict(field='response',type='watch_requires_fresh_price_plan')]
+    assert attempt['phase']=='generation'

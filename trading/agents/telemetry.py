@@ -82,6 +82,7 @@ def human_reason(reason):
 
 
 def trace_outcome(trace):
+    if trace.get('status')=='provider_wait':return 'Sağlayıcı kapasitesi bekleniyor; yeni AI isteği gönderilmedi'
     execution=trace.get('execution_status')
     if execution=='opened':
         return 'Gerçek işlem açıldı; borsa koruması doğrulandı' if trace.get('mode')=='LIVE' else 'Sanal işlem açıldı'

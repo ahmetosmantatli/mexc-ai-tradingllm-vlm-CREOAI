@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
+import json
+import time
+import math
+from email.utils import parsedate_to_datetime
+from trading.exchange.public_governor import PublicGovernor,shared_governor
 
 from trading.exchange.order_deny import assert_not_private_order_path
 
@@ -89,6 +94,7 @@ class MexcPublicClient:
     timeout_seconds: float = 10.0
     transport: httpx.BaseTransport | None = field(default=None, repr=False)
     _http: httpx.Client | None = field(default=None, repr=False)
+    governor: Any = field(default=None,repr=False)
     # Optional in-memory fixtures used when ``use_fixtures`` is True (deterministic tests).
     use_fixtures: bool = False
     fixture_tickers: dict[str, TickerSnapshot] = field(default_factory=dict)
@@ -112,16 +118,46 @@ class MexcPublicClient:
             self._http.close()
             self._http = None
 
+    def _governor(self):
+        if self.governor is None:
+            self.governor=PublicGovernor() if self.transport is not None else shared_governor(self.base_url)
+        return self.governor
+
+    def rate_status(self):
+        return self._governor().snapshot()
+
     def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         assert_not_private_order_path(path)
+        self._governor().acquire()
         return self._client().request(method, path, **kwargs)
 
     def _json(self, method: str, path: str, **kwargs: Any) -> Any:
-        response = self.request(method, path, **kwargs)
+        governor=self._governor();params=kwargs.get('params') or {}
+        key=path+json.dumps(params,sort_keys=True,separators=(',',':'))
+        ttl=10. if path=='/api/v1/contract/detail' else 1. if path=='/api/v1/contract/ticker' and not params else 0.
+        if '/contract/kline/' in path:
+            seconds={'Min5':300,'Min15':900,'Hour4':14400}.get(params.get('interval'))
+            if seconds:
+                # Never age an earlier forming bar into a fake closed candle.
+                key+=':'+str(int(time.time()//seconds))
+                ttl=min(30.,max(0,seconds-time.time()%seconds))
+        if ttl:
+            cached=governor.get(key)
+            if cached is not None:return cached
+        response=self.request(method,path,**kwargs)
+        if response.status_code==429:
+            raw_retry=response.headers.get('retry-after','30')
+            try:retry=float(raw_retry)
+            except (TypeError,ValueError):
+                try:retry=parsedate_to_datetime(raw_retry).timestamp()-time.time()
+                except (TypeError,ValueError,OverflowError):retry=30.
+            governor.penalize(retry if math.isfinite(retry) else 30.)
         response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and (payload.get("success") is False or payload.get("code", 0) != 0):
-            raise PublicMarketError(payload.get("code"))
+        payload=response.json()
+        if isinstance(payload,dict) and (payload.get('success') is False or payload.get('code',0)!=0):
+            if payload.get('code')==510:governor.penalize()
+            raise PublicMarketError(payload.get('code'))
+        if ttl:governor.put(key,payload,ttl)
         return payload
 
     def list_contract_symbols(self) -> list[str]:
@@ -132,7 +168,9 @@ class MexcPublicClient:
         symbols: list[str] = []
         if isinstance(data, list):
             for row in data:
-                if isinstance(row, dict) and row.get("symbol"):
+                if (isinstance(row, dict) and str(row.get("symbol","")).upper().endswith("_USDT")
+                        and row.get("state",0)==0 and row.get("quoteCoin","USDT")=="USDT"
+                        and row.get("settleCoin","USDT")=="USDT"):
                     symbols.append(str(row["symbol"]).upper())
         return symbols
 
@@ -267,7 +305,7 @@ class MexcPublicClient:
 
     def get_contract_rules(self, symbol):
         from trading.exchange.contracts import ContractRules
-        payload = self._json("GET", "/api/v1/contract/detail", params={"symbol": symbol})
+        payload = self._json("GET", "/api/v1/contract/detail")
         rows = payload.get("data")
         if isinstance(rows, dict):
             rows = [rows]

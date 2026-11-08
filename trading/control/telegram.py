@@ -153,8 +153,10 @@ class TelegramController:
                'unchanged_closed_candles':'Kurulum değişmedi; gereksiz AI çağrısı yapılmıyor',
                'analysis_error_backoff':'Bu analizde hata alındı; kısa hata beklemesi sürüyor',
                'candidates_filtered':'Aday filtreleri tamamlandı', 'model_completed':'AI analizi tamamlandı',
-               'model_invalid_or_unavailable_model':'AI analizi sonuçlanmadı', 'awaiting_scan':'İlk tarama bekleniyor'}.get(stage,'Piyasa ve işlem durumu izleniyor')
+               'model_provider_wait':'AI sağlayıcı kapasitesi bekleniyor; yeni istek gönderilmiyor', 'model_invalid_or_unavailable_model':'AI analizi sonuçlanmadı', 'awaiting_scan':'İlk tarama bekleniyor'}.get(stage,'Piyasa ve işlem durumu izleniyor')
         text=f"Şu an: {label}\n"
+        public=snapshot.get('public_data') or {}
+        if public.get('cooldown_seconds',0)>0:text+=f"MEXC veri beklemesi: {public['cooldown_seconds']:.0f} sn; yeni public istekler bekletiliyor.\n"
         scan=snapshot.get('scan_summary') or {}
         if scan:
             age=max(0,time.time()-scan.get('at',time.time()))
@@ -256,6 +258,10 @@ class TelegramController:
             score_text=f"{score:.2f}" if isinstance(score,(int,float)) else '?'
             text += (f"\nAnaliz {trace.get('id','?')} | {trace.get('symbol','?')} | {trace.get('strategy','?')}\n"
                      f"Aday puanı {score_text} (olasılık değil) | Sonuç: {trace.get('status','?')}\n")
+            if trace.get('started_at'):
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+                text+='Analiz saati: '+datetime.fromtimestamp(trace['started_at'],ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M:%S')+'\n'
             if trace.get('rationale'):
                 text+='Gerekçe: '+str(trace['rationale'])[:500]+'\n'
             if trace.get('why_reconsidered'):
@@ -265,6 +271,7 @@ class TelegramController:
                 text+=f"Bağlam: {trace['context_policy']} | Gönderi: {trace.get('prompt_bytes','?')} bayt\n"
             attempts=trace.get('attempts') or []
             text += f"Sağlayıcı denemesi: {len(attempts)}\n"
+            if not attempts:text+='Bu değerlendirmede sağlayıcı isteği kaydedilmemiş; kota, bekleme veya durdurma nedeniyle olabilir.\n'
             for attempt in attempts[-4:]:
                 text += (f"• {attempt.get('provider','?')} / {attempt.get('model','?')} | {attempt.get('status','?')}"
                          f" | {attempt.get('latency_ms',0):.0f} ms\n")

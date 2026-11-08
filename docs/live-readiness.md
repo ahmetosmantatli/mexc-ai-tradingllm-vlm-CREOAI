@@ -343,3 +343,30 @@ numeric exchange rejection codes. Diagnostics distinguish generated candidates,
 eligible candidates and retained queue size, and do not count metadata failures
 as skipped individual symbols. Shared request statistics and local quota-pool
 snapshots are included in LIVE diagnostics as well as PAPER diagnostics.
+
+## MEXC public-data rate admission
+
+MEXC code510 means excessive request frequency, not AI quota or a guarantee that
+an individual symbol is invalid. Public clients in one worker process now share
+host-level pacing (conservative 3 requests/second) and a 30-second cooldown after
+510; HTTP429 honors Retry-After. There is no immediate per-symbol retry or host/key
+switch to bypass the exchange limit. Private account/protection/order clients are
+not placed behind this public-data governor.
+
+LIVE scans request the bulk ticker snapshot once per round rather than one price
+HTTP request per symbol. Metadata is cached for at most10s; closed-context kline
+responses for at most30s, with a cache key that changes at the candle boundary.
+Cached forming bars cannot be reused as newly closed evidence. Executable single-
+symbol quotes remain uncached. Only active USDT-settled/quoted contracts enter
+normal universe discovery; USDC contracts are excluded. Metadata/cooldown failure
+returns a scan status instead of stopping the account or destroying untouched
+queued candidates. Local cooldown is visible in diagnostics; fresh price/risk
+checks still gate execution. Other programs on the same public IP are outside
+this process governor, so exchange throttling can still occur.
+
+Diagnostics include Istanbul analysis timestamps. A provider_wait record with no
+provider requests is distinguished from an invalid generated response. Historical
+cumulative failures remain historical; old records do not gain new error fields.
+The Anthropic SDK minimum is declared in pyproject.toml as well as requirements.txt
+because the Dockerfile installs the package with `pip install -e .`.
+Reference: [MEXC error codes](https://www.mexc.io/api-docs/futures/error-code).

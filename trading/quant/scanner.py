@@ -10,6 +10,7 @@ import sqlite3
 import httpx
 
 from trading.exchange.mexc_public import MexcPublicClient, TickerSnapshot, PublicMarketError
+from trading.exchange.public_governor import PublicDataDeferred
 from trading.quant.signals import CandidateSignal
 from trading.quant.strategies import (
     DEFAULT_STRATEGIES,
@@ -63,6 +64,7 @@ class MarketScanner:
     max_symbols: int = 40
     max_workers: int = 4
     rotation_store: object | None = None
+    bulk_tickers: bool = False
 
     def scan(self, symbols: Sequence[str] | None = None) -> ScanResult:
         started=time.monotonic()
@@ -74,7 +76,13 @@ class MarketScanner:
         except Exception as exc:
             fee_free=set()
             errors['fee_free_metadata']=type(exc).__name__
-        universe = list(symbols) if symbols is not None else self.client.list_contract_symbols()
+        try:
+            universe = list(symbols) if symbols is not None else self.client.list_contract_symbols()
+        except sqlite3.Error:raise
+        except Exception as exc:
+            errors['universe']=('PUBLIC_COOLDOWN' if isinstance(exc,PublicDataDeferred) else
+                'MEXC_CODE_'+str(exc.public_error_code) if isinstance(exc,PublicMarketError) else type(exc).__name__)
+            return ScanResult(scanned=0,kept=0,errors=errors,duration_seconds=time.monotonic()-started)
         if self.prefer_fee_free and fee_free and symbols is None:
             # Prefer fee-free first, then fill remaining slots.
             preferred = [s for s in universe if s.upper() in fee_free]
@@ -86,6 +94,15 @@ class MarketScanner:
         else:
             universe = universe[: self.max_symbols]
 
+        tickers=None
+        if self.bulk_tickers:
+            try:tickers={t.symbol:t for t in self.client.get_all_tickers()}
+            except sqlite3.Error:raise
+            except Exception as exc:
+                errors['bulk_tickers']=('PUBLIC_COOLDOWN' if isinstance(exc,PublicDataDeferred) else
+                    'MEXC_CODE_'+str(exc.public_error_code) if isinstance(exc,PublicMarketError) else type(exc).__name__)
+                return ScanResult(scanned=len(universe),kept=0,candidates=[],errors=errors,
+                    duration_seconds=time.monotonic()-started)
         filtered_out: dict[str, str] = {}
         candidates: list[CandidateSignal] = []
         kept = 0
@@ -94,7 +111,8 @@ class MarketScanner:
             sym=symbol.upper()
             passed=False
             try:
-                ticker=self.client.get_ticker(sym)
+                if tickers is not None and sym not in tickers:return sym,False,[],'NO_TICKER',None
+                ticker=tickers[sym] if tickers is not None else self.client.get_ticker(sym)
                 ok,reason=self.liquidity.passes(ticker)
                 if not ok:
                     return sym,False,[],reason,None
@@ -116,7 +134,7 @@ class MarketScanner:
             except sqlite3.Error:
                 raise
             except Exception as exc:
-                category=('MEXC_CODE_'+str(exc.public_error_code) if isinstance(exc,PublicMarketError)
+                category=('PUBLIC_COOLDOWN' if isinstance(exc,PublicDataDeferred) else 'MEXC_CODE_'+str(exc.public_error_code) if isinstance(exc,PublicMarketError)
                     else 'HTTP_'+str(exc.response.status_code) if isinstance(exc,httpx.HTTPStatusError)
                     else 'TIMEOUT' if isinstance(exc,httpx.TimeoutException) else 'NETWORK_ERROR' if isinstance(exc,httpx.TransportError)
                     else 'DATA_FORMAT' if isinstance(exc,(ValueError,TypeError,KeyError,IndexError)) else type(exc).__name__)
