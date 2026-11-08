@@ -312,6 +312,11 @@ class LiveRunner:
             tail = f" Exchange equity {balance['equity']} USDT, available margin {balance['available']} USDT."
         if row['status'] == 'closed':
             parts = [f"Exchange confirmed close {symbol} position {row.get('position_id')}."]
+            if row.get('halt_reason') == 'filled_position_risk_exceeds_plan':
+                parts.append(
+                    f"Review: fill {row.get('fill_price')} passed worst allowed {row.get('worst_allowed_price')}. "
+                    f"Computed stop loss {row.get('computed_loss')} exceeded the approved cap. "
+                    f"This confirmed close does not halt entries on other symbols.")
             if 'fee' in costs:
                 parts.append(f"Exchange fee {costs['fee']}.")
             if 'funding' in costs:

@@ -97,6 +97,12 @@ class LiveExecutionGates:
 
 
 class ApprovedLiveExecutor:
+    # Latches written because an emergency close is not yet proven. A confirmed
+    # close may drop only one of these, and only when it names that same intent.
+    _CONFIRMED_CLOSE_HALTS=frozenset({
+        'emergency_close_requires_review','emergency_close_not_confirmed',
+        'native_protection_not_confirmed','entry_remainder_open'})
+
     def __init__(self,gates,store,private,public,risk_engine,*,account_id='manual',
                  max_quote_age_seconds=30,max_price_drift_pct=.005,fee_rate=.0006,
                  slippage_bps=5,liquidation_buffer_pct=.02,can_execute=None,binding_id=None,allowed_capital=None):
@@ -153,7 +159,8 @@ class ApprovedLiveExecutor:
     def _halt(self,row,reason,*,account=True):
         # account=False keeps the intent unresolved without latching every future entry.
         # Unknown writes still latch: a second open is worse than a stopped account.
-        # A fill that exceeded the approved loss stays latched for review. Nothing here clears it.
+        # This does not clear an existing latch. A confirmed emergency close releases
+        # only its own latch later, and leaves every other halt in place.
         if account:
             current=self.store.get('live:halt') or {}
             if current.get('requires_review') is not True:
@@ -311,11 +318,10 @@ class ApprovedLiveExecutor:
             if row.get('entry_write_attempted'):
                 return self._reconcile(row,token)
             self._gate(entries=True)
+            self._release_stale_confirmed_close_halt()
             if self.store.get('live:halt'):raise LiveExecutionError('live_halt_latched')
             if row['status']!='approved' or row['expires_at']<=time():raise LiveExecutionError('fresh_exact_manual_approval_required')
-            with self.store.lock:
-                pending=[json.loads(payload) for _,payload in self.store.db.execute("SELECT key,value FROM state WHERE key LIKE 'live:intent:%'")]
-            if any(value['intent_id']!=intent_id and value.get('entry_write_attempted') and value.get('status') not in ('closed','entry_rejected') for value in pending):
+            if self._unresolved_entry(ignore_id=intent_id):
                 raise LiveExecutionError('unresolved_live_intent_blocks_entry')
             plan=self._preflight(row)
             proposal=plan['proposal']
@@ -399,10 +405,62 @@ class ApprovedLiveExecutor:
 
     def _mark_closed(self,row,report,*,reason):
         self._book_exchange_costs(row,report)
-        # A fill that broke the plan stays marked after the emergency close. The account halt is separate.
+        # A fill that broke the plan stays on the intent as a review note. The global
+        # entry halt is separate and is released only after this close is confirmed.
         kept=row.get('halt_reason') if row.get('halt_reason')=='filled_position_risk_exceeds_plan' else None
         row.update(status='closed',close_reason=reason,halt_reason=kept)
+        if reason=='emergency_close':
+            self._release_confirmed_close_halt(row)
         return self._save(row)
+
+    def _release_confirmed_close_halt(self,row):
+        """Drop this intent's emergency-close latch once the close is exchange-confirmed.
+
+        Deletes the single `live:halt` key only when it names this intent and one of
+        the emergency-close reasons. An unknown entry, a different intent, or any
+        other reason stays. This is not a scan or a wipe of halt rows.
+        """
+        halt=self.store.get('live:halt')
+        if not self._halt_is_this_confirmed_close(halt,row):
+            return
+        self.store.delete('live:halt')
+
+    def _halt_is_this_confirmed_close(self,halt,row):
+        return (isinstance(halt,dict) and halt.get('intent_id')==row.get('intent_id')
+            and halt.get('reason') in self._CONFIRMED_CLOSE_HALTS
+            and row.get('status')=='closed' and row.get('close_reason')=='emergency_close')
+
+    def _release_stale_confirmed_close_halt(self):
+        """A leftover latch for an emergency close that is already confirmed does not block.
+
+        The stored intent must already be closed for that reason. Any other halt stays.
+        A different intent whose exchange write is still unresolved keeps the latch too.
+        """
+        halt=self.store.get('live:halt')
+        if not isinstance(halt,dict) or halt.get('reason') not in self._CONFIRMED_CLOSE_HALTS:
+            return
+        intent_id=halt.get('intent_id')
+        if not isinstance(intent_id,str) or not intent_id:
+            return
+        if self._unresolved_entry(ignore_id=intent_id):
+            return
+        row=self.store.get(self._key(intent_id))
+        if isinstance(row,dict):
+            self._release_confirmed_close_halt(row)
+
+    def _unresolved_entry(self,*,ignore_id=None):
+        with self.store.lock:
+            pending=[json.loads(payload) for _,payload in self.store.db.execute(
+                "SELECT key,value FROM state WHERE key LIKE 'live:intent:%'")]
+        return any(value.get('intent_id')!=ignore_id and value.get('entry_write_attempted')
+            and value.get('status') not in ('closed','entry_rejected') for value in pending)
+
+    def _review_note(self,row,numbers):
+        """Operator review of a fill that broke the plan. This key does not block entries."""
+        note=dict(intent_id=row['intent_id'],symbol=row['proposal']['symbol'],
+            reason='emergency_close_requires_review',requires_review=True,at=time(),**numbers)
+        self.store.put('live:review:'+row['intent_id'],note)
+        return note
 
     def _confirmed_close(self,row):
         """Exchange-confirmed flat position. None when the close is not proven."""
@@ -489,13 +547,14 @@ class ApprovedLiveExecutor:
         return matches[0] if len(matches)==1 else None
 
     def _reject_fill(self,row,position,token,fill,computed):
-        """Persist the prices that failed the plan and latch review. Do not clear that latch."""
+        """Persist the prices that failed the plan. Block entries until the close is confirmed."""
         numbers=dict(fill_price=fill,worst_allowed_price=row.get('worst_allowed_price'),
             planned_loss=row.get('planned_loss'),computed_loss=computed,equity=row.get('equity'))
         row.update(numbers,halt_reason='filled_position_risk_exceeds_plan',status='filled_risk_rejected')
         self._save(row)
-        self.store.put('live:halt',dict(intent_id=row['intent_id'],reason='emergency_close_requires_review',
-            requires_review=True,at=time(),**numbers))
+        self._review_note(row,numbers)
+        # The review note is not an entry halt. The close result is still unknown, so new entries stop.
+        self._halt(row,'emergency_close_not_confirmed')
         hold=None if position is None else self._optional_number(position.get('holdVol'))
         if hold is None or hold<=0 or not row.get('allow_emergency_close') or row.get('emergency_close_attempted'):
             return self.state(row['intent_id'])

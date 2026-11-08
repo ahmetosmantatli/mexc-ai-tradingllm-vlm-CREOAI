@@ -29,3 +29,8 @@ class RuntimeStore:
     def put(self, key, value):
         with self.lock, self.db:
             self.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', (key, json.dumps(value, allow_nan=False)))
+
+    def delete(self, key):
+        """Remove one exact key. Callers must not pass a prefix or a pattern."""
+        with self.lock, self.db:
+            self.db.execute('DELETE FROM state WHERE key=?', (key,))
