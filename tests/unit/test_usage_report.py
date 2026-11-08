@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from trading.control.usage_report import export
 from trading.runtime.store import RuntimeStore
@@ -71,3 +72,45 @@ def test_review_summary_separates_exact_repeats_market_repeats_and_paid_causes(t
     assert result['review_counts'][0]['same_market_repeat_reviews']==2
     assert result['review_counts'][0]['sent_analyses']==3
     assert result['paid_route_reasons']=={'free_pool_quota_or_cooldown':3}
+
+
+def test_usage_export_attributes_runner2_attempts_and_counts_only_real_generations(tmp_path):
+    from trading.runtime.runner2_portfolio import QueueReview, Runner2Portfolio
+    from trading.runtime.runner2_reviews import run_review_batch
+
+    root=tmp_path/'data'
+    baseline=RuntimeStore(str(root/'friend'/'live'/'runtime.sqlite3'))
+    archive_trace(baseline,dict(id='watch',strategy='watch_review',analysis_version='text',started_at=900,
+        status='invalid_or_unavailable_model',action='hold',attempts=[dict(provider='gemini',model='fake',
+            status='failed',generation_requests=1,error_category='invalid_output_or_local_validation')]))
+    portfolio=Runner2Portfolio(RuntimeStore(str(root/'runner2-shadow-test.sqlite3')),'friend')
+    portfolio.apply(QueueReview(kind='queue',command_id='review',at=900,subject='position',revision=1,
+        trigger='structure_break',expires_at=940,evidence=dict(symbol='BTC_USDT',family='trend',
+            regime='down',timeframe='5m',observed_at=900)))
+
+    def complete(**_):
+        child.last_trace=dict(attempts=[
+            dict(provider='groq',model='quota',status='quota_skipped',generation_requests=0),
+            dict(provider='gemini',model='failed',status='invalid_schema',generation_requests=1),
+            dict(provider='gemini',model='fake',status='success',generation_requests=1,
+                 input_tokens=150,output_tokens=20,raw_prompt='SECRET')])
+        child.on_trace(child.last_trace)
+        return dict(action='hold',reason='Yeni mum kapanışı bekleniyor.')
+
+    child=SimpleNamespace(complete_json=complete,close=lambda:None,last_provider='gemini',last_model='fake')
+    pool=SimpleNamespace(analysis_capacity=lambda **_:dict(parallel_candidates=1),fork=lambda:child)
+    run_review_batch(portfolio,pool,clock=lambda:905)
+
+    report=export(root,tmp_path/'out')
+    assert report['evaluations']==2
+    base,shadow=report['runner_efficiency']
+    assert (base['runner_id'],base['task'],base['valid_decisions'])==('baseline-v1','watch_review',0)
+    assert base['generation_requests_per_valid_decision'] is None
+    assert (shadow['runner_id'],shadow['mode'],shadow['task'])==('runner2','SHADOW','position_management')
+    assert shadow['generation_requests']==2 and shadow['valid_decisions']==1
+    assert shadow['generation_requests_per_valid_decision']==2
+    assert shadow['validation_failures']==1 and shadow['quota_skips']==1
+    assert shadow['avg_queue_delay_ms']==5000
+    csv_text=(tmp_path/'out'/'ai-requests.csv').read_text()
+    assert 'runner2,SHADOW,position_management' in csv_text
+    assert 'SECRET' not in json.dumps(report)

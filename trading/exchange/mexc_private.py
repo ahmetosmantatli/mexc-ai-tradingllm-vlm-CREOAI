@@ -194,11 +194,21 @@ class MexcPrivateClient:
     def submit_market(self,*,symbol,side,contracts,leverage,external_id,stop_loss,take_profit,entry_price,position_mode=1):
         order=MarketOrder(symbol=symbol,side=side,contracts=contracts,leverage=leverage,external_id=external_id,
             stop_loss=stop_loss,take_profit=take_profit,entry_price=entry_price,position_mode=position_mode)
-        if not (stop_loss<entry_price<take_profit if side=='long' else take_profit<entry_price<stop_loss):
+        return self._submit_open(order,order_type=5,operation='submit_market')
+
+    def submit_ioc(self,*,symbol,side,contracts,leverage,external_id,stop_loss,take_profit,limit_price,position_mode=1):
+        order=MarketOrder(symbol=symbol,side=side,contracts=contracts,leverage=leverage,external_id=external_id,
+            stop_loss=stop_loss,take_profit=take_profit,entry_price=limit_price,position_mode=position_mode)
+        return self._submit_open(order,order_type=3,operation='submit_ioc')
+
+    def _submit_open(self,order,*,order_type,operation):
+        long=order.side=='long'
+        low,high=(order.stop_loss,order.take_profit) if long else (order.take_profit,order.stop_loss)
+        if not low<order.entry_price<high:
             raise ValueError('invalid protection direction')
-        return self._request('POST','/api/v1/private/order/create',operation='submit_market',expected=dict,
+        return self._request('POST','/api/v1/private/order/create',operation=operation,expected=dict,
             body=dict(symbol=order.symbol,price=order.entry_price,vol=order.contracts,leverage=order.leverage,
-                side=1 if side=='long' else 3,type=5,openType=1,externalOid=external_id,
+                side=1 if long else 3,type=order_type,openType=1,externalOid=order.external_id,
                 stopLossPrice=order.stop_loss,takeProfitPrice=order.take_profit,lossTrend=2,profitTrend=2,
                 positionMode=order.position_mode,reduceOnly=False))
 

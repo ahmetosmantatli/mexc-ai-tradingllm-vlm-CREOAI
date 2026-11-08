@@ -34,6 +34,7 @@ class LiveRunner:
         self.private,self.public,self.llm=private,public,llm
         self.external_control=external_control or (lambda:dict(enabled=False))
         self.executor=executor
+        self.runner_id='baseline-v1'
         self.lock=store.lock
         self.external_scan=True
         self.reconciler=LiveAccountReconciler(account_id,store,binding_id=binding_id,
@@ -68,6 +69,7 @@ class LiveRunner:
         if profile not in ('capital_preservation','balanced','aggressive_growth'):
             profile='balanced'
         self.cfg.risk_profile=RiskProfile(profile)
+        self.runner_id=control.get('runner_id','baseline-v1')
         self.risk=self._risk_engine()
         self.cfg.analysis_version=control.get('version',self.cfg.analysis_version)
         if self.cfg.analysis_version not in ('text','vlm'):
@@ -269,6 +271,7 @@ class LiveRunner:
             evaluator=ContextEvaluator(child,self.store,self.public,self.cfg) if child is not self.llm else self.graph
             capital=self._capital(snapshot,control)
             live_context=self._live_context(snapshot,control)
+            live_context['runner_id']=control.get('runner_id','baseline-v1')
             # Other parallel candidates' leverage rows are not this symbol's
             # decision evidence. Portfolio positions/risk remain fully supplied.
             for field in ('risk_limits','leverage'):
@@ -301,7 +304,10 @@ class LiveRunner:
         if self.cfg.live_leverage_mode=='exchange' and result.metadata.get('sizing_plan') is None:
             raise ValueError('model must explicitly choose live leverage and risk')
         ticker=self.quote(candidate.symbol)
+        runner_id=control.get('runner_id','baseline-v1')
         planning_candidate=candidate
+        if runner_id=='runner2' and result.metadata.get('price_plan') is None:
+            raise ValueError('Runner 2 requires a candle-grounded price plan')
         if result.metadata.get('price_plan') is not None:
             if not self.cfg.live_price_plan_enabled:raise ValueError('live model price planning disabled')
             planning_candidate=apply_market_price_plan(candidate,result.metadata['price_plan'],result.metadata.get('price_evidence') or {},
@@ -325,6 +331,7 @@ class LiveRunner:
         proposal.notional=notional
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)
         proposal.metadata.update(price_plan=result.metadata.get('price_plan'),price_source='model' if result.metadata.get('price_plan') else 'quant',
+            runner_id=runner_id,
             setup_family=(result.metadata.get('setup_selection') or {}).get('family',candidate.features.get('setup_family')),
             setup_id=(result.metadata.get('setup_selection') or {}).get('setup_id'),
             contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
@@ -342,7 +349,9 @@ class LiveRunner:
         if (result.selected_signal is None or result.selected_signal.signal_id!=candidate.signal_id
                 or not all(note and note.mode=='llm' for note in (result.market,result.strategy,result.portfolio))):
             return finish('HOLD_LIVE_UNVALIDATED_MODEL')
-        if not self._enabled() or self._control().get('updated_at')!=control.get('updated_at'):
+        current_control=self._control()
+        if (not self._enabled(current_control) or current_control.get('updated_at')!=control.get('updated_at')
+                or current_control.get('runner_id','baseline-v1')!=control.get('runner_id','baseline-v1')):
             return finish('HOLD_LIVE_CONTROL_CHANGED')
         if self.executor is None:
             return finish('HOLD_LIVE_EXECUTOR_DISABLED')
@@ -384,8 +393,10 @@ class LiveRunner:
         original=getattr(self.executor,'can_execute',None)
         def current():
             latest=coordinator.card(candidate.symbol)
-            return bool((original is None or original()) and self._enabled()
-                and self._control().get('updated_at')==control.get('updated_at')
+            current_control=self._control()
+            return bool((original is None or original()) and self._enabled(current_control)
+                and current_control.get('updated_at')==control.get('updated_at')
+                and current_control.get('runner_id','baseline-v1')==control.get('runner_id','baseline-v1')
                 and self.candidate_queue().is_current(candidate)
                 and latest['revision']==card['revision'] and latest.get('last_action')=='trade'
                 and time.time()-started<=self.cfg.decision_ttl_seconds)
@@ -529,7 +540,8 @@ class LiveRunner:
                 remaining_contracts=intent.get('managed_contracts',intent.get('effective_contracts',intent.get('contracts'))),
                 opened_at=row.get('opened_at'),intent_id=intent.get('intent_id'),
                 protection_status=intent.get('status','unmanaged'),analysis_version=metadata.get('analysis_version'),
-                decision_ai=metadata.get('decision_ai',{}),price_source=metadata.get('price_source','quant'))
+                decision_ai=metadata.get('decision_ai',{}),price_source=metadata.get('price_source','quant'),
+                runner_id=metadata.get('runner_id','baseline-v1'))
         closed=[row for row in intents if row.get('status')=='closed']
         public_data=self.public.rate_status() if callable(getattr(self.public,'rate_status',None)) else {}
         snapshot=dict(stage=self.store.get('stage'),public_data=public_data,mode='LIVE',live_orders_enabled=bool(self.executor is not None),observed_at=time.time(),reason=reason,
@@ -539,6 +551,7 @@ class LiveRunner:
             management_status=self.store.get('management_status',{}),management_trace=self.store.get('management_trace',{}),
             analysis_trace=self.store.get('analysis_trace',{}),analysis_history=self.store.get('analysis_history',[]),
             watchlist=watch_snapshot(self.store),leverage_mode=self.cfg.live_leverage_mode,analysis_version=self.cfg.analysis_version,
+            runner_id=self.runner_id,
             entry_risk_policy=dict(profile=self.risk.preset.profile.value,daily_loss_limit_pct=self.risk.preset.daily_loss_halt_pct),
             ai_status=getattr(self.llm,'last_status','not_called'),live_halt=self.store.get('live:halt'),is_simulated=False)
         with self.lock:

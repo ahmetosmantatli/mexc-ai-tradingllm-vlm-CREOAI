@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from trading.agents.schemas import EvaluationResult, GraphAction, MarketAnalystNote, StrategyReviewNote, PortfolioAnalystNote
 from trading.evaluation.watch import WatchPlan, WatchCoordinator, ACTIVE, watch_event_key
 from trading.evaluation.price_plan import MarketPricePlan,apply_market_price_plan,evidence_from_market
@@ -22,7 +22,12 @@ class ModelDecision(BaseModel):
     signal_id: str | None
     rationale: str = Field(max_length=1200)
     invalidation: str = Field(max_length=500)
-    watch_note: str = Field(max_length=1000)
+    watch_note: str | None = Field(default='', max_length=1000)
+
+    @field_validator('watch_note')
+    @classmethod
+    def normalize_watch_note(cls, value):
+        return '' if value is None else value
 
 
 SYSTEM_POLICY = (
@@ -66,7 +71,8 @@ SYSTEM_POLICY = (
     'on the profit side. Prices must respect supplied tick step. Entry is only a current market reference, not a pending order; '
     'for a distant entry use WATCH. A null price_plan keeps quant levels. When price planning is disabled keep price_plan null. '
     'Never change prices just to force higher leverage or hit a money target. Write concise Turkish rationale explaining the concrete missing confirmation '
-    'or rejection, and a watch_note describing what would justify reconsideration. Do not just say insufficient evidence. '
+    'or rejection. Use watch_note for a brief text note on what would justify reconsideration, or null when inapplicable. '
+    'Do not put a watch plan or any structured value in watch_note. Do not just say insufficient evidence. '
     'Keep rationale within1200 characters, invalidation within500 and watch_note within1000. '
     'VLM annotations are deterministic observations, not proof of profit.'
 )
@@ -148,10 +154,16 @@ class ContextEvaluator:
             return EvaluationResult(action=GraphAction.HOLD, hold_reason='no_candidates',metadata={'provider_called':False})
         candidate = max(candidates, key=lambda c:c.confidence)
         symbol = candidate.symbol
-        selection_enabled=bool(context.get('live_account_context') is not None and getattr(self.cfg,'live_structure_setups_enabled',False) and getattr(self.cfg,'live_price_plan_enabled',False))
+        live_account=context.pop('live_account_context',None)
+        if live_account is not None and (not isinstance(live_account,dict) or live_account.get('mode')!='LIVE' or live_account.get('currency')!='USDT'):
+            return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_live_account_context',metadata={'provider_called':False})
+        runner2=bool(live_account and live_account.get('runner_id')=='runner2')
+        selection_enabled=bool(live_account is not None and getattr(self.cfg,'live_structure_setups_enabled',False) and getattr(self.cfg,'live_price_plan_enabled',False))
         scope = 'symbol_setups' if selection_enabled else f'{candidate.strategy.value}:{candidate.side.value}'
-        if context.get('live_account_context') is not None:
+        if live_account is not None:
             scope=f'{self.cfg.analysis_version}:'+scope
+        if runner2:
+            scope='runner2:'+scope
         self.store.put('stage','fetching_multitimeframe_context')
         bundle = build_bundle(self.public, symbol)
         chart_context = bundle.to_context()
@@ -161,7 +173,7 @@ class ContextEvaluator:
         memory = self.store.get(key)
         if memory is None:
             # Old unscoped memory is migrated only when the scope is compatible.
-            memory=copy.deepcopy(legacy) if legacy.get('scope') in (None,scope) else {}
+            memory=copy.deepcopy(legacy) if not runner2 and legacy.get('scope') in (None,scope) else {}
         memory.setdefault('history',[])
         memory.setdefault('watch_note','')
         memory.setdefault('last_fingerprint',None)
@@ -173,10 +185,7 @@ class ContextEvaluator:
                 or prior_watch.get('plan',{}).get('expires_at',0)<=time.time()
                 or candidate.features.get('review_event_key')!=watch_event_key(prior_watch)):
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='stale_watch_review',metadata={'provider_called':False})
-        live_account=context.pop('live_account_context',None)
         live_positions=context.pop('live_positions',None)
-        if live_account is not None and (not isinstance(live_account,dict) or live_account.get('mode')!='LIVE' or live_account.get('currency')!='USDT'):
-            return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_live_account_context',metadata={'provider_called':False})
         positions = live_positions if live_account is not None and isinstance(live_positions,dict) else self.store.get('paper', {}).get('positions', {})
         account=dict(equity=equity,risk_per_trade_pct=risk_per_trade_pct,leverage=target_leverage,**context)
         exchange_cap=target_leverage
@@ -221,6 +230,7 @@ class ContextEvaluator:
         paths=[str(c.path) for c in charts]
         started=time.time()
         trace=dict(id=uuid4().hex,mode='LIVE' if live_account is not None else 'PAPER',symbol=symbol,strategy=candidate.strategy.value,confidence=candidate.confidence,
+            runner_id=(live_account or {}).get('runner_id','baseline-v1'),
             analysis_version=self.cfg.analysis_version,started_at=started,status='pending',attempts=[],provider='none',model='',
             why_reconsidered=changes,market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))
@@ -246,6 +256,8 @@ class ContextEvaluator:
                 raise ValueError('explicit model sizing required for exchange leverage mode')
             if decision.action=='trade' and candidate.features.get('watch_review') and decision.price_plan is None:
                 raise ValueError('independent watch trade requires a fresh price plan')
+            if decision.action=='trade' and runner2 and decision.price_plan is None:
+                raise ValueError('Runner 2 requires a candle-grounded price plan')
             if decision.price_plan is not None:
                 if not price_planning or decision.action!='trade':
                     raise ValueError('price planning disabled or not trade')
@@ -265,7 +277,9 @@ class ContextEvaluator:
             return decision
         if hasattr(self.llm,'response_validator'):
             self.llm.response_validator=validate
-        payload=self.llm.complete_json(system=SYSTEM_POLICY,user=prompt,max_tokens=1100 if price_planning else 700,
+        policy=SYSTEM_POLICY+(' Runner 2 trade requires a grounded price_plan. Use market as the reference entry_type; '
+                              'execution independently enforces a fresh IOC price limit.' if runner2 else '')
+        payload=self.llm.complete_json(system=policy,user=prompt,max_tokens=1100 if price_planning else 700,
             images=paths if self.cfg.analysis_version=='vlm' else None)
         provider_trace=copy.deepcopy(getattr(self.llm,'last_trace',{}) or {})
         trace.update(provider_trace)

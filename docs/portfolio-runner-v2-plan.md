@@ -1,4 +1,4 @@
-# Portfolio runner v2 — accepted direction, implementation pending
+# Runner 2 — portfolio plan and exit replay
 
 Recorded 2026-11-08, Europe/Istanbul. This document is a development contract,
 not a claim that v2, runner switching or additional providers already work.
@@ -7,7 +7,7 @@ Current reference code revision before this document: `7f75a5d`.
 
 ## Independent runners and analysis modes
 
-Keep `baseline-v1` for the existing logic and `portfolio-v2` for new behavior.
+Keep `baseline-v1` for the existing logic and `runner2` (Runner 2) for new behavior.
 Runner identity is independent of text/VLM, risk profile and PAPER/LIVE mode.
 Persist runner ID, immutable code/config version, account binding, analysis
 mode, policy revision and model attribution on every decision and order.
@@ -72,11 +72,91 @@ Apply decisions symmetrically to long and short:
 - explicitly revise a scalp into an intraday/swing plan, with reason, expiry,
   horizon and invalidation, without widening stop or increasing initial loss risk.
 
-Target extensions need an explicit new schema/action, candle reference,
-expected plan revision and native amend/read-back. They are NOT supported by
-the current management schema. Keep prior protection during uncertain updates;
+Target extensions need a candle reference, expected plan revision and native
+amend/read-back. The opt-in LIVE pilot allows one outward target extension on
+a near-target event and leaves the native stop unchanged. Keep prior protection during uncertain updates;
 never remove a valid stop merely to extend a target. A target already triggered
 or closed position must reconcile, not be revived. Bound repeated extensions.
+
+Runner 2 can choose a single target or TP1 plus TP2 at entry. The same exit
+plan can be revised for an open position, including switching back to one
+target for the remaining contracts. Round TP1 down to the contract step and
+assign the remainder to TP2. Both planned legs must meet the exchange minimum.
+Record each fill once by ID. A TP1 fill reduces the size under the common stop
+and cannot create a second TP1 allocation. A stop may only tighten, and a
+crossed old target must be reconciled before editing the plan.
+
+The implemented SHADOW replay takes an `opening` object and an `events` array
+with explicit simulated fills and plan revisions. Run it with
+`python -m trading.control.runner2 scenario.json`. The output contains the
+opening evidence, decision reasons, revisions, fills, and remaining stop
+coverage. The input can be replayed from the start. See
+`tests/unit/test_runner2.py` for a complete scenario.
+
+An optional `opening.horizon` stores the initial style, review timeframe and
+expiry. A SHADOW revision can promote it before expiry with a longer horizon
+and a further target anchored to a closed candle on the higher review
+timeframe. The original opening stays in the audit, and the current stop
+remains the invalidation level unless the revision tightens it.
+
+Optional `opening.entry_risk` takes contract size, loss budget, fee rate and
+exit slippage in basis points. The replay derives a tick-rounded IOC price
+limit and rejects a simulated fill outside it. This check models stop loss
+and costs at the configured prices. It does not submit orders or model gaps
+beyond the assumed stop slippage.
+
+The exit replay reports planned versus filled entry, adverse entry slippage,
+initial target R and realized R before funding when costs are supplied. It
+accepts partial stop fills as unresolved stop execution and rejects plan
+revisions while the simulated remainder is unresolved. Compare matched
+opening and cost scenarios with `--compare other.json`. The comparison uses
+supplied fills and reports a final net difference only when both are closed.
+
+The portfolio SHADOW entry point uses a separate SQLite file:
+
+```sh
+python -m trading.control.runner2 scenario.json --portfolio-db data/runner2-shadow-demo.sqlite3
+```
+
+The input `commands` array accepts timestamped observations, review queue and
+dispatch events, review results, balance observations, confirmed reductions,
+reservations, entry/close results and historical retrieval. See
+`tests/unit/test_runner2_portfolio.py` for complete inputs. Dispatch consumes
+the scenario's supplied available slot count. It prioritizes position events,
+leases one review per subject, discards superseded results and allows one
+bounded retry when a provider result is unavailable. The journal is restart
+safe by command ID. An uncertain entry retains its reservation. A confirmed
+fill releases reserved headroom only when a newer balance explicitly includes
+that fill. Historical retrieval uses only decisions and outcomes known at the
+requested cutoff. Automatic feeding from the live scan, provider pool and
+exchange adapter remains a separate integration step.
+
+A SHADOW position observation may include the active target, side, original
+price risk, ATR and a fresh quote. It queues a near-target review within the
+smaller of 0.25R and 0.5 ATR. A touched target requires fill reconciliation.
+A new plan revision supersedes reviews of the old target.
+
+Pass `--ai-reviews` explicitly to process one batch of current, timestamped
+SHADOW jobs with the existing free-provider pool. It reads the shared quota
+ledger, dispatches eligible reviews in priority order, includes up to three
+time-safe examples and uses the pool's fallback for each isolated request.
+The default replay makes no network requests. The explicit batch consumes
+free-provider quota, supports text evidence and records advice only. It has
+no exchange writer and does not reserve capacity ahead of the existing worker.
+
+The replay does not simulate matching or amend requests. The LIVE pilot is
+opt-in with `LIVE_RUNNER2_ENABLED=true`, alongside
+`LIVE_PRICE_PLAN_ENABLED=true` and `LIVE_POSITION_MANAGEMENT_ENABLED=true`.
+The Telegram settings flow selects the runner for new entries, then analysis
+mode, trader profile and explicit Start. Entries use price-bounded IOC with
+one exchange-native SL/TP pair. If its full coverage cannot be verified, the
+existing emergency close/review flow applies. Existing positions retain their
+opening runner's management policy, and legacy positions are treated as Runner 1.
+
+The pilot uses the existing managed partial close flow. Native TP1/TP2 legs,
+live horizon promotion, automated portfolio reallocation and authenticated
+exchange validation remain separate work. In particular verify aggregate stop
+coverage, trigger/modify races and partial fills before adding two native exits.
 
 For reallocation, one account coordinator compares keep/reduce/close/wait with
 new opportunities net of switching costs, uncertainty, correlation and margin.
@@ -111,6 +191,14 @@ Separate wallet return from allocated runner return. Never call a few observed
 trades or shadow fills proof of profitability.
 
 ## Provider routing and Telegram observability
+
+The shared pool caps actual generation requests per evaluation with
+`AI_POOL_MAX_GENERATION_REQUESTS` (default 3). If paid fallback is configured,
+one slot is reserved for it when the cap permits. Malformed HTTP 200 output
+skips other credentials serving the same model for that evaluation.
+`trading.control.usage_report` includes Runner 2 SHADOW databases under the
+runtime data directory and reports generation requests per valid decision by
+runner and task.
 
 Retain application-owned position/portfolio state across provider changes.
 No provider may assume persistent hidden conversation context. Match each

@@ -21,6 +21,7 @@ import httpx
 from trading.agents.anthropic_client import AnthropicClient
 from trading.agents.provider_limits import blocked
 from trading.agents.provider_router import ProviderRouter
+from trading.agents.telemetry import is_model_output_failure
 
 
 class PrefixStore:
@@ -493,6 +494,9 @@ class ProviderPool:
         # Do not bypass a provider's Retry-After. Longer delays use future cycles.
         return status!=429 or self._cooldown(slot,images)<=time.time()+seconds
 
+    def _generation_requests(self):
+        return sum(attempt.get('generation_requests', 0) for attempt in self.last_trace['attempts'])
+
     def _paid_guard_key(self):
         # Scope to model and shared budget DB, not account/fork or API key.
         return 'pool:paid:guard:'+hashlib.sha256(self.settings.anthropic_model.encode()).hexdigest()
@@ -609,7 +613,11 @@ class ProviderPool:
         remaining=[slot for slot in self._slots if self._supports(slot,images)] if primary!='anthropic' else []
         retry=None
         waited_for_capacity=False
-        while remaining and self._allowed():
+        generation_limit=self.settings.ai_pool_max_generation_requests
+        reserve_paid=(self.settings.ai_claude_fallback_enabled and self.settings.anthropic_api_key
+                      and generation_limit>1)
+        free_limit=generation_limit-int(bool(reserve_paid))
+        while remaining and self._allowed() and self._generation_requests()<free_limit:
             reservation=self._reserve(remaining,system,user,max_tokens,images)
             if reservation is None:
                 self.last_fallback_reason='free_pool_quota_or_cooldown'
@@ -630,19 +638,26 @@ class ProviderPool:
                     return self._finish(None)
                 break
             slot=reservation[0]
-            # One attempt per quota group/model per pass, not one per nominal key.
-            group_key=self._quota_key(slot,images)
             remaining=[other for other in remaining if other is not slot]
             result=self._attempt(reservation,system,user,max_tokens,images)
             if result is not None:
                 self.successful_calls+=1
                 return self._finish(result)
-            if retry is None and self._retryable(slot,images):
+            attempts=self.last_trace['attempts']
+            if attempts and is_model_output_failure(attempts[-1]):
+                # Changing a credential cannot fix this response's output contract.
+                model=self._model(slot,images)
+                remaining=[other for other in remaining if self._model(other,images)!=model]
+                if retry is not None and self._model(retry,images)==model:
+                    retry=None
+                self.last_fallback_reason='invalid_model_output'
+            elif retry is None and self._retryable(slot,images):
                 retry=slot
         if not self._allowed():
             self.last_status='stopped'
             return self._finish(None)
-        if retry is not None and getattr(self.settings,'ai_pool_max_retry_attempts',1):
+        if (retry is not None and getattr(self.settings,'ai_pool_max_retry_attempts',1)
+                and self._generation_requests()<free_limit):
             delay=max(0,min(10,getattr(self.settings,'ai_pool_retry_seconds',5)))
             if not self._wait(delay):
                 self.last_status='stopped'
@@ -660,6 +675,9 @@ class ProviderPool:
                     return self._finish(result)
         if not self._allowed():
             self.last_status='stopped'
+            return self._finish(None)
+        if self._generation_requests()>=generation_limit:
+            self.last_status='generation_limit_reached'
             return self._finish(None)
         if primary!='anthropic' and not self.settings.ai_claude_fallback_enabled:
             self.last_status='primary_unavailable_fallback_disabled'

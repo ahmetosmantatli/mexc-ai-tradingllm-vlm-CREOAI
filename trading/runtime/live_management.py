@@ -11,6 +11,7 @@ from trading.evaluation.context import compact_market, digest
 from trading.evaluation.price_plan import CandleReference, evidence_from_market, _reference
 from trading.runtime.usage import archive_trace
 
+TIMEFRAME_SECONDS={'5m':300,'15m':900,'4h':14400}
 
 class ManagementDecision(BaseModel):
     model_config=ConfigDict(extra='forbid',strict=True,allow_inf_nan=False)
@@ -36,7 +37,23 @@ class ManagementDecision(BaseModel):
         return self
 
 
-POLICY=(
+class Runner2ManagementDecision(ManagementDecision):
+    action: str = Field(pattern='^(hold|move_stop|move_target|reduce|close)$')
+    target_price: float | None = Field(default=None,gt=0)
+    target_reference: CandleReference | None = None
+
+    @model_validator(mode='after')
+    def consistent_target(self):
+        has_target = self.target_price is not None or self.target_reference is not None
+        if self.action=='move_target':
+            if self.target_price is None or self.target_reference is None:
+                raise ValueError('target action requires price and candle reference')
+        elif has_target:
+            raise ValueError('target fields allowed only for move_target')
+        return self
+
+
+COMMON_POLICY=(
     'Manage only the supplied existing MEXC USDT perpetual position. Never open/add/reverse or change leverage. '
     'Reply JSON with action hold/move_stop/reduce/close, position_id (exact string), reason (concise Turkish), '
     'review_timeframe (5m/15m/4h), stop_price, stop_reference, close_fraction. Nonapplicable optional fields must be null. '
@@ -50,9 +67,15 @@ POLICY=(
     'from observed recent_ohlcv UTC-open seconds, low for LONG/high for SHORT. Stop beyond that wick by at most '
     'one recent average true range and on the safe side of current executable AND fair price. '
     'reduce uses close_fraction of CURRENT remaining contracts (0<f<1), close uses 1. '
-    'No direct TP modifications: preserve native target; reduce/close when the thesis or target is no longer appropriate. '
     'Money objectives never justify raising risk or forcing trades. Charts if supplied are the same candle evidence. '
     'No guarantee of execution. Server revalidates ownership, revision, age, tick/quantity and protection before writes.'
+)
+POLICY=COMMON_POLICY+' Preserve native target; reduce/close when the thesis or target is no longer appropriate.'
+RUNNER2_POLICY=COMMON_POLICY+(
+    ' Runner 2 also supports action move_target once, on a near-target event before the native target touches. '
+    'Keep the stop unchanged. Supply target_price and target_reference only for move_target, both null otherwise. '
+    'Target must extend in the profitable direction and anchor to a supplied closed high for long or low for short. '
+    'Explain why confirmed continuation supports the extension; otherwise hold, reduce, or close.'
 )
 
 
@@ -75,6 +98,7 @@ class LivePositionManager:
             card.update(current_r=current,mfe_r=max(0,current,card.get('mfe_r',0)),
                 mae_r=min(0,current,card.get('mae_r',0)),sampled_at=time.time(),excursion_source='sampled executable quotes, not tick-exact')
             r.store.put(self.key(row),card)
+        return quote
 
     def _permitted(self,revision):
         r=self.runner
@@ -99,40 +123,80 @@ class LivePositionManager:
     def review(self,intent,control):
         from trading.analysis import build_bundle,render_bundle
         r=self.runner;now=time.time();key=self.key(intent)
-        self.observe(intent)
+        observed_quote=self.observe(intent)
         card=r.store.get(key,{})
         if now-card.get('last_attempt_at',0)<r.cfg.live_management_min_interval_seconds:return
         proposal=intent['proposal'];symbol=proposal['symbol']
-        timeframe=card.get('review_timeframe') or (proposal.get('metadata',{}).get('price_plan') or {}).get('entry_timeframe','15m')
+        metadata=proposal.get('metadata') or {}
+        runner_id=metadata.get('runner_id','baseline-v1')
+        runner2=runner_id=='runner2'
+        variant=metadata.get('analysis_version') if 'runner_id' in metadata else None
+        variant=variant if variant in ('text','vlm') else control.get('version',r.cfg.analysis_version)
+        stop,target=r.executor.protection_levels(intent)
+        long=proposal['side']=='long'
+        near_target=False
+        if runner2 and observed_quote is not None:
+            fair=observed_quote.raw['fairPrice']
+            distance=target-max(observed_quote.ask1,fair) if long else min(observed_quote.bid1,fair)-target
+            if distance<=0:
+                return # The native target may already be executing; the monitor reconciles it.
+            initial_risk=abs(intent['entry_fill_price']-proposal['stop_loss']['price'])
+            near_target=(card.get('last_near_target')!=target and
+                         distance<=min(.25*initial_risk,.5*card.get('review_atr',0)))
+        entry_timeframe=(metadata.get('price_plan') or {}).get('entry_timeframe')
+        timeframe=card.get('review_timeframe') or entry_timeframe or '15m'
         milestone=min(100,max(0,int(math.floor(card.get('mfe_r',0)))))
         previous=card.get('last_event') or {}
+        retry=card.get('provider_retry') or {}
+        revision=intent.get('management_revision',0)
+        retry_due=(retry.get('revision')==revision and retry.get('control_revision')==control.get('updated_at')
+                   and retry.get('at',0)<=now<retry.get('expires_at',0))
         # No reason to download three histories again before either trigger can change.
         if (previous.get('timeframe')==timeframe and previous.get('favorable_r_milestone')==milestone
-                and now<previous.get('closed_at',0)+{'5m':300,'15m':900,'4h':14400}[timeframe]):return
+                and now<previous.get('closed_at',0)+TIMEFRAME_SECONDS[timeframe] and not retry_due and not near_target):return
         bundle=build_bundle(r.public,symbol);market=bundle.to_context()
         view=next((v for v in market['timeframes'] if v['timeframe']==timeframe),None)
         if view is None:raise ValueError('management entry timeframe evidence missing')
         event=dict(timeframe=timeframe,closed_at=view['closed_at'],favorable_r_milestone=milestone)
-        if card.get('last_event')==event:return
+        if runner2:
+            evidence=evidence_from_market(market)
+            ref=CandleReference(timeframe=timeframe,open_time=int(evidence[timeframe][-1][0]),field='high')
+            _,review_atr=_reference(ref,evidence,now)
+            if observed_quote is not None and (card.get('last_near_target')!=target
+                    or retry_due and previous.get('near_target')==target):
+                near_target=distance<=min(.25*initial_risk,.5*review_atr)
+            if near_target:
+                event['near_target']=target
+        same_event=previous==event
+        if same_event and not retry_due:return
         # Durable attempt reservation prevents restart/network failures causing call storms.
         with r.store.lock:
             current=r.store.get(key,{})
             current.update(last_attempt_at=now,last_event=event)
+            if runner2:
+                current['review_atr']=review_atr
+                if near_target:
+                    current['last_near_target']=target
+            current.pop('provider_retry',None)
             r.store.put(key,current)
             card=current
-        revision=intent.get('management_revision',0)
         snapshot=r._refresh([symbol])
         position=next((p for p in snapshot['positions'] if str(p['position_id'])==intent['position_id']),None)
         if position is None:return
-        stop,target=r.executor.protection_levels(intent)
+        opened_ms=position.get('opened_at')
+        opened_at=opened_ms/1000 if isinstance(opened_ms,(int,float)) and 0<opened_ms/1000<=now else None
+        elapsed_bars=(int((now-opened_at)/TIMEFRAME_SECONDS[entry_timeframe])
+                      if opened_at is not None and entry_timeframe in TIMEFRAME_SECONDS else None)
         position_card=dict(position,initial_entry=proposal.get('entry_price'),filled_entry=intent['entry_fill_price'],
             initial_stop=proposal['stop_loss']['price'],current_stop=stop,current_target=target,
             remaining_contracts=r.executor.remaining_contracts(intent),original_thesis=proposal.get('rationale'),
-            original_price_plan=proposal.get('metadata',{}).get('price_plan'),opened_at=intent.get('staged_at'),
-            elapsed_entry_bars=max(0,int((now-intent['staged_at'])/{'5m':300,'15m':900,'4h':14400}[timeframe])),
+            original_price_plan=metadata.get('price_plan'),opened_at=opened_at,
+            entry_timeframe=entry_timeframe,review_timeframe=timeframe,elapsed_entry_bars=elapsed_bars,
             initial_risk_usdt=proposal.get('max_loss_if_stopped'),remaining_planned_loss_usdt=intent.get('planned_loss'),excursions={k:card.get(k) for k in ('current_r','mfe_r','mae_r','sampled_at','excursion_source')},
             previous_decisions=card.get('decisions',[])[-5:],confirmed_actions=intent.get('management_events',[])[-5:],
             management_revision=revision)
+        if runner2:
+            position_card['target_extension_available']=bool(near_target and not intent.get('target_extensions'))
         quote=r.quote(symbol);rules=r.public.get_contract_rules(symbol)
         prompt=json.dumps(dict(task='manage_existing_position',event=event,position=position_card,
             account=r._live_context(snapshot,control),market=compact_market(market),
@@ -140,14 +204,17 @@ class LivePositionManager:
             ensure_ascii=False,separators=(',',':'),allow_nan=False)
         llm=r.management_llm()
         trace=dict(id=uuid4().hex,started_at=now,symbol=symbol,strategy='position_management',mode='LIVE',
-            analysis_version=control.get('version',r.cfg.analysis_version),status='pending',attempts=[],prompt_bytes=len(prompt.encode()),input_fingerprint=digest(prompt))
+            runner_id=runner_id,
+            analysis_version=variant,status='pending',attempts=[],prompt_bytes=len(prompt.encode()),input_fingerprint=digest(prompt))
         def archive(update=None):
             if update:trace.update(copy.deepcopy(update))
             with r.store.lock:
                 r.store.put('management_trace',trace)
                 archive_trace(r.store,trace)
+        schema=Runner2ManagementDecision if runner2 else ManagementDecision
         def validate(raw):
-            decision=ManagementDecision.model_validate(raw)
+            decision=schema.model_validate(raw)
+            long=proposal['side']=='long'
             if decision.position_id!=intent['position_id']:raise ValueError('management position identity mismatch')
             if decision.action=='move_stop':
                 anchor,atr=_reference(decision.stop_reference,evidence_from_market(market),time.time())
@@ -159,21 +226,37 @@ class LivePositionManager:
                     raise ValueError('management stop buffer invalid')
                 if not (stop<decision.stop_price<min(quote.bid1,quote.raw['fairPrice']) if long else stop>decision.stop_price>max(quote.ask1,quote.raw['fairPrice'])):
                     raise ValueError('management stop must tighten')
+            if decision.action=='move_target':
+                if not position_card['target_extension_available']:
+                    raise ValueError('management target extension unavailable')
+                reference=decision.target_reference
+                anchor,atr=_reference(reference,evidence,time.time())
+                if (reference.field!=('high' if long else 'low')
+                        or not (decision.target_price>target and anchor>target if long else decision.target_price<target and anchor<target)
+                        or abs(decision.target_price-anchor)>max(atr,rules.price_step)+rules.price_step*1e-6):
+                    raise ValueError('management target requires a grounded extension')
             return decision
         try:
             llm.response_validator=validate
-            llm.decision_schema=ManagementDecision.model_json_schema()
+            llm.decision_schema=schema.model_json_schema()
             llm.can_call=lambda:self._permitted(control.get('updated_at'))
             llm.deadline=now+r.cfg.decision_ttl_seconds
             llm.on_trace=archive
             paths=[]
-            if control.get('version',r.cfg.analysis_version)=='vlm':
+            if variant=='vlm':
                 paths=[str(c.path) for c in render_bundle(bundle,Path(r.cfg.analysis_chart_dir)/symbol/('management-'+bundle.fingerprint[:16]))]
-            raw=llm.complete_json(system=POLICY,user=prompt,max_tokens=850,images=paths or None)
+            raw=llm.complete_json(system=RUNNER2_POLICY if runner2 else POLICY,user=prompt,max_tokens=850,images=paths or None)
             trace.update(copy.deepcopy(getattr(llm,'last_trace',{})))
             trace.update(completed_at=time.time(),provider=getattr(llm,'last_provider','none'),model=getattr(llm,'last_model',''),
                 status='failed' if raw is None else 'completed')
             if raw is None:
+                if not same_event and self._permitted(control.get('updated_at')):
+                    retry_at=max(now+r.cfg.live_management_min_interval_seconds,time.time()+5)
+                    with r.store.lock:
+                        current=r.store.get(key,{})
+                        current['provider_retry']=dict(at=retry_at,expires_at=retry_at+r.cfg.decision_ttl_seconds,
+                            revision=revision,control_revision=control.get('updated_at'))
+                        r.store.put(key,current)
                 r.store.put('management_status',dict(at=time.time(),symbol=symbol,status='ai_unavailable',
                     reason='AI yönetim yanıtı alınamadı; mevcut SL/TP sürüyor.'))
                 return

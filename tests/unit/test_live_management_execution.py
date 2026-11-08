@@ -17,7 +17,7 @@ class ManagementClient(Client):
         if self.protects and not self.resize_apply:
             self.protects.append(kw['request_id']);raise TimeoutError()
         result=super().place_protection(**kw)
-        self.stops[0]['id']=33
+        self.stops[0].update(id=33,errorCode=0,positionType=self.positions[0]['positionType'])
         if self.resize_unknown:raise TimeoutError()
         return result
     def modify_protection(self,**kw):
@@ -50,21 +50,116 @@ class ManagementPublic(Public):
     def get_ticker(self,symbol):return SimpleNamespace(bid1=99.99,ask1=100.,last_price=100.,quote_volume_24h=1e6,raw={'timestamp':time()*1000,'fairPrice':100.})
 
 
-def prepared(tmp_path):
+def prepared(tmp_path, *, short=False):
+    from trading.models.domain import Side
+    from .test_live_execution import proposal
     executor,_,store=setup(tmp_path)
     private=ManagementClient();executor.private=private;executor.public=ManagementPublic()
-    row=approve(executor);row=executor.execute(row['intent_id'])
+    if short:
+        submit=private.submit_market
+        def short_submit(**kw):
+            result=submit(**kw);private.positions[0]['liquidatePrice']=120.;return result
+        private.submit_market=short_submit
+        plan=proposal(side=Side.SHORT,stop_loss={'price':102.},take_profit_price=96.)
+    else:
+        plan=proposal()
+    row=approve(executor,plan);row=executor.execute(row['intent_id'])
     assert row['status']=='protected'
     return executor,private,store,row
 
 
 def decision(action='move_stop',**kw):
+    action_fields={'move_stop':{'stop_price':99.},'move_target':{'target_price':105.},
+                   'reduce':{'close_fraction':.5},'close':{'close_fraction':1.}}
     return {'action':action,'reason':'Yeni kapanmış mumda destek yapısı teyit edildi.',
-        'ai':{'provider':'test','model':'fake'},**({'stop_price':99.} if action=='move_stop' else {'close_fraction':.5 if action=='reduce' else 1.}),**kw}
+        'ai':{'provider':'test','model':'fake'},**action_fields[action],**kw}
 
 
 def manage(executor,row,data=None,ident='d1',guard=lambda:True):
     return executor.manage_position(row['intent_id'],data or decision(),expected_revision=row.get('management_revision',0),decision_id=ident,guard=guard)
+
+
+def runner2_owned(executor,row):
+    # Isolate the management path from the entry transport. The executor
+    # reads ownership from the immutable proposal in the stored intent.
+    row['proposal']['metadata']['runner_id']='runner2'
+    return executor._save(row)
+
+
+def test_runner2_target_extends_once_in_place_with_unchanged_stop_and_risk(tmp_path):
+    executor,private,_,row=prepared(tmp_path)
+    with pytest.raises(LiveExecutionError,match='management_target_runner2_required'):
+        manage(executor,row,decision('move_target'))
+    row=runner2_owned(executor,row)
+    changed=manage(executor,row,decision('move_target'))
+    assert changed['current_protection']=={'stop':98.,'target':105.}
+    assert changed['target_extensions']==1
+    assert changed['proposal']['take_profit_price']==104.
+    assert changed['planned_loss']==row['planned_loss']
+    event=changed['management_events'][-1]
+    assert (event['action'],event['status'],event['old_target'],event['new_target'])==('move_target','confirmed',104.,105.)
+    assert private.modifies[0]['stop_loss']==98. and len(private.protects)==1 and not private.cancels
+    with pytest.raises(LiveExecutionError,match='management_target_extension_limit'):
+        manage(executor,changed,decision('move_target',target_price=106.),ident='d2')
+    assert len(private.modifies)==1
+
+
+@pytest.mark.parametrize(('price','error'),[(103.,'management_target_must_extend'),(105.005,'management_tick_mismatch')])
+def test_runner2_invalid_target_never_amends(tmp_path,price,error):
+    executor,private,_,row=prepared(tmp_path)
+    row=runner2_owned(executor,row)
+    with pytest.raises(LiveExecutionError,match=error):
+        manage(executor,row,decision('move_target',target_price=price))
+    assert not private.modifies
+
+
+def test_runner2_already_triggerable_target_never_amends(tmp_path):
+    executor,private,_,row=prepared(tmp_path)
+    row=runner2_owned(executor,row)
+    executor.public.get_ticker=lambda _: SimpleNamespace(bid1=104.,ask1=104.01,
+        raw={'timestamp':time()*1000,'fairPrice':104.})
+    with pytest.raises(LiveExecutionError,match='management_protection_already_triggerable'):
+        manage(executor,row,decision('move_target'))
+    assert not private.modifies
+
+
+def test_runner2_short_target_extends_downward_with_unchanged_stop(tmp_path):
+    executor,private,_,row=prepared(tmp_path,short=True)
+    row=runner2_owned(executor,row)
+    changed=manage(executor,row,decision('move_target',target_price=94.))
+    assert changed['current_protection']=={'stop':102.,'target':94.}
+    assert changed['target_extensions']==1 and len(private.modifies)==1
+
+
+def test_runner2_target_requires_explicit_market_stop_evidence(tmp_path):
+    executor,private,_,row=prepared(tmp_path)
+    row=runner2_owned(executor,row)
+    private.stops[0].pop('stopLossType')
+    with pytest.raises(LiveExecutionError,match='management_protection_id_missing'):
+        manage(executor,row,decision('move_target'))
+    assert not private.modifies
+
+
+@pytest.mark.parametrize(('field','wrong'),[('id',34),('vol',999.),('stopLossPrice',97.)])
+def test_runner2_target_timeout_requires_exact_pair_stop_and_coverage(tmp_path,field,wrong):
+    executor,private,store,row=prepared(tmp_path)
+    row=runner2_owned(executor,row)
+    modify=private.modify_protection
+    original=private.stops[0][field]
+    def wrong_readback(**kw):
+        modify(**kw)
+        private.stops[0][field]=wrong
+        raise TimeoutError()
+    private.modify_protection=wrong_readback
+    changed=manage(executor,row,decision('move_target'))
+    assert changed['status']=='management_pending' and store.get('live:halt')
+    assert not changed.get('target_extensions')
+    assert executor.reconcile(row['intent_id'])['status']=='management_pending'
+    assert len(private.modifies)==1 and not private.cancels
+    private.stops[0][field]=original
+    changed=executor.reconcile(row['intent_id'])
+    assert changed['status']=='protected' and changed['target_extensions']==1
+    assert not store.get('live:halt')
 
 
 def test_stop_modified_in_place_and_reconciles_after_restart_without_changing_original_plan(tmp_path):
@@ -201,16 +296,7 @@ def test_native_exit_racing_unknown_stop_is_historical_close_not_repeat_write(tm
 
 
 def test_short_stop_tightens_downward_and_remains_protected(tmp_path):
-    from trading.models.domain import Side
-    from .test_live_execution import proposal
-    executor,_,_=setup(tmp_path)
-    private=ManagementClient();executor.private=private;executor.public=ManagementPublic()
-    submit=private.submit_market
-    def short_submit(**kw):
-        result=submit(**kw);private.positions[0]['liquidatePrice']=120.;return result
-    private.submit_market=short_submit
-    row=approve(executor,proposal(side=Side.SHORT,stop_loss={'price':102.},take_profit_price=96.))
-    row=executor.execute(row['intent_id']);assert row['status']=='protected'
+    executor,_,_,row=prepared(tmp_path,short=True)
     changed=manage(executor,row,decision(stop_price=101.))
     assert changed['current_protection']['stop']==101.
     assert executor.reconcile(row['intent_id'])['status']=='protected'

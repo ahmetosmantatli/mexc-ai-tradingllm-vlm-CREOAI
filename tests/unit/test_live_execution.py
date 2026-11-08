@@ -109,6 +109,85 @@ def approve(executor,p=None):
     return executor.approve(intent['intent_id'],intent['proposal_fingerprint'],'7',allow_emergency_close=True)
 
 
+def ioc_case(tmp_path, *, fraction=1., terminal=3, timeout=False, fill_price=100., attached=True):
+    executor,private,store=setup(tmp_path)
+    executor.public.get_ticker=lambda symbol: SimpleNamespace(
+        bid1=99.99,ask1=100.,raw={'timestamp':time()*1000,'fairPrice':100.})
+    intent=approve(executor,proposal(metadata={'runner_id':'runner2'}))
+    private.fill_fraction=fraction
+    calls=[]
+
+    def submit_ioc(*,limit_price,**kwargs):
+        staged=executor.state(intent['intent_id'])
+        assert staged['entry_submitted_type']==3 and staged['entry_limit_price']==100.
+        assert staged['entry_write_attempted'] is True
+        calls.append(limit_price)
+        private.submit_market(entry_price=limit_price,**kwargs)
+        private.order_row.update(orderType=3,state=terminal,dealAvgPrice=fill_price)
+        if fraction and attached:
+            private.stops=[dict(positionId=11,positionType=1,orderId=22,errorCode=0,state=1,isFinished=0,
+                lossTrend=2,profitTrend=2,stopLossType=0,takeProfitType=0,stopLossReverse=2,takeProfitReverse=2,
+                profitLossVolType='SAME',vol=kwargs['contracts']*fraction,
+                stopLossPrice=kwargs['stop_loss'],takeProfitPrice=kwargs['take_profit'])]
+        if not fraction:
+            private.positions=[]
+        if timeout:
+            raise SimpleError(ambiguous=True)
+
+    private.submit_ioc=submit_ioc
+    return executor,private,store,intent,calls
+
+
+@pytest.mark.parametrize('fraction,terminal',[(1.,3),(.5,4)])
+def test_runner2_ioc_requires_exact_protection_for_confirmed_filled_size(tmp_path,fraction,terminal):
+    executor,private,store,intent,calls=ioc_case(tmp_path,fraction=fraction,terminal=terminal)
+    row=executor.execute(intent['intent_id'])
+    assert row['status']=='protected'
+    assert row['effective_contracts']==row['contracts']*fraction
+    assert private.stops[0]['vol']==row['effective_contracts']
+    assert row['entry_exchange_type']==3
+    assert calls==[100.] and not private.cancels and not private.protects and not store.get('live:halt')
+
+
+def test_runner2_ioc_timeout_reconciles_zero_fill_and_releases_halt(tmp_path):
+    executor,private,store,intent,calls=ioc_case(tmp_path,fraction=0.,terminal=4,timeout=True)
+    assert executor.execute(intent['intent_id'])['status']=='entry_write_unknown'
+    assert store.get('live:halt')
+    row=executor.reconcile(intent['intent_id'])
+    assert row['status']=='entry_rejected' and row['entry_rejection']['code']=='EXCHANGE_ORDER_UNFILLED'
+    assert calls==[100.] and not private.cancels and not store.get('live:halt')
+
+
+def test_runner2_ioc_waits_for_exchange_remainder_and_emergency_closes_broken_limit(tmp_path):
+    executor,private,store,intent,calls=ioc_case(tmp_path,fraction=.5,terminal=2,fill_price=100.01)
+    row=executor.execute(intent['intent_id'])
+    assert row['halt_reason']=='ioc_remainder_not_reconciled'
+    assert not private.cancels and not private.closes
+    private.order_row['state']=4
+    row=executor.reconcile(intent['intent_id'])
+    assert row['close_reason']=='EMERGENCY'
+    assert row['halt_reason']=='ioc_fill_outside_entry_plan'
+    assert calls==[100.] and not private.cancels and len(private.closes)==1
+
+
+def test_runner2_ioc_refuses_to_post_if_the_quote_cannot_meet_budget(tmp_path):
+    executor,private,store=setup(tmp_path)
+    executor.public.get_ticker=lambda symbol: SimpleNamespace(
+        bid1=99.99,ask1=100.,raw={'timestamp':time()*1000,'fairPrice':100.})
+    intent=approve(executor,proposal(metadata={'runner_id':'runner2'},max_loss_if_stopped=1.))
+    private.submit_ioc=lambda **kwargs:pytest.fail('IOC must not be sent')
+    with pytest.raises(LiveExecutionError,match='ioc_limit_not_executable'):
+        executor.execute(intent['intent_id'])
+    assert not executor.state(intent['intent_id'])['entry_write_attempted']
+
+
+def test_runner2_ioc_missing_attachment_closes_without_duplicating_protection(tmp_path):
+    executor,private,store,intent,calls=ioc_case(tmp_path,attached=False)
+    row=executor.execute(intent['intent_id'])
+    assert row['close_reason']=='EMERGENCY'
+    assert len(private.closes)==1 and not private.protects and calls==[100.]
+
+
 def test_definite_entry_rejection_preserves_safe_exchange_diagnostics(tmp_path):
     from trading.exchange.mexc_private import MexcPrivateError
     executor,private,store=setup(tmp_path)
@@ -346,6 +425,8 @@ def test_actual_filled_liquidation_risk_can_trigger_one_reduce_close(tmp_path):
     result=executor.reconcile(intent['intent_id'])
     assert result['status']=='close_write_unknown'
     assert len(private.submits)==1 and len(private.closes)==1
+    assert result['fill_risk_check']['liquidation_price']==97.5
+    assert result['fill_risk_check']['stop_buffer']<result['fill_risk_check']['min_stop_buffer']
 
 
 def test_real_private_client_contract_end_to_end_uses_no_network(tmp_path):

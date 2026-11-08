@@ -149,13 +149,22 @@ def test_live_aggressive_daily_limit_override_reaches_entry_and_executor(tmp_pat
 
 
 @pytest.mark.parametrize('independent_watch',[False,True])
-def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_path,monkeypatch,independent_watch):
+@pytest.mark.parametrize('runner_id',['baseline-v1','runner2'])
+def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_path,monkeypatch,independent_watch,runner_id):
     cfg=Settings(_env_file=None,broker_mode='live',live_trading_enabled=True,live_automatic_enabled=True,
         live_price_plan_enabled=True,live_allowed_accounts=('ahmet',),risk_profile='balanced',risk_per_trade_pct=.01,
         default_target_leverage=5,kill_switch_path=str(tmp_path/'kill'),analysis_chart_dir=str(tmp_path/'charts'))
     store=RuntimeStore(str(tmp_path/'live'));private,public=Client(),QuotePublic()
     control=dict(enabled=True,stopped=False,updated_at=1,version='text',risk_profile='balanced',risk_per_trade_pct=.01,
-        max_leverage=5,max_positions=2,allocation_mode='full')
+        max_leverage=5,max_positions=2,allocation_mode='full',runner_id=runner_id)
+    def submit_ioc(*,limit_price,**kwargs):
+        private.submit_market(entry_price=limit_price,**kwargs)
+        private.order_row['orderType']=3
+        private.stops=[dict(positionId=11,positionType=1,orderId=22,errorCode=0,state=1,isFinished=0,
+            lossTrend=2,profitTrend=2,stopLossType=0,takeProfitType=0,stopLossReverse=2,takeProfitReverse=2,
+            profitLossVolType='SAME',vol=kwargs['contracts'],
+            stopLossPrice=kwargs['stop_loss'],takeProfitPrice=kwargs['take_profit'])]
+    private.submit_ioc=submit_ioc
     stamp=int(time())-1000
     rows=[[stamp-900,100,102,99,100,10],[stamp,100,104,99.5,101,12]]
     selected=dict(entry_type='market',entry_price=100.,stop_loss_price=99.4,take_profit_price=103.9,entry_timeframe='15m',
@@ -194,6 +203,8 @@ def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_p
     assert intent['proposal']['stop_loss']['price']==99.4
     assert intent['proposal']['take_profit_price']==103.9
     assert intent['proposal']['metadata']['price_source']=='model'
+    assert intent['proposal']['metadata']['runner_id']==runner_id
+    assert intent['entry_submitted_type']==(3 if runner_id=='runner2' else 5)
     assert private.stops[0]['stopLossPrice']==99.4 and private.stops[0]['takeProfitPrice']==103.9
     assert len(private.submits)==1 and store.get('paper') is None
 

@@ -63,6 +63,18 @@ def test_lit_short_preserves_protection_and_positive_market_reference():
     assert body['stopLossPrice']==3.2784 and body['takeProfitPrice']==3.2459
 
 
+@pytest.mark.parametrize('side,stop,target,side_code', [('long',98.,104.,1), ('short',102.,96.,3)])
+def test_ioc_uses_documented_type_limit_and_attached_protection(side,stop,target,side_code):
+    client,requests=setup(writes_enabled=True)
+    client.submit_ioc(symbol='BTC_USDT',side=side,contracts=2.,leverage=3,
+        external_id='runner2-intent',stop_loss=stop,take_profit=target,limit_price=100.)
+    assert len(requests)==1
+    assert requests[0].url.path=='/api/v1/private/order/create'
+    body=json.loads(requests[0].content)
+    assert (body['type'],body['price'],body['side'],body['openType'])==(3,100.,side_code,1)
+    assert (body['stopLossPrice'],body['takeProfitPrice'],body['lossTrend'],body['profitTrend'])==(stop,target,2,2)
+
+
 def test_writes_disabled_by_default_and_callback_rechecked_no_http():
     client,requests=setup()
     with pytest.raises(MexcPrivateError,match='writes_disabled'):

@@ -234,9 +234,44 @@ def test_invalid_schema_free_result_does_not_count_as_success(tmp_path):
         if payload['action']!='hold':raise ValueError('bad decision')
     p.response_validator=valid
     assert p.complete_json(system='s',user='u') is None
-    assert len(calls)==2 and p.successful_calls==0
+    assert len(calls)==1 and p.successful_calls==0
     assert store.get('ai_request_stats')['groq']['successes']==0
-    assert len(p.last_trace['attempts'])==2
+    assert len(p.last_trace['attempts'])==1
+
+
+def test_invalid_output_tries_a_different_model_with_same_context(tmp_path):
+    requests=[]
+    def transport(request):
+        requests.append(json.loads(request.content))
+        return response('invalid') if len(requests)==1 else response()
+    p,_=pool(tmp_path,settings(groq_api_key_2='other-groq-key',groq_quota_group_2='second',
+        gemini_api_key='other-provider'),transport)
+    def validate(payload):
+        if payload['action']!='hold':
+            raise ValueError('bad decision')
+    p.response_validator=validate
+    assert p.complete_json(system='instructions',user='same evidence')=={'action':'hold'}
+    assert len(requests)==2
+    assert requests[0]['model']!=requests[1]['model']
+    assert requests[0]['messages']==requests[1]['messages']
+
+
+@pytest.mark.parametrize('paid_enabled',[False, True])
+def test_generation_cap_reserves_a_paid_slot_only_when_enabled(tmp_path, paid_enabled):
+    calls=[]
+    p,_=pool(tmp_path,settings(groq_api_key_2='another-groq-key',groq_quota_group_2='second',
+        gemini_api_key='gemini',anthropic_api_key='paid',ai_claude_fallback_enabled=paid_enabled,
+        ai_pool_max_generation_requests=2),
+        lambda request:(calls.append(request) or httpx.Response(500,json={'error':{'message':'down'}})))
+    def paid(**kwargs):
+        p.claude.last_status='success'
+        p.claude.last_attempt=dict(provider='anthropic',status='success',generation_requests=1,count_requests=1)
+        return {'action':'hold'}
+    p.claude.complete_json=paid
+    result=p.complete_json(system='s',user='u')
+    assert result==({'action':'hold'} if paid_enabled else None)
+    assert len(calls)==(1 if paid_enabled else 2)
+    assert sum(a['generation_requests'] for a in p.last_trace['attempts'])==2
 
 
 def test_busy_free_group_waits_briefly_before_paid_fallback(tmp_path):

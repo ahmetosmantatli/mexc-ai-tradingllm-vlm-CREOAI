@@ -63,6 +63,22 @@ def test_live_startup_requires_every_explicit_gate(tmp_path,change):
     with pytest.raises(ValueError): fleet(tmp_path,**change)
 
 
+def test_runner2_start_requires_opt_in_and_exchange_adapter(tmp_path):
+    f=fleet(tmp_path,live_runner2_enabled=True,live_price_plan_enabled=True,live_position_management_enabled=True)
+    try:
+        f.controller.set_control('a',enabled=True,stopped=False,capital_chosen=True,capital_mode='account',
+                                 version_chosen=True,profile_chosen=True,runner_id='runner2')
+        assert not f.entry_control('a')['enabled']
+        assert f.publish(f.accounts[0])['available_runner_ids']==('baseline-v1',)
+        f.runners['a'].executor=SimpleNamespace(private=SimpleNamespace(submit_ioc=lambda **kw:None))
+        assert f.entry_control('a')['enabled']
+        assert f.publish(f.accounts[0])['available_runner_ids']==('baseline-v1','runner2')
+        f.cfg.live_runner2_enabled=False
+        assert not f.entry_control('a')['enabled']
+    finally:
+        f.stop()
+
+
 def test_first_live_boot_does_not_reuse_running_paper_control(tmp_path):
     store=RuntimeStore(str(tmp_path/'control.sqlite3'))
     store.put('account:a:control',dict(enabled=True,capital_mode='demo',capital_chosen=True))
@@ -164,9 +180,17 @@ def test_native_events_distinguish_pending_from_open_and_use_actual_net(tmp_path
         f._publish_intent('a',row)
         assert 'sonucu belirsiz' in f.controller.messages[-1][0][1]
         assert 'İşlem açıldı' not in f.controller.messages[-1][0][1]
+        row.update(status='protected',entry_metrics=dict(filled_notional_usdt=50,
+            estimated_initial_margin_usdt=5,initial_stop_risk_usdt=4,
+            estimated_target_net_usdt=8,estimated_target_r=2))
+        f._publish_intent('a',row)
+        opened=f.controller.messages[-1][0][1]
+        assert 'Tahmini başlangıç teminatı: 5.0000 USDT' in opened
+        assert '+2.00R' in opened
         row.update(status='closed',net_pnl=12.3,realized_complete=True)
         f._publish_intent('a',row)
         assert '+12.3000 USDT' in f.controller.messages[-1][0][1]
+        assert '+3.08R' in f.controller.messages[-1][0][1]
         assert f.controller.messages[-1][1]['event_id']=='live:generation:intent:closed'
     finally: f.stop()
 

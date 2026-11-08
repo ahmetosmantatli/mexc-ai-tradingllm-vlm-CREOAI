@@ -85,12 +85,24 @@ class LiveFleet:
                     self.vault.put(ident,account.mexc_api_key,account.mexc_api_secret)
                 self._create_runner(account)
 
+    def available_runner_ids(self, ident):
+        executor=getattr(self.runners.get(ident),'executor',None)
+        adapter=getattr(executor,'private',None)
+        if (ident in self.allowed and self.cfg.live_runner2_enabled
+                and self.cfg.live_price_plan_enabled and self.cfg.live_position_management_enabled
+                and callable(getattr(adapter,'submit_ioc',None))):
+            return ('baseline-v1','runner2')
+        return ('baseline-v1',)
+
     def entry_control(self, ident):
         control=dict(self.controller.control(ident))
+        control.setdefault('runner_id','baseline-v1')
         control['enabled']=bool(ident in self.allowed and control.get('enabled')
             and not control.get('stopped') and control.get('capital_chosen')
             and not control.get('capital_pending') and control.get('capital_mode')=='account'
             and control.get('version_chosen') and control.get('profile_chosen')
+            and not control.get('runner_selection_pending')
+            and control['runner_id'] in self.available_runner_ids(ident)
             and self.control_store.get(f'account:{ident}:linked',False)
             and not self.control_store.get(f'account:{ident}:disconnected',False)
             and not self.closed)
@@ -284,6 +296,7 @@ class LiveFleet:
         snapshot['price_planning_enabled']=self.cfg.live_price_plan_enabled
         snapshot['position_management_enabled']=self.cfg.live_position_management_enabled
         snapshot['control']=self.controller.control(ident)
+        snapshot['available_runner_ids']=self.available_runner_ids(ident)
         snapshot['version']=snapshot['control'].get('version','text')
         snapshot['ai_budget']=self.budget_store.get('ai_budget',{})
         snapshot['ai_request_stats']=self.budget_store.get('ai_request_stats',{})
@@ -326,9 +339,11 @@ class LiveFleet:
         proposal=row.get('proposal') or {}
         metadata=proposal.get('metadata') or {}
         text=f"CANLI | {ident} | {proposal.get('symbol','?')}\n{labels[state]}\n"
+        if metadata.get('runner_id')=='runner2':
+            text+='Runner: 2 · Fiyat sınırlı IOC\n'
         if state=='entry_rejected':
             rejection=row.get('entry_rejection') or {}
-            stages={'submit_market':'Emir gönderimi','order_reconciliation':'Emir sonucu kontrolü'}
+            stages={'submit_market':'Emir gönderimi','submit_ioc':'Fiyat sınırlı IOC emir gönderimi','order_reconciliation':'Emir sonucu kontrolü'}
             text+='Ret aşaması: '+stages.get(rejection.get('stage'),'Eski kayıtta belirtilmemiş')+'\n'
             for label,key in [('MEXC hata kodu','exchange_code'),('HTTP','http_status'),('Borsa emir durumu','order_state')]:
                 value=rejection.get(key)
@@ -338,6 +353,18 @@ class LiveFleet:
             stop=proposal.get('stop_loss') or {}
             text+=(f"Yön: {proposal.get('side','?')} | Kaldıraç: {proposal.get('leverage','?')}x\n"
                 f"Gerçekleşen giriş: {row.get('entry_fill_price','doğrulanmadı')} | SL: {stop.get('price','?')} | TP: {proposal.get('take_profit_price','?')}\n")
+            metrics=row.get('entry_metrics') or {}
+            if metrics:
+                text+=(f"Dolan pozisyon: {metrics['filled_notional_usdt']:.4f} USDT | "
+                       f"Tahmini başlangıç teminatı: {metrics['estimated_initial_margin_usdt']:.4f} USDT\n"
+                       f"İlk stop riski (tahmini): {metrics['initial_stop_risk_usdt']:.4f} USDT\n")
+                target_r=metrics.get('estimated_target_r')
+                if target_r is not None:
+                    text+=(f"TP net tahmini: {metrics['estimated_target_net_usdt']:+.4f} USDT "
+                           f"({target_r:+.2f}R, ücret ve kayma varsayımıyla)\n")
+            entry_timeframe=(metadata.get('price_plan') or {}).get('entry_timeframe')
+            if entry_timeframe in ('5m','15m','4h'):
+                text+=f"Giriş zaman dilimi: {entry_timeframe}\n"
             source='AI mum/yapı referanslı planı' if metadata.get('price_source')=='model' else 'algoritma seviyeleri'
             text+=f'Giriş/SL/TP kaynağı: {source}\n'
             if metadata.get('price_plan'):
@@ -353,6 +380,9 @@ class LiveFleet:
                 text+='Acil kapanış sonrası yeni giriş engeli kaldırılmaz; teknik inceleme gerekir.\n'
             if row.get('realized_complete') is True and isinstance(row.get('net_pnl'),(int,float)):
                 text+=f"MEXC net sonuç: {row['net_pnl']:+.4f} USDT\n"
+                initial_risk=(row.get('entry_metrics') or {}).get('initial_stop_risk_usdt')
+                if isinstance(initial_risk,(int,float)) and initial_risk>0:
+                    text+=f"Gerçekleşen sonuç: {row['net_pnl']/initial_risk:+.2f}R (ilk dolum riskine göre)\n"
             else:
                 text+='Net sonuç henüz doğrulanmadı.\n'
         snapshot=self.control_store.get(f'account:{ident}:status',{})
@@ -376,11 +406,12 @@ class LiveFleet:
     def _publish_management(self,ident,row):
         proposal=row.get('proposal',{})
         for event in row.get('management_events',[]):
-            labels={'move_stop':'AI stop değişikliği','reduce':'AI kısmi kapatma','close':'AI kapatma'}
+            labels={'move_stop':'AI stop değişikliği','move_target':'AI hedef değişikliği','reduce':'AI kısmi kapatma','close':'AI kapatma'}
             confirmed=event.get('status')=='confirmed'
             text=(f"CANLI | {proposal.get('symbol','?')} | {labels.get(event['action'],event['action'])}\n"
                 +('Borsa sonucu doğrulandı.\n' if confirmed else 'Yönetim sırasında pozisyon borsada kapandı; değişiklik uygulanmış sayılmadı.\n' if event.get('status')=='position_closed' else 'Pozisyon koruması doğrulanamadı; acil kapatma sonucu uzlaştırılıyor.\n' if event.get('status')=='protection_failed' else 'İstek reddedildi; değişiklik doğrulanmadı.\n'))
             if event['action']=='move_stop':text+=f"SL: {event['old_stop']} → {event.get('new_stop','doğrulanmadı')} | TP: {event['target']}\n"
+            elif event['action']=='move_target':text+=f"TP: {event['old_target']} → {event.get('new_target','doğrulanmadı')} | SL: {event['old_stop']}\n"
             else:
                 text+=f"Kapanan kontrat: {event.get('filled_contracts','doğrulanmadı')} | Kalan: {event.get('remaining_contracts','doğrulanmadı')}\n"
                 if event['action']=='reduce' and confirmed:text+='Kısmi kapanışın ayrı net kârı henüz hesaplanmadı; kasa borsadan okunur.\n'

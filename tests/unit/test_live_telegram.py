@@ -74,3 +74,48 @@ def test_native_close_button_does_not_require_missing_exchange_create_time(tmp_p
     assert targets[0]['intent_id']=='intent' and targets[0]['position_id']=='42'
     ctl.position_buttons('a')
     assert calls[-1]['reply_markup']['inline_keyboard'][0][0]['text']=='Kapat: BTC_USDT'
+
+
+def test_runner2_selection_requires_settings_and_fresh_start(tmp_path):
+    ctl,calls=setup(tmp_path,{'a':{'available_runner_ids':['baseline-v1','runner2']}})
+    ready(ctl)
+    ctl._command('a','start')
+    assert ctl.control('a')['enabled'] is True
+    assert 'Runner 1' in ctl.status_text('a')
+    ctl._command('a','runner:runner2')  # Stale selection buttons cannot change a running account.
+    assert ctl.control('a')['enabled'] is True
+    assert 'runner_id' not in ctl.control('a')
+
+    ctl._command('a','settings')
+    assert ctl.control('a')['enabled'] is False
+    buttons=calls[-1]['reply_markup']['inline_keyboard'][0]
+    assert [item['callback_data'] for item in buttons]==['control:runner:baseline-v1','control:runner:runner2']
+    ctl._command('a','text')  # An older analysis-mode button cannot skip the choice.
+    assert ctl.control('a')['version_chosen'] is False
+
+    ctl._command('a','runner:runner2')
+    assert ctl.control('a')['runner_id']=='runner2'
+    assert 'runner_id' not in ctl.control('b')
+    ctl._command('a','start')
+    assert ctl.control('a')['enabled'] is False
+    ctl._command('a','text')
+    ctl._command('a','trader_aggressive')
+    ctl._command('a','start')
+    assert ctl.control('a')['enabled'] is True
+    assert 'Runner 2' in ctl.status_text('a')
+
+
+def test_unavailable_runner2_blocks_start_and_offers_baseline_recovery(tmp_path):
+    ctl,calls=setup(tmp_path)
+    ready(ctl)
+    ctl.set_control('a',runner_id='runner2')
+    ctl._command('a','start')
+    assert ctl.control('a')['enabled'] is False
+    assert 'kullanılamıyor' in calls[-1]['text']
+    buttons=calls[-1]['reply_markup']['inline_keyboard'][0]
+    assert [item['callback_data'] for item in buttons]==['control:runner:baseline-v1']
+    ctl._command('a','runner:runner2')
+    assert ctl.control('a')['enabled'] is False
+    ctl._command('a','runner:baseline-v1')
+    assert ctl.control('a')['runner_id']=='baseline-v1'
+    assert ctl.control('a')['enabled'] is False

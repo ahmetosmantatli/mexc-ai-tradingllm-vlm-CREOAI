@@ -39,6 +39,41 @@ class PositionManagementMixin:
             return True
         except Exception:return False
 
+    def _target_pair_id(self,row,position):
+        """Verify one explicitly typed native pair and return its identity."""
+        if str(position.get('positionId'))!=row['position_id']:
+            return None
+        stop,target=self.protection_levels(row)
+        matches=[]
+        for page in range(1,11):
+            rows=self.private.protection_orders(row['proposal']['symbol'],page_num=page,page_size=100)
+            if not isinstance(rows,list):return None
+            matches.extend(item for item in rows if isinstance(item,dict)
+                           and str(item.get('positionId'))==row['position_id'])
+            if len(rows)<100:break
+        else:
+            return None
+        if len(matches)!=1:return None
+        pair=matches[0];ident=str(pair.get('id') or pair.get('stopPlanOrderId'))
+        if not ident.isascii() or not ident.isdecimal() or ident.startswith('0') or len(ident)>26:
+            return None
+        if (pair.get('state')!=1 or pair.get('isFinished')!=0
+                or pair.get('errorCode')!=0 or pair.get('positionType')!=position.get('positionType')
+                or pair.get('lossTrend')!=2 or pair.get('profitTrend')!=2
+                or type(pair.get('stopLossType')) is not int or pair['stopLossType']!=0
+                or type(pair.get('takeProfitType')) is not int or pair['takeProfitType']!=0
+                or pair.get('stopLossReverse')!=2 or pair.get('takeProfitReverse')!=2
+                or self._number(pair.get('stopLossPrice'))!=stop
+                or self._number(pair.get('takeProfitPrice'))!=target):
+            return None
+        remaining=self.remaining_contracts(row)
+        if pair.get('profitLossVolType')=='SAME' and self._number(pair.get('vol'))==remaining:
+            return int(ident)
+        if (pair.get('profitLossVolType')=='SEPARATE' and self._number(pair.get('stopLossVol'))==remaining
+                and self._number(pair.get('takeProfitVol'))==remaining):
+            return int(ident)
+        return None
+
     def manage_position(self,intent_id,decision,*,expected_revision,decision_id,guard):
         """Caller validates typed AI output. Revalidate ownership/size/price here."""
         self._management_authorized(guard)
@@ -51,12 +86,23 @@ class PositionManagementMixin:
                 self._management_error('management_position_busy')
             if any(event['decision_id']==decision_id for event in row.get('management_events',[])):
                 return row
+            action=decision['action']
+            if action=='move_target':
+                if (row['proposal'].get('metadata') or {}).get('runner_id')!='runner2':
+                    self._management_error('management_target_runner2_required')
+                if row.get('target_extensions',0)>=1:
+                    self._management_error('management_target_extension_limit')
             order=self.private.order_by_external_id(row['proposal']['symbol'],row['external_id'])
             position=self._position(row,order)
-            if position is None or self._protected(row,position) is not True:
+            if position is None or (action!='move_target' and self._protected(row,position) is not True):
                 self._management_error('management_owned_protection_required')
+            target_pair_id=None
+            if action=='move_target':
+                target_pair_id=self._target_pair_id(row,position)
+                if target_pair_id is None:self._management_error('management_protection_id_missing')
             ticker=self.public.get_ticker(row['proposal']['symbol'])
-            age=time()-self._number(ticker.raw.get('timestamp'))/1000
+            quote_at=self._number(ticker.raw.get('timestamp'))/1000
+            age=time()-quote_at
             bid,ask=self._number(ticker.bid1),self._number(ticker.ask1)
             if not -5<=age<=self.max_age or bid<=0 or ask<bid:self._management_error('management_fresh_quote_required')
             stop,target=self.protection_levels(row)
@@ -65,14 +111,14 @@ class PositionManagementMixin:
             if fair<=0 or not (stop<min(bid,fair) and target>max(ask,fair) if long else target<min(bid,fair) and stop>max(ask,fair)):
                 self._management_error('management_protection_already_triggerable')
             rules=self.public.get_contract_rules(row['proposal']['symbol'])
-            action=decision['action']
             pending=dict(decision_id=decision_id,action=action,reason=decision['reason'],ai=decision.get('ai',{}),
                 at=time(),before_contracts=self.remaining_contracts(row),old_stop=stop,target=target,
                 external_id='mg-'+uuid4().hex[:24],write_attempted=True)
-            if action=='move_stop':
-                new=self._number(decision['stop_price'])
+            if action in ('move_stop','move_target'):
+                new=self._number(decision['stop_price' if action=='move_stop' else 'target_price'])
                 units=Decimal(str(new))/Decimal(str(rules.price_step))
                 if abs(units-units.to_integral_value())>Decimal('.000001'):self._management_error('management_tick_mismatch')
+            if action=='move_stop':
                 if not (stop<new<min(bid,fair) if long else stop>new>max(ask,fair)):
                     self._management_error('management_stop_must_tighten')
                 liquidation=self._number(position.get('liquidatePrice'))
@@ -85,6 +131,10 @@ class PositionManagementMixin:
                 ident=matches[0].get('id') or matches[0].get('stopPlanOrderId')
                 if ident is None:self._management_error('management_protection_id_missing')
                 pending.update(stop=new,protection_id=ident)
+            elif action=='move_target':
+                if not (new>target if long else 0<new<target):
+                    self._management_error('management_target_must_extend')
+                pending.update(stop=stop,old_target=target,target=new,protection_id=target_pair_id)
             elif action in ('reduce','close'):
                 before=pending['before_contracts']
                 fraction=self._number(decision['close_fraction'])
@@ -101,13 +151,15 @@ class PositionManagementMixin:
             self._save(row) # Durable BEFORE the only POST, including permission revocation races.
             try:
                 self._management_authorized(guard)
+                if action=='move_target' and time()-quote_at>self.max_age:
+                    self._management_error('management_fresh_quote_required')
             except Exception:
                 row.pop('management_pending',None);row['status']='protected';self._save(row)
                 raise
             try:
-                if action=='move_stop':
+                if action in ('move_stop','move_target'):
                     self.private.modify_protection(protection_id=pending['protection_id'],stop_loss=pending['stop'],
-                        take_profit=target,request_id=pending['external_id'])
+                        take_profit=pending['target'],request_id=pending['external_id'])
                 else:
                     self.private.close_position(symbol=row['proposal']['symbol'],side=row['proposal']['side'],
                         contracts=pending['requested_contracts'],position_id=row['position_id'],
@@ -123,7 +175,7 @@ class PositionManagementMixin:
         event=dict(pending,status=status,confirmed_at=time(),**extra)
         row['management_events']=(row.get('management_events',[])+[event])[-50:]
         row['management_revision']=row.get('management_revision',0)+1
-        if status=='confirmed':
+        if status=='confirmed' and pending['action']!='move_target':
             stop,_=self.protection_levels(row)
             entry=row['entry_fill_price'];long=row['proposal']['side']=='long'
             worst=stop*(1-self.slip if long else 1+self.slip)
@@ -137,21 +189,34 @@ class PositionManagementMixin:
         pending=row['management_pending'];self._check_lease(token)
         try:
             positions=self.private.open_positions(row['proposal']['symbol'])
-            if pending['action']=='move_stop' and not any(str(p.get('positionId'))==row['position_id'] and self._number(p.get('holdVol'))>0 for p in positions):
+            action=pending['action']
+            price_change=action in ('move_stop','move_target')
+            if price_change and not any(str(p.get('positionId'))==row['position_id'] and self._number(p.get('holdVol'))>0 for p in positions):
                 closed=self._management_native_closed(row)
                 if closed:return closed
-            if pending['action']=='move_stop':
+            if price_change:
                 expected=copy.deepcopy(row)
                 expected['current_protection']=dict(stop=pending['stop'],target=pending['target'])
                 order=self.private.order_by_external_id(row['proposal']['symbol'],row['external_id'])
                 position=self._position(row,order)
-                if position is not None and self._protected(expected,position) is True:
+                if action=='move_target':
+                    confirmed=position is not None and self._target_pair_id(expected,position)==pending['protection_id']
+                else:
+                    confirmed=position is not None and self._protected(expected,position) is True
+                if confirmed:
                     row['current_protection']=expected['current_protection']
+                    if action=='move_target':
+                        row['target_extensions']=row.get('target_extensions',0)+1
+                        return self._management_complete(row,'confirmed',new_target=pending['target'])
                     return self._management_complete(row,'confirmed',new_stop=pending['stop'])
-                if position is not None and time()-pending['at']>=self.max_age and self._protected(row,position) is not True and row.get('allow_emergency_close'):
-                    row=self._management_complete(row,'protection_failed')
-                    self._halt(row,'management_stop_protection_failed')
-                    return self._close_once(row,position,token,'EMERGENCY')
+                if position is not None and time()-pending['at']>=self.max_age and row.get('allow_emergency_close'):
+                    old_verified=(self._target_pair_id(row,position)==pending['protection_id'] if action=='move_target'
+                                  else self._protected(row,position) is True)
+                    if not old_verified:
+                        row=self._management_complete(row,'protection_failed')
+                        self._halt(row,'management_target_protection_failed' if action=='move_target'
+                                   else 'management_stop_protection_failed')
+                        return self._close_once(row,position,token,'EMERGENCY')
             else:
                 close=self.private.order_by_external_id(row['proposal']['symbol'],pending['external_id'])
                 expected_side=4 if row['proposal']['side']=='long' else 2

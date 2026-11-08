@@ -7,6 +7,7 @@ blindly retried. Native protection must be read back before an exposure is
 reported protected. This module does not guarantee exchange execution or PnL.
 """
 from dataclasses import dataclass
+from decimal import Decimal
 import copy
 import hashlib
 import json
@@ -18,6 +19,7 @@ from trading.brokers.live.management import PositionManagementMixin
 from trading.models.domain import TradeProposal
 from trading.risk.engine import RiskContext
 from trading.runtime.live_account import LiveAccountReconciler,LiveAccountError,observe_risk_reference
+from trading.runtime.runner2_entry import ioc_price_limit
 
 
 class LiveExecutionError(RuntimeError):
@@ -172,6 +174,25 @@ class ApprovedLiveExecutor(PositionManagementMixin):
         if sl is None or tp is None or not (sl<entry<tp if proposal.side.value=='long' else tp<entry<sl):
             raise LiveExecutionError('native_stop_and_target_required')
         contracts,notional=rules.size_order(proposal.notional,entry,proposal.leverage)
+        ioc=proposal.metadata.get('runner_id')=='runner2'
+        if ioc:
+            if not callable(getattr(self.private,'submit_ioc',None)):
+                raise LiveExecutionError('ioc_adapter_unavailable')
+            long=proposal.side.value=='long'
+            fair=self._number(ticker.raw.get('fairPrice'))
+            quote=Decimal(str(entry))
+            try:
+                limit=ioc_price_limit(side=proposal.side.value,stop=sl,target=tp,
+                    contracts=contracts,contract_size=rules.size,price_step=rules.price_step,
+                    loss_budget=proposal.max_loss_if_stopped,fee_rate=self.fee,exit_slippage_bps=self.slip*10000)
+                executable=quote%Decimal(str(rules.price_step))==0 and (quote<=limit if long else quote>=limit)
+            except (ValueError,ArithmeticError):
+                raise LiveExecutionError('ioc_limit_not_executable') from None
+            if not executable or not (sl<fair<tp if long else tp<fair<sl):
+                raise LiveExecutionError('ioc_limit_not_executable')
+            # The fresh quote is the tightest marketable price. A moved book
+            # can lead to a partial fill or cancellation.
+            row['entry_limit_price']=entry
         managed=self._managed()
         managed_positions=[r['position_id'] for r in managed if r.get('position_id')]
         managed_orders=[r['exchange_order_id'] for r in managed if r.get('exchange_order_id')]
@@ -181,7 +202,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
         if not readiness.ready:raise LiveExecutionError('private_preflight_rejected',reason_codes=readiness.reasons)
         available=readiness.available
         if abs(notional-proposal.notional)>max(1e-8,entry*rules.size*rules.step):raise LiveExecutionError('approved_notional_changed')
-        worst_entry=entry*(1+self.slip if proposal.side.value=='long' else 1-self.slip)
+        worst_entry=entry if ioc else entry*(1+self.slip if proposal.side.value=='long' else 1-self.slip)
         worst_stop=sl*(1-self.slip if proposal.side.value=='long' else 1+self.slip)
         quantity=contracts*rules.size
         planned_loss=abs(worst_entry-worst_stop)*quantity+self.fee*quantity*(worst_entry+worst_stop)
@@ -244,18 +265,22 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             if not self._authorized(row):raise LiveExecutionError('entry_authorization_changed')
             self._check_lease(token)
             if row['expires_at']<=time():raise LiveExecutionError('approval_expired_during_preflight')
+            ioc='entry_limit_price' in row
+            operation='submit_ioc' if ioc else 'submit_market'
             row.update(status='entry_write_unknown',entry_write_attempted=True,contracts=contracts,position_mode=mode,
-                entry_protection_schema='mexc_create_market_attached_v1',entry_submitted_type=5)
+                entry_protection_schema='mexc_create_ioc_attached_v1' if ioc else 'mexc_create_market_attached_v1',
+                entry_submitted_type=3 if ioc else 5)
             self._save(row) # Durable before POST; crash requires read-only reconciliation.
             try:
-                self.private.submit_market(symbol=proposal.symbol,side=proposal.side.value,contracts=contracts,
+                price={'limit_price':row['entry_limit_price']} if ioc else {'entry_price':proposal.entry_price}
+                getattr(self.private,operation)(symbol=proposal.symbol,side=proposal.side.value,contracts=contracts,
                     leverage=int(proposal.leverage),external_id=row['external_id'],stop_loss=proposal.stop_loss.price,
-                    take_profit=proposal.take_profit_price,entry_price=proposal.entry_price,position_mode=mode)
+                    take_profit=proposal.take_profit_price,position_mode=mode,**price)
             except Exception as exc:
                 if getattr(exc,'ambiguous',True) is False:
                     from trading.runtime.execution_diagnostics import safe_execution_error
                     row.update(status='entry_rejected',entry_rejection={
-                        **safe_execution_error(exc),'stage':'submit_market'})
+                        **safe_execution_error(exc),'stage':operation})
                     return self._save(row)
                 self._halt(row,'entry_write_outcome_unknown')
                 return self.state(intent_id)
@@ -303,6 +328,11 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                 try:
                     if str(protection.get('positionId'))!=str(position['positionId']):
                         continue
+                    if row.get('entry_submitted_type')==3 and (
+                            str(protection.get('orderId'))!=row.get('exchange_order_id')
+                            or protection.get('positionType')!=(1 if row['proposal']['side']=='long' else 2)
+                            or protection.get('errorCode')!=0):
+                        return None
                     volumes=protection.get('profitLossVolType')
                     if volumes not in ('SAME','SEPARATE'):
                         return None
@@ -382,14 +412,21 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             if not isinstance(order,dict) or str(order.get('externalOid'))!=row['external_id']:
                 return self._halt(row,'entry_order_not_reconciled')
             expected_side=1 if row['proposal']['side']=='long' else 3
+            ioc=row.get('entry_submitted_type')==3
+            exchange_type=self._entry_order_type(order)
             if (order.get('symbol')!=row['proposal']['symbol'] or order.get('side')!=expected_side
                     or order.get('openType')!=1 or order.get('positionMode')!=row['position_mode']
+                    or (ioc and exchange_type!=3)
                     or self._number(order.get('vol'))!=row['contracts']):
                 return self._halt(row,'entry_order_identity_mismatch')
             filled=self._number(order.get('dealVol'))
             if filled<0 or filled>row['contracts']:
                 return self._halt(row,'invalid_entry_filled_volume')
             if 0<filled<row['contracts'] and order.get('state') in (1,2):
+                if ioc:
+                    # Wait for IOC's automatic cancellation rather than issuing
+                    # a second write while the entry's outcome is uncertain.
+                    return self._halt(row,'ioc_remainder_not_reconciled')
                 # Cancel remaining size once; a timeout is reconciled, not retried.
                 if not row.get('cancel_write_attempted'):
                     row.update(cancel_write_attempted=True,status='partial_entry_cancel_unknown')
@@ -404,12 +441,12 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                 row.update(status='entry_rejected',entry_rejection={
                     'code':'EXCHANGE_ORDER_UNFILLED','stage':'order_reconciliation',
                     'order_state':order['state']})
-                return self._save(row)
+                return self._resolved(row)
             if not (filled==row['contracts'] and order.get('state')==3 or 0<filled<row['contracts'] and order.get('state') in (4,5)):
                 return self._halt(row,'entry_fill_not_fully_confirmed')
             row.update(effective_contracts=filled,exchange_order_id=str(order['orderId']),
                 entry_fill_price=self._number(order.get('dealAvgPrice')),partial_fill=filled<row['contracts'],
-                entry_exchange_type=self._entry_order_type(order))
+                entry_exchange_type=exchange_type)
             position=self._position(row,order)
             if position is None:
                 closed=self._historical_close(row,order)
@@ -418,20 +455,48 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             row.update(position_id=str(position['positionId']),status='entry_filled_unprotected')
             self._save(row)
             fill_price=row['entry_fill_price']
+            if ioc:
+                stop,target=self.protection_levels(row)
+                limit=row['entry_limit_price']
+                long=row['proposal']['side']=='long'
+                if not (stop<fill_price<target and fill_price<=limit if long
+                        else target<fill_price<stop and fill_price>=limit):
+                    self._halt(row,'ioc_fill_outside_entry_plan')
+                    return self._close_once(row,position,token,'EMERGENCY')
             liquidation=self._number(position.get('liquidatePrice'))
             stop=self.protection_levels(row)[0]
             stop_buffer=(stop-liquidation)/fill_price if row['proposal']['side']=='long' else (liquidation-stop)/fill_price
             worst_stop=stop*(1-self.slip if row['proposal']['side']=='long' else 1+self.slip)
             qty=self.remaining_contracts(row)*row['contract_size']
             actual_risk=max(0,fill_price-worst_stop if row['proposal']['side']=='long' else worst_stop-fill_price)*qty+self.fee*qty*(fill_price+worst_stop)
+            if 'entry_metrics' not in row:
+                long=row['proposal']['side']=='long'
+                target=self.protection_levels(row)[1]
+                target_exit=target*(1-self.slip if long else 1+self.slip)
+                target_net=((target_exit-fill_price if long else fill_price-target_exit)
+                            -self.fee*(fill_price+target_exit))*qty
+                notional=fill_price*qty
+                row['entry_metrics']=dict(
+                    filled_notional_usdt=notional,
+                    estimated_initial_margin_usdt=notional/row['proposal']['leverage'],
+                    initial_stop_risk_usdt=actual_risk,
+                    estimated_target_net_usdt=target_net,
+                    estimated_target_r=target_net/actual_risk if actual_risk>0 else None,
+                )
             if liquidation<=0 or stop_buffer<self.liq_buffer or actual_risk>row['proposal']['max_loss_if_stopped']+1e-8:
+                row['fill_risk_check']=dict(
+                    stop_risk_usdt=actual_risk,loss_budget_usdt=row['proposal']['max_loss_if_stopped'],
+                    liquidation_price=liquidation,stop_buffer=stop_buffer,min_stop_buffer=self.liq_buffer,
+                )
                 self._halt(row,'filled_position_risk_exceeds_plan')
                 return self._close_once(row,position,token,'EMERGENCY')
             protection_state=self._protected(row,position)
             if protection_state is True:
                 row.update(status='protected')
                 return self._resolved(row)
-            if protection_state is None:
+            if ioc or protection_state is None:
+                # An absent IOC attachment may still be propagating. Do not
+                # submit a second stop/target pair for the same position.
                 return self._emergency_close(row,position,token)
             if not row.get('protection_write_attempted') and not row.get('emergency_close_attempted'):
                 self._gate(entry=False)

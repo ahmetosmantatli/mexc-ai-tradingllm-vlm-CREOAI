@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     live_price_plan_enabled: bool = False
     live_structure_setups_enabled: bool = False
     live_position_management_enabled: bool = False
+    live_runner2_enabled: bool = False
     live_management_min_interval_seconds: float = Field(default=60, ge=15, le=3600)
     live_leverage_mode: str = Field(default='profile',pattern='^(profile|exchange)$')
     live_max_leverage: int = Field(default=10,ge=1,le=25)
@@ -195,6 +196,7 @@ class Settings(BaseSettings):
     ai_dynamic_parallel_enabled: bool = True
     ai_pool_retry_seconds: float = Field(default=5,ge=0,le=10)
     ai_pool_max_retry_attempts: int = Field(default=1,ge=0,le=1)
+    ai_pool_max_generation_requests: int = Field(default=3,ge=1,le=8)
     groq_api_key_2: str = Field(default='',repr=False)
     gemini_api_key_2: str = Field(default='',repr=False)
     groq_quota_group: str = Field(default='groq-main',pattern='^[A-Za-z0-9_-]{1,64}$')

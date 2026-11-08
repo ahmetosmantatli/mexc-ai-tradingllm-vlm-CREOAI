@@ -5,6 +5,10 @@ from trading.control.telegram import TelegramController,TRADER_MODES
 from trading.agents.telemetry import human_reason
 
 
+BASELINE_RUNNER_ID = 'baseline-v1'
+RUNNER_LABELS = {BASELINE_RUNNER_ID: 'Runner 1', 'runner2': 'Runner 2'}
+
+
 def number(value, digits=4):
     if value is None:return 'doğrulanmadı'
     try:return f'{float(value):.{digits}f}'
@@ -13,6 +17,17 @@ def number(value, digits=4):
 
 class LiveTelegramController(TelegramController):
     live_mode=True
+
+    @staticmethod
+    def runner_options(snapshot):
+        advertised=snapshot.get('available_runner_ids')
+        return tuple(runner_id for runner_id in RUNNER_LABELS
+                     if runner_id==BASELINE_RUNNER_ID or isinstance(advertised,(tuple,list)) and runner_id in advertised)
+
+    @staticmethod
+    def runner_selection_pending(state,options):
+        return bool(state.get('runner_selection_pending') or state.get('runner_id',BASELINE_RUNNER_ID) not in options)
+
     def capital_ready(self,account_id):
         state=self.control(account_id)
         return bool(self.linked(account_id) and state.get('capital_chosen') and not state.get('capital_pending')
@@ -24,13 +39,18 @@ class LiveTelegramController(TelegramController):
 
     def keyboard(self,account_id):
         state=self.control(account_id)
-        grant=(self.snapshot_provider(account_id) or {}).get('automatic_grant') or {}
+        snapshot=self.snapshot_provider(account_id) or {}
+        grant=snapshot.get('automatic_grant') or {}
+        runners=self.runner_options(snapshot)
         expired=bool(grant.get('expires_at') and grant['expires_at']<=time.time())
         rows=[]
         if not self.linked(account_id):
             rows.append([{'text':'MEXC hesabını bağla','callback_data':'control:connect'}])
         elif not self.capital_ready(account_id):
             rows.append([{'text':'Güncel MEXC kasasını kullan','callback_data':'control:capital_full'}])
+        elif self.runner_selection_pending(state,runners):
+            rows.append([{'text':RUNNER_LABELS[runner_id],'callback_data':f'control:runner:{runner_id}'}
+                         for runner_id in runners])
         elif not state.get('version_chosen'):
             rows.append([{'text':'Görselsiz','callback_data':'control:text'},{'text':'VLM (grafikli)','callback_data':'control:vlm'}])
         elif not state.get('profile_chosen'):
@@ -55,23 +75,30 @@ class LiveTelegramController(TelegramController):
         text='LIVE · Gerçek MEXC hesabı\n'+self.capital_text(account_id)+'\n'
         if not self.linked(account_id):return text+'Önce MEXC hesabını bağla.'
         if not self.capital_ready(account_id):return text+'Güncel kasa kullanımını seç. Bu seçim para transfer etmez.'
+        snapshot=self.snapshot_provider(account_id) or {}
+        runners=self.runner_options(snapshot)
+        selected=state.get('runner_id',BASELINE_RUNNER_ID)
+        if selected not in runners:
+            return text+'Seçili runner bu worker’da kullanılamıyor. Yeni girişler için kullanılabilir bir runner seç.'
+        if self.runner_selection_pending(state,runners):
+            return text+'Yeni işlemler için runner seç. Açık pozisyonların yönetim planı kendi runner’ında kalır.'
+        text+=f'Yeni işlem runner’ı: {RUNNER_LABELS[selected]}\n'
         if not state.get('version_chosen'):return text+'Analizi seç: görselsiz veya VLM.'
         if not state.get('profile_chosen'):return text+'Trader profilini seç. Profil sınırları model önerilerinde uygulanır.'
         mode=next((v for v in TRADER_MODES.values() if v['risk_profile']==state['risk_profile']),{})
-        snapshot=self.snapshot_provider(account_id) or {}
         leverage_mode=snapshot.get('leverage_mode','profile')
         risk_policy=snapshot.get('entry_risk_policy') or {}
         daily_limit=risk_policy.get('daily_loss_limit_pct') if risk_policy.get('profile')==state['risk_profile'] else None
         daily_text=f'Günlük kayıp eşiği: %{daily_limit*100:g}\n' if daily_limit is not None else ''
         leverage_text=('Kaldıraç: parite ve hesabın güncel borsa üst sınırı; model seçim yapar. Stop/likidasyon, marjin ve risk kontrolleri geçerlidir.\n'
             if leverage_mode=='exchange' else f"Profil kaldıraç üst sınırı: {state.get('max_leverage','?')}x; gerçek hesap/borsa sınırı daha düşük olabilir.\n")
-        price_planning=(self.snapshot_provider(account_id) or {}).get('price_planning_enabled',False)
+        price_planning=snapshot.get('price_planning_enabled',False)
         price_text=('Giriş/SL/TP: AI kapanmış mumlara referanslı plan önerebilir; piyasa ve risk doğrulaması zorunlu.\n'
             if price_planning else 'Giriş/SL/TP: algoritma seviyeleri.\n')
         return (text+f"Analiz: {'VLM' if state['version']=='vlm' else 'Görselsiz'} | Profil: {mode.get('label','?')}\n"
             f"Planlanan işlem riski üst sınırı: %{state['risk_per_trade_pct']*100:g}\n"
             +daily_text+leverage_text+price_text+('Açık pozisyon: olay bazlı AI stop taşıma/kısmi kapatma/kapatma yönetimi etkin.\n'
-                if (self.snapshot_provider(account_id) or {}).get('position_management_enabled') else '')+
+                if snapshot.get('position_management_enabled') else '')+
             'Başlat sonrasında model ve risk motoru işlem başına Telegram onayı beklemez. Başlat yetkisi 7 gün geçerlidir.\n'
             'Durdur yeni girişleri/AI çağrılarını keser; açık pozisyonların uzlaştırması ve borsa koruması sürer.')
 
@@ -120,6 +147,14 @@ class LiveTelegramController(TelegramController):
               f"Pozisyon marjini: {number(balance.get('position_margin'))} USDT\n"
               f"Açık PnL: {number(balance.get('unrealized'))} USDT\n")
         text+=self.positions_text(account_id,snapshot)
+        selected=state.get('runner_id',BASELINE_RUNNER_ID)
+        if selected in self.runner_options(snapshot):
+            text+=f'Seçili yeni işlem runner’ı: {RUNNER_LABELS[selected]}\n'
+        else:
+            text+='Seçili runner kullanılamıyor. Ayarlar’dan yeniden seç.\n'
+        effective=snapshot.get('runner_id')
+        if effective in RUNNER_LABELS and effective!=selected:
+            text+=f'Worker’ın son bildirdiği runner: {RUNNER_LABELS[effective]}\n'
         scan=snapshot.get('scan_summary') or {}
         universe=scan.get('universe') or {}
         if universe:text+=f"Tarama: bu tur {scan.get('scanned','?')} / evren {universe.get('total_symbols','?')} parite; dönüşümlü kapsam.\n"
@@ -176,9 +211,18 @@ class LiveTelegramController(TelegramController):
             return self.request_capital(account_id,'account',allocation_mode='full')
         if command in ('capital_demo','capital_amount') or command.startswith('demo_amount:'):
             self.send(account_id,'Bu LIVE panelinde yalnız güncel MEXC kasası kullanılır.',buttons=True);return
-        if command in ('start','run'):
-            state=self.control(account_id)
-            if not (self.capital_ready(account_id) and state.get('version_chosen') and state.get('profile_chosen')):
+        state=self.control(account_id)
+        runners=self.runner_options(self.snapshot_provider(account_id) or {})
+        runner_pending=self.runner_selection_pending(state,runners)
+        if command.startswith('runner:'):
+            runner_id=command.split(':',1)[1]
+            if not self.capital_ready(account_id) or not runner_pending or runner_id not in runners:
+                self.send(account_id,'Runner seçimi kullanılamıyor. Ayarlar menüsünü yenile.',buttons=True);return
+            self.set_control(account_id,runner_id=runner_id,runner_selection_pending=False,
+                             enabled=False,version_chosen=False,profile_chosen=False)
+            text=self.settings_text(account_id)
+        elif command in ('start','run'):
+            if not (self.capital_ready(account_id) and not runner_pending and state.get('version_chosen') and state.get('profile_chosen')):
                 self.send(account_id,self.settings_text(account_id),buttons=True);return
             self.set_control(account_id,enabled=True,stopped=False)
             text='Canlı işlem arayışı istendi. Güncel hesap, risk ve koruma kontrolleri geçerse model önerileri yürütülür.'
@@ -186,15 +230,16 @@ class LiveTelegramController(TelegramController):
             self.set_control(account_id,enabled=False,stopped=command=='stop')
             text='Yeni girişler ve açık pozisyonlar için AI yönetim çağrıları durdu. Açık pozisyonların borsa SL/TP koruması ve uzlaştırması sürer; bu düğme pozisyonları kapatmaz.'
         elif command in ('text','vlm'):
-            self.set_control(account_id,enabled=False,version=command,version_chosen=True,profile_chosen=False)
+            if self.capital_ready(account_id) and not runner_pending:
+                self.set_control(account_id,enabled=False,version=command,version_chosen=True,profile_chosen=False)
             text=self.settings_text(account_id)
         elif command in TRADER_MODES:
-            state=self.control(account_id)
-            if state.get('version_chosen') and self.capital_ready(account_id):
+            if state.get('version_chosen') and self.capital_ready(account_id) and not runner_pending:
                 self.set_control(account_id,enabled=False,profile_chosen=True,**{k:v for k,v in TRADER_MODES[command].items() if k!='label'})
             text=self.settings_text(account_id)
         elif command=='settings':
-            self.set_control(account_id,enabled=False,version_chosen=False,profile_chosen=False)
+            self.set_control(account_id,enabled=False,version_chosen=False,profile_chosen=False,
+                             runner_selection_pending=len(runners)>1)
             text=self.settings_text(account_id)
         elif command=='positions':
             self.send(account_id,self.status_text(account_id,True),buttons=True)

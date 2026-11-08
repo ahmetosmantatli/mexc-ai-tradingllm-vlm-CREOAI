@@ -93,6 +93,76 @@ def test_ai_partial_then_next_review_has_remaining_size_and_confirmed_action(tmp
     assert runner.monitor()['positions']['BTC_USDT']['remaining_contracts']==500
 
 
+def test_runner2_near_target_uses_stored_owner_after_switch_and_is_deduplicated(tmp_path,monkeypatch):
+    runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
+    row['proposal']['metadata'].update(runner_id='runner2',analysis_version='text')
+    executor._save(row)
+    control.update(runner_id='baseline-v1',version='vlm')
+    for view in market['timeframes']:
+        view['closed_at']=int(time())-1
+    runner.manage_positions()
+    initial=len(llm.calls)
+    assert initial==1
+    target=row['proposal']['take_profit_price']
+    stop=row['proposal']['stop_loss']['price']
+    entry=row['entry_fill_price']
+    distance=(entry-stop)*.1
+    original=runner.public.get_ticker
+    def moved(symbol):
+        quote=original(symbol)
+        quote.bid1=target-distance*1.05
+        quote.ask1=target-distance
+        quote.raw['fairPrice']=quote.ask1
+        return quote
+    runner.public.get_ticker=moved
+    allow_next(runner,row)
+    runner.manage_positions()
+    assert llm.calls[-1][0]['event']['near_target']==target
+    assert llm.calls[-1][0]['position']['target_extension_available']
+    assert llm.calls[-1][1]['images'] is None
+    assert runner.store.get('management_trace')['runner_id']=='runner2'
+    allow_next(runner,row)
+    runner.manage_positions()
+    assert len(llm.calls)==initial+1
+
+
+def test_runner2_near_target_ai_extension_reaches_native_readback(tmp_path,monkeypatch):
+    runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
+    row['proposal']['metadata'].update(runner_id='runner2',analysis_version='text')
+    executor._save(row)
+    target=row['proposal']['take_profit_price']
+    stamp=int(time())-1800
+    for view in market['timeframes']:
+        view['closed_at']=int(time())-1
+        view['recent_ohlcv']=[[stamp,100.,target+2.,99.,target-.1,10.]]
+    # Bootstrap the sampled ATR, then independently trigger proximity.
+    runner.manage_positions()
+    original=runner.public.get_ticker
+    def near(symbol):
+        quote=original(symbol)
+        quote.bid1=target-.21
+        quote.ask1=target-.2
+        quote.raw['fairPrice']=quote.ask1
+        return quote
+    runner.public.get_ticker=near
+    def extend(**kwargs):
+        data=json.loads(kwargs['user'])
+        answer=dict(action='move_target',position_id=row['position_id'],
+                    reason='Kapanmış üst fitil yeni hedef için yapısal devamı destekliyor.',
+                    review_timeframe='15m',target_price=target+2.,
+                    target_reference=dict(timeframe='15m',open_time=stamp,field='high'))
+        return answer
+    llm.fork=lambda:SimpleNamespace(
+        complete_json=extend,close=lambda:None,last_provider='gemini',last_model='fake',last_trace={})
+    allow_next(runner,row)
+    runner.manage_positions()
+    updated=executor.state(row['intent_id'])
+    assert updated.get('current_protection',{}).get('target')==target+2., (runner.store.get('management_status'),updated)
+    assert updated['current_protection']['stop']==row['proposal']['stop_loss']['price']
+    assert updated['target_extensions']==1
+    assert updated['management_events'][-1]['status']=='confirmed'
+
+
 def test_stop_or_control_revision_change_during_ai_blocks_write(tmp_path,monkeypatch):
     runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch);llm.action='reduce'
     llm.on_call=lambda:control.update(enabled=False,stopped=True,updated_at=2)
@@ -126,6 +196,37 @@ def test_ai_failure_preserves_protection_and_vlm_uses_request_local_schema(tmp_p
     assert not private.modifies and not private.closes
     assert executor.reconcile(row['intent_id'])['status']=='protected'
     assert runner.store.get('management_status')['status']=='ai_unavailable'
+
+
+def test_provider_outage_leaves_one_bounded_retry_for_same_management_event(tmp_path,monkeypatch):
+    runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
+    llm.fail=True
+    runner.manage_positions()
+    key=runner.position_manager.key(row)
+    card=runner.store.get(key)
+    assert card['provider_retry']['at']>time()
+    runner.manage_positions()
+    assert len(llm.calls)==1
+    card['last_attempt_at']=0
+    card['provider_retry']['at']=time()-1
+    runner.store.put(key,card)
+    runner.manage_positions()
+    assert len(llm.calls)==2
+    assert llm.calls[0][0]['event']==llm.calls[1][0]['event']
+    assert 'provider_retry' not in runner.store.get(key)
+    allow_next(runner,row);runner.manage_positions()
+    assert len(llm.calls)==2 and not private.closes and not private.modifies
+
+
+def test_elapsed_entry_bars_use_exchange_open_time_and_entry_timeframe(tmp_path,monkeypatch):
+    runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
+    row['proposal']['metadata']['price_plan']={'entry_timeframe':'5m'}
+    executor._save(row)
+    private.positions[0]['createTime']=int((time()-650)*1000)
+    runner.store.put(runner.position_manager.key(row),dict(review_timeframe='15m'))
+    runner.manage_positions()
+    card=llm.calls[0][0]['position']
+    assert (card['entry_timeframe'],card['review_timeframe'],card['elapsed_entry_bars'])==('5m','15m',2)
 
 
 @pytest.mark.parametrize('changes',[

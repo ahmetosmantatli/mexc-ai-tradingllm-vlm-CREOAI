@@ -75,6 +75,8 @@ class AutomaticLiveExecutor(ApprovedLiveExecutor):
         self._gate()
         grant=self._current_grant()
         if grant['control_revision']!=control_revision:raise LiveExecutionError('automatic_control_revision_changed')
+        if proposal.metadata.get('runner_id','baseline-v1')!=self.control_provider().get('runner_id','baseline-v1'):
+            raise LiveExecutionError('automatic_runner_changed')
         row=self.stage(proposal,ttl_seconds=ttl_seconds)
         with self.store.lock:
             row=self.state(row['intent_id'])
@@ -92,6 +94,7 @@ class AutomaticLiveExecutor(ApprovedLiveExecutor):
     def _authorized(self,row):
         grant=self._current_grant()
         return (row.get('status')=='policy_authorized' and row.get('authorization_type')=='automatic_start_grant'
+            and (row['proposal'].get('metadata') or {}).get('runner_id','baseline-v1')==self.control_provider().get('runner_id','baseline-v1')
             and row.get('policy_grant_created_at')==grant['created_at']
             and row.get('policy_control_revision')==grant['control_revision'])
 

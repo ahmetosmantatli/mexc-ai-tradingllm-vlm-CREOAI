@@ -1,6 +1,21 @@
 """Safe provider diagnostics: classify errors without persisting raw provider text."""
 
 
+def is_model_output_failure(attempt):
+    """Distinguish output contract failures from quota, transport and access."""
+    if not attempt.get('generation_requests'):
+        return False
+    category = attempt.get('error_category')
+    if attempt.get('status') == 'invalid_schema' or category == 'json_generation_failed':
+        return True
+    return attempt.get('http_status') == 200 and (
+        bool(attempt.get('validation_issues')) or category in (
+            'invalid_output_or_local_validation', 'external_invalid_output_or_admission',
+            'external_invalid_decision', 'external_invalid_tool', 'external_invalid_object',
+        )
+    )
+
+
 def safe_error(response):
     status=response.status_code
     try:

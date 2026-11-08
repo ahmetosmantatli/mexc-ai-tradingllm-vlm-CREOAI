@@ -162,3 +162,13 @@ def test_cancel_watch_with_stale_revision_is_rejected(tmp_path,monkeypatch):
         invalidation='',watch_note='',reviewed_watch_revision=0)
     assert run().hold_reason=='invalid_or_unavailable_model'
     assert coordinator.card('BTC_USDT')['status']=='triggered'
+def test_watch_note_allows_missing_or_null_but_rejects_structured_output():
+    import pytest
+    from pydantic import ValidationError
+    from trading.evaluation.service import ModelDecision
+
+    decision = dict(action='hold', signal_id=None, rationale='Teyit yok.', invalidation='')
+    assert ModelDecision.model_validate(decision).watch_note == ''
+    assert ModelDecision.model_validate({**decision, 'watch_note': None}).watch_note == ''
+    with pytest.raises(ValidationError, match='watch_note'):
+        ModelDecision.model_validate({**decision, 'watch_note': {'price': 100}})
