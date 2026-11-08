@@ -68,13 +68,27 @@ class LiveRunner:
             raise ValueError('invalid live risk')
         return min(requested,self.cfg.risk_per_trade_pct,self.risk.preset.risk_per_trade_pct)
 
-    def _leverage_cap(self,control):
+    def _leverage_cap(self,control,exchange_cap=None):
+        if self.cfg.live_leverage_mode=='exchange':
+            if isinstance(exchange_cap,bool) or not isinstance(exchange_cap,(int,float)) or not isfinite(exchange_cap) or exchange_cap<1:
+                raise ValueError('verified exchange leverage cap required')
+            return exchange_cap
         cap=min(getattr(self.cfg,'live_max_leverage',10),
             self.risk.preset.max_leverage_majors,self.risk.preset.max_leverage_alts)
         requested=control.get('max_leverage',cap)
         if isinstance(requested,bool) or not isinstance(requested,(int,float)) or not isfinite(requested) or requested<1:
             raise ValueError('invalid live leverage')
         return min(cap,requested)
+
+    def _symbol_leverage_cap(self,candidate,snapshot):
+        rules=self.public.get_contract_rules(candidate.symbol)
+        side=1 if candidate.side.value=='long' else 2
+        risk=next(row for row in snapshot['risk_limits'][candidate.symbol] if row['side']==side)
+        setting=next(row for row in snapshot['leverage'][candidate.symbol] if row['side']==side)
+        values=(rules.max_leverage,risk['max_leverage'],setting['max_leverage'])
+        if not all(isinstance(v,(int,float)) and not isinstance(v,bool) and isfinite(v) and v>=1 for v in values):
+            raise ValueError('invalid account leverage cap')
+        return min(values)
 
     @staticmethod
     def _capital(snapshot,control):
@@ -245,8 +259,13 @@ class LiveRunner:
             evaluator=ContextEvaluator(child,self.store,self.public,self.cfg) if child is not self.llm else self.graph
             capital=self._capital(snapshot,control)
             live_context=self._live_context(snapshot,control)
+            exchange_cap=self._symbol_leverage_cap(candidate,snapshot)
+            live_context['leverage_policy']=dict(mode=self.cfg.live_leverage_mode,account_exchange_max=exchange_cap,
+                minimum_stop_liquidation_buffer_fraction=self.cfg.liquidation_buffer_pct,
+                fee_rate=self.cfg.paper_fee_rate,slippage_bps=self.cfg.paper_slippage_bps,
+                note='Maximum is an upper bound, not a target. Keep candidate SL/TP, loss budget and liquidation buffer; choose lower leverage or HOLD when incompatible.')
             return evaluator.evaluate_candidates([candidate],equity=capital,risk_per_trade_pct=self._risk_fraction(control),
-                target_leverage=self._leverage_cap(control),risk_profile=self.cfg.risk_profile.value,
+                target_leverage=self._leverage_cap(control,exchange_cap),risk_profile=self.cfg.risk_profile.value,
                 live_account_context=live_context,live_positions=self._positions(snapshot))
         finally:
             if child is not self.llm and callable(getattr(child,'close',None)):
@@ -258,8 +277,10 @@ class LiveRunner:
         private_risk=next(row for row in snapshot['risk_limits'][candidate.symbol] if row['side']==side)
         private_leverage=next(row for row in snapshot['leverage'][candidate.symbol] if row['side']==side)
         exchange_cap=min(rules.max_leverage,private_risk['max_leverage'],private_leverage['max_leverage'])
+        if self.cfg.live_leverage_mode=='exchange' and result.metadata.get('sizing_plan') is None:
+            raise ValueError('model must explicitly choose live leverage and risk')
         proposal=apply_decision_sizing(candidate,result.metadata.get('sizing_plan'),self._capital(snapshot,control),
-            self._risk_fraction(control),self._leverage_cap(control),exchange_cap)
+            self._risk_fraction(control),self._leverage_cap(control,exchange_cap),exchange_cap)
         ticker=self.quote(candidate.symbol)
         if abs(ticker.last_price/candidate.entry_price-1)>min(candidate.stop_distance_pct/2,.005):
             raise ValueError('live entry price drift')
@@ -455,7 +476,7 @@ class LiveRunner:
             account=dict(ready=account.get('ready',False),**account.get('balance',{})),
             live_account=account,real_account=account,balance=account.get('balance'),positions=positions,closed=closed,intents=intents,
             analysis_trace=self.store.get('analysis_trace',{}),analysis_history=self.store.get('analysis_history',[]),
-            watchlist=watch_snapshot(self.store),analysis_version=self.cfg.analysis_version,
+            watchlist=watch_snapshot(self.store),leverage_mode=self.cfg.live_leverage_mode,analysis_version=self.cfg.analysis_version,
             ai_status=getattr(self.llm,'last_status','not_called'),live_halt=self.store.get('live:halt'),is_simulated=False)
         with self.lock:
             events=self.store.get('live_events',[])

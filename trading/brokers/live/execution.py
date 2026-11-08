@@ -184,7 +184,10 @@ class ApprovedLiveExecutor:
         buffer=(sl-liquidation)/entry if proposal.side.value=='long' else (liquidation-sl)/entry
         if distance<=0 or buffer<self.liq_buffer:raise LiveExecutionError('insufficient_liquidation_buffer')
         state=observe_risk_reference(self.store,self.binding_id,equity)
+        verified_leverage_cap=min(rules.max_leverage,*(r['max_leverage'] for group in ('risk_limits','leverage')
+            for r in snapshot[group][proposal.symbol] if r['side']==side))
         context=RiskContext(equity=equity,starting_capital=state['initial'],capital_floor=0,
+            exchange_max_leverage=verified_leverage_cap,
             open_positions=len(snapshot['positions']),open_risk=sum(r.get('planned_loss',r['proposal']['max_loss_if_stopped']) for r in managed),
             daily_loss_pct=state['daily_loss_pct'],weekly_loss_pct=state['weekly_loss_pct'],drawdown_pct=state['drawdown_pct'])
         decision=self.risk.evaluate(proposal,context)

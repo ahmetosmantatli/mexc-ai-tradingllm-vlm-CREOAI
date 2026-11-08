@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     )
 
     # Live code is inert unless every deployment gate and account allowlist matches.
+    live_leverage_mode: str = Field(default='profile',pattern='^(profile|exchange)$')
     live_max_leverage: int = Field(default=10,ge=1,le=25)
     live_max_positions: int = Field(default=4,ge=1,le=4)
     live_automatic_enabled: bool = False

@@ -40,6 +40,7 @@ SYSTEM_POLICY = (
     'explicitly set reviewed_watch_revision to that revision and explain concretely in Turkish why the old plan is invalid or superseded. '
     'Never pretend to supersede an unseen plan. For trade choose sizing_plan with integer leverage and '
     'risk_per_trade_pct as an account fraction (.01 means 1%), within supplied limits; null retains policy sizing. '
+    'In LIVE exchange leverage mode an explicit sizing_plan is mandatory: never default to the maximum. '
     'Entry/SL/TP remain the candidate levels; never invent a different setup. Write concise Turkish rationale explaining the concrete missing confirmation '
     'or rejection, and a watch_note describing what would justify reconsideration. Do not just say insufficient evidence. '
     'Keep rationale within1200 characters, invalidation within500 and watch_note within1000. '
@@ -186,6 +187,9 @@ class ContextEvaluator:
             self.llm.on_trace=lambda update:publish_progress(self.store,{**trace,**copy.deepcopy(update)})
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
+            if (decision.action=='trade' and live_account is not None
+                    and (live_account.get('leverage_policy') or {}).get('mode')=='exchange' and decision.sizing_plan is None):
+                raise ValueError('explicit model sizing required for exchange leverage mode')
             if decision.action=='trade' and decision.signal_id!=candidate.signal_id:
                 raise ValueError('unknown signal')
             if decision.watch_plan is not None and decision.action!='watch':

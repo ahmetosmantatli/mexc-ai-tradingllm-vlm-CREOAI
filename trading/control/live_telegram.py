@@ -56,9 +56,12 @@ class LiveTelegramController(TelegramController):
         if not state.get('version_chosen'):return text+'Analizi seç: görselsiz veya VLM.'
         if not state.get('profile_chosen'):return text+'Trader profilini seç. Profil sınırları model önerilerinde uygulanır.'
         mode=next((v for v in TRADER_MODES.values() if v['risk_profile']==state['risk_profile']),{})
+        leverage_mode=(self.snapshot_provider(account_id) or {}).get('leverage_mode','profile')
+        leverage_text=('Kaldıraç: parite ve hesabın güncel borsa üst sınırı; model seçim yapar. Stop/likidasyon, marjin ve risk kontrolleri geçerlidir.\n'
+            if leverage_mode=='exchange' else f"Profil kaldıraç üst sınırı: {state.get('max_leverage','?')}x; gerçek hesap/borsa sınırı daha düşük olabilir.\n")
         return (text+f"Analiz: {'VLM' if state['version']=='vlm' else 'Görselsiz'} | Profil: {mode.get('label','?')}\n"
             f"Planlanan işlem riski üst sınırı: %{state['risk_per_trade_pct']*100:g}\n"
-            f"Profil kaldıraç üst sınırı: {state.get('max_leverage','?')}x; gerçek hesap/borsa sınırı daha düşük olabilir.\n"
+            +leverage_text+
             'Başlat sonrasında model ve risk motoru işlem başına Telegram onayı beklemez. Başlat yetkisi 7 gün geçerlidir.\n'
             'Durdur yeni girişleri/AI çağrılarını keser; açık pozisyonların uzlaştırması ve borsa koruması sürer.')
 

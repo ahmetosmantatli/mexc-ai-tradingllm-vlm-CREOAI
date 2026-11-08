@@ -20,6 +20,7 @@ class RiskContext:
     daily_loss_pct: float = 0.0
     weekly_loss_pct: float = 0.0
     drawdown_pct: float = 0.0
+    exchange_max_leverage: float | None = None
     floor_activated: bool = False
     always_on_scan: bool = True
     halt_new_risk: bool = False
@@ -46,7 +47,16 @@ class RiskEngine:
             return RiskDecision(action=DecisionAction.REJECT, proposal_id=proposal.proposal_id,
                                 reason_codes=["NONFINITE_RISK_INPUT"])
         major = proposal.symbol in {"BTC_USDT", "ETH_USDT"}
-        if proposal.leverage > (preset.max_leverage_majors if major else preset.max_leverage_alts):
+        cap=preset.max_leverage_majors if major else preset.max_leverage_alts
+        live_exchange=(getattr(self.settings.broker_mode,'value',self.settings.broker_mode)=='live'
+            and getattr(self.settings,'live_leverage_mode','profile')=='exchange')
+        if live_exchange:
+            observed=context.exchange_max_leverage
+            if isinstance(observed,bool) or not isinstance(observed,(int,float)) or not isfinite(observed) or observed<1:
+                reasons.append('UNVERIFIED_EXCHANGE_LEVERAGE_CAP')
+            else:
+                cap=observed
+        if proposal.leverage > cap:
             reasons.append("LEVERAGE_CAP")
         if proposal.notional / proposal.leverage > context.equity:
             reasons.append("INSUFFICIENT_MARGIN")

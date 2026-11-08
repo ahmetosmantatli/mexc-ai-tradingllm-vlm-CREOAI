@@ -140,3 +140,21 @@ Official references checked2026-11-08:
 - https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/get-risk-limits
 - https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/get-historical-positions
 - https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/place-tpsl-order-by-position
+
+## Optional exchange-based leverage selection
+
+`LIVE_LEVERAGE_MODE=profile` remains the default. Set `exchange` only if the
+operator chooses to replace the local/profile leverage ceilings with the fresh
+minimum of public contract maxLeverage, private account risk maxLeverage and
+side-specific private leverage maxLeverageView. In this mode `LIVE_MAX_LEVERAGE`,
+the profile leverage cap and Telegram's saved max_leverage do not set the ceiling;
+the model must explicitly return integer leverage and a risk fraction. A missing
+plan is HOLD, never automatic use of the maximum. PAPER behavior is unchanged.
+
+Risk fraction, total open risk, available margin, initial margin rate, contract
+minimum/step and stop/estimated liquidation buffers still apply, before the
+entry and again on confirmed filled exposure. A500x exchange upper bound is
+not a feasible500x stop plan. The existing default minimum stop-to-liquidation
+buffer is2% of price, and current quant stops are typically1.5–2% of price; many
+high leverage proposals will correctly be rejected. This setting does not add
+model-selected arbitrary entry/SL/TP levels or alter existing positions.
