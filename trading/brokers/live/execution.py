@@ -242,7 +242,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             try:
                 self.private.submit_market(symbol=proposal.symbol,side=proposal.side.value,contracts=contracts,
                     leverage=int(proposal.leverage),external_id=row['external_id'],stop_loss=proposal.stop_loss.price,
-                    take_profit=proposal.take_profit_price,position_mode=mode)
+                    take_profit=proposal.take_profit_price,entry_price=proposal.entry_price,position_mode=mode)
             except Exception as exc:
                 if getattr(exc,'ambiguous',True) is False:
                     from trading.runtime.execution_diagnostics import safe_execution_error

@@ -20,7 +20,7 @@ def setup(handler=None,**kwargs):
 
 def market(client,**kwargs):
     return client.submit_market(**dict(dict(symbol='BTC_USDT',side='long',contracts=2.,leverage=3,
-        external_id='intent_123',stop_loss=90.,take_profit=110.),**kwargs))
+        external_id='intent_123',stop_loss=90.,take_profit=110.,entry_price=100.),**kwargs))
 
 
 def test_exact_post_signed_bytes_and_native_protection(monkeypatch):
@@ -33,6 +33,7 @@ def test_exact_post_signed_bytes_and_native_protection(monkeypatch):
     assert request.headers['signature']==hmac.new(b'PRIVATE_SECRET',signed,hashlib.sha256).hexdigest()
     body=json.loads(request.content)
     assert body['side']==1 and body['openType']==1 and body['type']==5
+    assert body['price']==100.
     assert body['externalOid']=='intent_123'
     assert body['stopLossPrice']==90. and body['takeProfitPrice']==110.
     assert body['lossTrend']==body['profitTrend']==2
@@ -49,6 +50,17 @@ def test_get_sorting_encoding_and_path_excluded_from_sign(monkeypatch):
     client.client=httpx.Client(transport=httpx.MockTransport(lambda req:httpx.Response(200,json=dict(success=True,code=0,data={}))))
     # IDs embedded in the path do not enter the parameter signature.
     assert client.order_by_external_id('BTC_USDT','intent_123')=={}
+
+
+def test_lit_short_preserves_protection_and_positive_market_reference():
+    client,requests=setup(writes_enabled=True)
+    market(client,symbol='LIT_USDT',side='short',entry_price=3.263,
+        stop_loss=3.2784,take_profit=3.2459,leverage=10)
+    body=json.loads(requests[-1].content)
+    assert body['type']==5 and body['side']==3
+    assert body['price']==3.263
+    assert body['takeProfitPrice']<body['price']<body['stopLossPrice']
+    assert body['stopLossPrice']==3.2784 and body['takeProfitPrice']==3.2459
 
 
 def test_writes_disabled_by_default_and_callback_rechecked_no_http():
@@ -108,7 +120,8 @@ def test_business_rejection_safe_numeric_code():
 
 @pytest.mark.parametrize('updates',[dict(contracts=True),dict(leverage=True),dict(leverage=2.5),
     dict(contracts=float('nan')),dict(symbol='../transfer'),dict(external_id='x?PRIVATE_KEY'),
-    dict(stop_loss=0),dict(stop_loss=111),dict(position_mode=3),dict(position_mode=True),dict(position_mode=1.0)])
+    dict(stop_loss=0),dict(stop_loss=111),dict(entry_price=0),dict(entry_price=float('nan')),
+    dict(entry_price=90.),dict(entry_price=110.),dict(position_mode=3),dict(position_mode=True),dict(position_mode=1.0)])
 def test_invalid_order_has_no_http(updates):
     client,requests=setup(writes_enabled=True)
     with pytest.raises((ValidationError,ValueError)):

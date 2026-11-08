@@ -40,7 +40,7 @@ class Client:
     def order_by_external_id(self,symbol,external_id):
         if external_id.startswith('close-'):return deepcopy(self.close_order)
         return deepcopy(self.order_row)
-    def submit_market(self,*,symbol,side,contracts,leverage,external_id,stop_loss,take_profit,position_mode=1):
+    def submit_market(self,*,symbol,side,contracts,leverage,external_id,stop_loss,take_profit,entry_price,position_mode=1):
         self.submits.append(external_id)
         if self.on_submit:self.on_submit()
         self.order_row=dict(symbol=symbol,side=1 if side=='long' else 3,openType=1,positionMode=position_mode,
@@ -286,7 +286,7 @@ def test_real_private_client_contract_end_to_end_uses_no_network(tmp_path):
         elif path.endswith('/stoporder/list/orders'):data=fake.protection_orders('BTC_USDT',page_num=int(request.url.params['page_num']))
         elif path.endswith('/order/create'):
             body=json.loads(request.content)
-            data=fake.submit_market(symbol=body['symbol'],side='long',contracts=body['vol'],leverage=body['leverage'],external_id=body['externalOid'],stop_loss=body['stopLossPrice'],take_profit=body['takeProfitPrice'],position_mode=body['positionMode'])
+            data=fake.submit_market(symbol=body['symbol'],side='long',contracts=body['vol'],leverage=body['leverage'],external_id=body['externalOid'],stop_loss=body['stopLossPrice'],take_profit=body['takeProfitPrice'],entry_price=body['price'],position_mode=body['positionMode'])
         elif path.endswith('/stoporder/place'):
             body=json.loads(request.content)
             data=fake.place_protection(position_id=body['positionId'],contracts=body['vol'],stop_loss=body['stopLossPrice'],take_profit=body['takeProfitPrice'],request_id='test')

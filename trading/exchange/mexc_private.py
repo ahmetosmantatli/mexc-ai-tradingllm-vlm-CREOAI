@@ -39,6 +39,7 @@ class MarketOrder(BaseModel):
     external_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
     stop_loss: float = Field(gt=0)
     take_profit: float = Field(gt=0)
+    entry_price: float = Field(gt=0)
     position_mode: Literal[1,2] = 1
 
     @field_validator('position_mode',mode='before')
@@ -188,13 +189,13 @@ class MexcPrivateClient:
         return self._request('GET','/api/v1/private/stoporder/list/orders',operation='protection_orders',
             params=dict(self._page(page_num,page_size),symbol=_symbol(symbol) if symbol else None,is_finished=0),expected=list)
 
-    def submit_market(self,*,symbol,side,contracts,leverage,external_id,stop_loss,take_profit,position_mode=1):
+    def submit_market(self,*,symbol,side,contracts,leverage,external_id,stop_loss,take_profit,entry_price,position_mode=1):
         order=MarketOrder(symbol=symbol,side=side,contracts=contracts,leverage=leverage,external_id=external_id,
-            stop_loss=stop_loss,take_profit=take_profit,position_mode=position_mode)
-        if not (stop_loss<take_profit if side=='long' else take_profit<stop_loss):
+            stop_loss=stop_loss,take_profit=take_profit,entry_price=entry_price,position_mode=position_mode)
+        if not (stop_loss<entry_price<take_profit if side=='long' else take_profit<entry_price<stop_loss):
             raise ValueError('invalid protection direction')
         return self._request('POST','/api/v1/private/order/create',operation='submit_market',expected=dict,
-            body=dict(symbol=order.symbol,price=0,vol=order.contracts,leverage=order.leverage,
+            body=dict(symbol=order.symbol,price=order.entry_price,vol=order.contracts,leverage=order.leverage,
                 side=1 if side=='long' else 3,type=5,openType=1,externalOid=external_id,
                 stopLossPrice=order.stop_loss,takeProfitPrice=order.take_profit,lossTrend=2,profitTrend=2,
                 positionMode=order.position_mode,reduceOnly=False))
