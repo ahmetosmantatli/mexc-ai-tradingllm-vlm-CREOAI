@@ -235,33 +235,37 @@ class TelegramController:
             text+=f"\nDiğer aktif takip: {len(active)-12}"
         return text
 
+    def quota_text(self, account_id):
+        snapshot=self.snapshot_provider(account_id) or {}
+        groups=(snapshot.get('provider_pool') or {}).get('groups',[])
+        text='AI kotaları · yerel tahmin; sağlayıcı bakiyesi değildir.\nGemini: Pasifik günü. Groq: korumacı son24s.\n'
+        for group in groups[:24]:
+            text+=(f"{group['provider']} / {group['model']} / {group['quota_group']}\n"
+                   f"Kalan günlük istek {group.get('requests_daily_remaining','?')} | dk istek {group.get('requests_minute_remaining','?')} | "
+                   f"dk token tahmini {group.get('tokens_minute_remaining_estimate','?')} | Meşgul: {'evet' if group.get('in_flight') else 'hayır'}\n")
+        resets=sorted({g['next_daily_reset_at'] for g in groups if g.get('provider')=='gemini' and g.get('next_daily_reset_at')})
+        if resets:text+='Gemini sonraki günlük reset: '+datetime.fromtimestamp(resets[0],ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M')+'\n'
+        if len(groups)>24 or len(text)>3750:
+            text=text[:3600]+'\nTam kota listesi: sunucuda python -m trading.control.provider_status\n'
+        return text if groups else text+'Henüz kota kaydı yok.'
+
     def diagnostics_text(self, account_id):
         snapshot=self.snapshot_provider(account_id) or {}
-        text='Analiz / AI istekleri | PAPER\n'+self.progress_text(snapshot)+self.algorithm_text()+'\n'
+        text='Analiz / AI istekleri | PAPER\n'+self.progress_text(snapshot)+'\n'
         for provider,counts in snapshot.get('ai_request_stats',{}).items():
             text+=(f"Ortak {provider}: üretim isteği {counts.get('generation_requests',0)}, token sayımı {counts.get('count_requests',0)}, "
                    f"başarılı {counts.get('successes',0)}, başarısız {counts.get('failures',0)}\n")
-        groups=(snapshot.get('provider_pool') or {}).get('groups',[]) if isinstance(snapshot.get('provider_pool'),dict) else []
-        if groups:
-            text+='Yerel kota tahmini (sağlayıcı paneli değil; Gemini Pasifik günü, Groq korumacı son24s):\n'
-            for group in groups:
-                text+=(f"{group['provider']} / {group['model']} / {group['quota_group']} | "
-                       f"Kalan dk istek {group.get('requests_minute_remaining','?')}, tahmini token {group.get('tokens_minute_remaining_estimate','?')} | "
-                       f"Kalan günlük istek {group.get('requests_daily_remaining','?')} | "
-                       f"Meşgul: {'evet' if group.get('in_flight') else 'hayır'}\n")
-                reset=group.get('next_daily_reset_at')
-                if reset:text+='Yerel sonraki günlük hak zamanı: '+datetime.fromtimestamp(reset,ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M')+'\n'
-                reported=group.get('provider_reported') or {}
-                if reported:
-                    text+=f"Son sağlayıcı yanıtı: kalan istek {reported.get('requests_remaining','?')}, token {reported.get('tokens_remaining','?')} (anlık panel değildir).\n"
+        text+='Kota ayrıntısı: /quota · Sayılar geçmiş toplamdır.\n'
         latest=snapshot.get('analysis_trace') or {}
         history=snapshot.get('analysis_history') or []
-        traces=history[-3:] if history else ([latest] if latest else [])
+        traces=history[-2:] if history else ([latest] if latest else [])
         if latest and (not traces or traces[-1].get('id')!=latest.get('id')):
-            traces=(traces+[latest])[-3:]
+            traces=(traces+[latest])[-2:]
         if not traces:
             return text+'Henüz kayıtlı aday değerlendirmesi yok. Çalışıyor durumu, mutlaka AI isteği veya işlem oluştuğu anlamına gelmez.'
         for trace in reversed(traces):
+            from trading.agents.telemetry import trace_outcome
+            text+='\n'+trace_outcome(trace)+'\n'
             score=trace.get('confidence')
             score_text=f"{score:.2f}" if isinstance(score,(int,float)) else '?'
             text += (f"\nAnaliz {trace.get('id','?')} | {trace.get('symbol','?')} | {trace.get('strategy','?')}\n"
@@ -269,7 +273,7 @@ class TelegramController:
             if trace.get('started_at'):
                 text+='Analiz saati: '+datetime.fromtimestamp(trace['started_at'],ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M:%S')+'\n'
             if trace.get('rationale'):
-                text+='Gerekçe: '+str(trace['rationale'])[:500]+'\n'
+                text+='Gerekçe: '+str(trace['rationale'])[:300]+'\n'
             model_action=trace.get('model_action') or (trace.get('action') if trace.get('status')=='completed' else None)
             if model_action:text+='Model kararı: '+{'trade':'İşlem öner','watch':'Takibe al','hold':'Bekle','cancel_watch':'Takibi iptal et'}.get(model_action,'Bilinmiyor')+'\n'
             if trace.get('setup_family'):text+='Seçilen kurulum: '+str(trace['setup_family'])+' | Yön: '+str(trace.get('side','?'))+'\n'
@@ -283,7 +287,8 @@ class TelegramController:
             attempts=trace.get('attempts') or []
             text += f"Sağlayıcı denemesi: {len(attempts)}\n"
             if not attempts:text+='Bu değerlendirmede sağlayıcı isteği kaydedilmemiş; kota, bekleme veya durdurma nedeniyle olabilir.\n'
-            for attempt in attempts[-4:]:
+            sent=[a for a in attempts if a.get('generation_requests',0) or a.get('count_requests',0)]
+            for attempt in (sent or attempts)[-2:]:
                 text += (f"• {attempt.get('provider','?')} / {attempt.get('model','?')} | {attempt.get('status','?')}"
                          f" | {attempt.get('latency_ms',0):.0f} ms\n")
                 errors=[f"{label}: {attempt[key]}" for key,label in (('http_status','HTTP'),('error_category','Tür'),('error_code','Kod'),('error_param','Alan')) if attempt.get(key) is not None]
@@ -304,7 +309,8 @@ class TelegramController:
                 text += (f"Yanıt kullanımından tahmini maliyet: ${estimate:.6f}\n" if estimate is not None else 'İstek maliyeti doğrulanmadı / hesaplanmadı.\n')
                 if attempt.get('pending_usd'):
                     text+=f"Bekleyen/belirsiz rezervasyon: ${attempt['pending_usd']:.6f} (fatura değil)\n"
-        return text+'\nBu kayıtlar sağlayıcı faturası değildir; ham istek/yanıt veya anahtar gösterilmez.'
+        footer='\nTam istek kaydı: sunucudaki usage_report. Kotalar: /quota. Bu kayıtlar sağlayıcı faturası değildir.'
+        return (text if len(text)<=3800 else text[:3700]+'\nEski teknik ayrıntılar kısaltıldı.')+footer
 
     def request_capital(self, account_id, mode, amount=None, allocation_mode='fixed'):
         if mode not in ('demo','account') or allocation_mode not in ('fixed','full'):
@@ -454,7 +460,7 @@ class TelegramController:
         name = parts[0].split('@')[0].lower() if parts else ''
         mapping = {'/start':'menu', '/help':'menu', '/status':'status', '/durum':'status', '/balance':'status',
                    '/bakiye':'status', '/report':'report', '/history':'report', '/rapor':'report', '/settings':'settings', '/ayarlar':'settings', '/positions':'positions', '/pozisyonlar':'positions',
-                   '/watchlist':'watchlist', '/takip':'watchlist', '/diagnostics':'diagnostics', '/events':'diagnostics', '/run':'start', '/baslat':'start', '/pause':'pause', '/durdur':'stop', '/stop':'stop'}
+                   '/watchlist':'watchlist', '/takip':'watchlist', '/diagnostics':'diagnostics', '/quota':'quota', '/kotalar':'quota', '/events':'diagnostics', '/run':'start', '/baslat':'start', '/pause':'pause', '/durdur':'stop', '/stop':'stop'}
         if self.command_handler and self.command_handler(account.account_id, text, message):
             return
         if name in ('/demo','/capital'):
@@ -588,6 +594,8 @@ class TelegramController:
             message=self.watchlist_text(account_id)
         elif command=='diagnostics':
             message=self.diagnostics_text(account_id)
+        elif command=='quota':
+            message=self.quota_text(account_id)
         elif command=='report':
             message=self.report_text(account_id)
         elif command in ('status','positions'):

@@ -115,7 +115,7 @@ def test_telegram_quota_reset_label_is_provider_day_not_rolling_gemini():
     stamp=datetime(2026,11,8,8,tzinfo=timezone.utc).timestamp()
     group=dict(provider='gemini',model='test',quota_group='group',requests_daily_remaining=500,next_daily_reset_at=stamp)
     fake=SimpleNamespace(snapshot_provider=lambda _:dict(provider_pool={'groups':[group]}),progress_text=lambda _: '',algorithm_text=lambda: '')
-    text=TelegramController.diagnostics_text(fake,'friend')
+    text=TelegramController.quota_text(fake,'friend')
     assert '08.11 11:00' in text and 'Kalan günlük istek 500' in text
 
 

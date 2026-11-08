@@ -492,3 +492,27 @@ def test_watchlist_plain_language_and_account_isolation(tmp_path):
     assert 'AAA_USDT' not in ctl.watchlist_text('b')
     ctl.dispatch(message(11,11,'/takip'))
     assert 'AAA_USDT' in calls[-1][1]['text']
+
+
+def test_diagnostics_decision_survives_telegram_length_limit_with_many_quota_routes(tmp_path):
+    groups=[dict(provider='gemini',model=f'model-{i}',quota_group='group',requests_daily_remaining=500) for i in range(24)]
+    trace=dict(id='newest',symbol='BTC_USDT',strategy='trend',status='completed',model_action='hold',action='hold',
+        execution_status='not_opened',rationale='Yeni kapanmış mumda teyit eksik; koşul oluşmadı.',
+        attempts=[dict(provider='gemini',model='actual-model',generation_requests=1,status='success',http_status=200)])
+    ctl,calls=controller(tmp_path,{'a':dict(provider_pool={'groups':groups},analysis_history=[trace],analysis_trace=trace)})
+    ctl.dispatch(message(11,11,'/diagnostics'))
+    sent=calls[-1][1]['text']
+    assert len(sent)<4000
+    assert 'AI beklemeyi seçti' in sent and 'BTC_USDT' in sent and 'actual-model' in sent
+    assert 'model-23' not in sent and '/quota' in sent
+    ctl.dispatch(message(11,11,'/quota'))
+    assert 'Kalan günlük istek 500' in calls[-1][1]['text']
+
+
+def test_diagnostics_prioritizes_actual_generation_failure_over_later_routing_skips(tmp_path):
+    trace=dict(id='invalid',symbol='BTC_USDT',strategy='trend',status='invalid_or_unavailable_model',action='hold',
+        execution_status='not_opened',attempts=[dict(provider='gemini',model='actual-failure',generation_requests=1,status='failed',http_status=200,
+            validation_issues=['unknown_setup_id'])]+[dict(provider='groq',model=f'skip-{i}',generation_requests=0,status='quota_skipped') for i in range(5)])
+    ctl,calls=controller(tmp_path,{'a':dict(analysis_history=[trace])})
+    ctl.dispatch(message(11,11,'/diagnostics'))
+    assert 'actual-failure' in calls[-1][1]['text'] and 'unknown_setup_id' in calls[-1][1]['text']

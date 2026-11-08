@@ -522,3 +522,15 @@ is validated locally with the same decision schema; non-STOP/truncated, malforme
 or unvalidated results cannot open an order. No text/image data is removed to fit
 quota. Every fallback shares the original deadline; no unbounded retry loop.
 Reference: [Gemma on Gemini API](https://ai.google.dev/gemma/docs/core/gemma_on_gemini_api).
+
+### Telegram decision visibility
+
+The Son analiz panel prioritizes the latest model/entry outcome and actual
+provider generation failures. Full quota lists are on `/quota` / AI kotaları,
+so a long model pool cannot consume Telegram's4000-character payload before the
+operator sees the decision. At most two recent reviews and two relevant sent
+attempts each are shown; older verbose details may be explicitly shortened.
+The full durable usage journal remains available through usage_report. This UI
+change does not increase trading risk, force entry or change model decisions.
+Native protected-entry and exchange-confirmed closure notifications remain
+separate durable outbox messages.

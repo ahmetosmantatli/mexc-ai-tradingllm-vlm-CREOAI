@@ -46,6 +46,7 @@ class LiveTelegramController(TelegramController):
         rows.append([{'text':'Takip listesi','callback_data':'control:watchlist'},
                      {'text':'Son analiz / AI','callback_data':'control:diagnostics'},
                      {'text':'İşlem raporu','callback_data':'control:report'}])
+        rows.append([{'text':'AI kotaları','callback_data':'control:quota'}])
         if self.linked(account_id):rows.append([{'text':'Bağlantıyı kaldır','callback_data':'control:disconnect'}])
         return {'inline_keyboard':rows}
 
@@ -197,6 +198,7 @@ class LiveTelegramController(TelegramController):
         elif command=='status':text=self.status_text(account_id)
         elif command=='report':text=self.report_text(account_id)
         elif command=='diagnostics':text=self.diagnostics_text(account_id)
+        elif command=='quota':text=self.quota_text(account_id)
         elif command=='watchlist':text=self.watchlist_text(account_id)
         else:text=self.settings_text(account_id)
         self.send(account_id,text,buttons=True)
