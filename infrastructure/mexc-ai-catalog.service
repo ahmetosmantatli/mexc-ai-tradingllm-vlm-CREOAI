@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh free AI model catalog (no trading actions)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/mexc-ai-trading
+ExecStart=/usr/bin/docker compose --env-file .env -f infrastructure/docker-compose.yml -p mexc-ai exec -T worker python -m trading.control.external_models discover
+TimeoutStartSec=180
+UMask=0077

@@ -5,6 +5,9 @@ TRACE_FIELDS=('id','mode','analysis_version','symbol','strategy','confidence','s
 ATTEMPT_FIELDS=('provider','model','provider_reported','status','phase','http_status','error_category','error_code','error_param','latency_ms','generation_requests','count_requests','input_tokens','output_tokens','estimated_cost_usd','pending_usd','estimated_input_tokens','token_budget','completion_token_limit','output_stop_reason','validation_issues','credential_id','quota_group','retry_number','retry_after_seconds','daily_quota_exhausted')
 
 
+ATTEMPT_FIELDS += ('neuron_reserved_estimate',)
+
+
 def archive_trace(store, trace):
     safe={key:trace[key] for key in TRACE_FIELDS if key in trace}
     safe['attempts']=[{key:a[key] for key in ATTEMPT_FIELDS if key in a} for a in trace.get('attempts',[])]

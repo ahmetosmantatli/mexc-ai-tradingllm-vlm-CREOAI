@@ -69,6 +69,8 @@ class ProviderPool:
         self.successful_calls = 0
         self.last_trace = {}
         self._slots = []
+        self._external_signature = None
+        self._external_expires = 0
         self._sleep = time.sleep
         seen = set()
         from trading.agents.quota_routes import parse_routes
@@ -103,6 +105,44 @@ class ProviderPool:
                     child=ProviderRouter(extra,None,PrefixStore(store,'pool:route:'+group_id+':'+route_label+':'),self.client)
                     self._slots.append(_Slot(provider,route_label,group_id,child,route.model,tuple(route.modes),
                         (route.rpm,route.tpm,route.rpd,route.tpd),route.quota_bucket))
+        self._reload_external()
+
+    def _reload_external(self):
+        """Hourly discovery may replace a manifest; existing strategies stay intact."""
+        if not getattr(self.settings,'external_models_enabled',False):return
+        from pathlib import Path
+        from trading.agents.external_catalog import load_routes
+        from trading.agents.external_client import ExternalClient
+        path=Path(self.settings.external_models_file)
+        try:signature=(path.stat().st_mtime_ns,int(time.time()/3600))
+        except OSError:signature=None
+        if signature==self._external_signature and time.time()<self._external_expires:return
+        self._external_signature=signature
+        self._external_expires=time.time()+60
+        verified_limit=50
+        try:
+            manifest=json.loads(path.read_text())
+            self._external_expires=min(self._external_expires,manifest['observed_at']+86400)
+            for report in manifest.get('reports',[]):
+                if report.get('provider')=='openrouter':
+                    limit=report.get('daily_quota',{}).get('limit')
+                    if type(limit) is int and 0<limit<=1000:verified_limit=limit
+        except (OSError,ValueError,KeyError,TypeError,AttributeError):pass
+        slots=[s for s in self._slots if s.provider not in ('cloudflare','openrouter')]
+        for route in load_routes(path):
+            if route.provider=='openrouter' and not self.settings.openrouter_api_key:continue
+            if route.provider=='cloudflare' and not (self.settings.cloudflare_api_token and self.settings.cloudflare_free_plan_confirmed):continue
+            group=hashlib.sha256((route.provider+'\0'+(self.settings.cloudflare_account_id if route.provider=='cloudflare' else 'account')).encode()).hexdigest()
+            router=ExternalClient(self.settings,route,self.store,self.client)
+            # OpenRouter has a common 20 RPM / baseline 50 RPD free account cap.
+            # A larger allowance needs an authenticated discovery report.
+            # Cloudflare 4 RPM is an operational guard;
+            # its actual admission unit is account-wide neurons in the client.
+            limits=(20,0,verified_limit,0) if route.provider=='openrouter' else (4,0,0,0)
+            label=route.provider+'-'+hashlib.sha256(route.model.encode()).hexdigest()[:8]
+            slots.append(_Slot(route.provider,label,group,router,route.model,
+                ('text','vlm') if route.vision else ('text',),limits,'account-all-models'))
+        self._slots=slots
 
     def fork(self):
         """Fresh request-local state/clients; quota leases and paid budget remain shared."""
@@ -129,6 +169,7 @@ class ProviderPool:
 
     @property
     def available(self):
+        self._reload_external()
         if self._primary(self.settings.analysis_version=='vlm')=='anthropic':
             return self.claude.available
         return bool(self._slots or (self.settings.ai_claude_fallback_enabled and self.claude.available))
@@ -137,7 +178,7 @@ class ProviderPool:
         return slot.model or getattr(self.settings, slot.provider+('_vision_model' if images else '_text_model'))
 
     def _estimate(self, slot, system, user, max_tokens, images):
-        completion=max(max_tokens,getattr(self.settings,slot.provider+'_max_completion_tokens'))
+        completion=max(max_tokens,getattr(self.settings,slot.provider+'_max_completion_tokens',self.settings.external_max_completion_tokens))
         return math.ceil(len((system+user).encode('utf-8'))/3)+512+2048*len(images or [])+completion
 
     def _quota_key(self,slot,images):
@@ -164,6 +205,8 @@ class ProviderPool:
         if slot.provider=='gemini':
             local=datetime.fromtimestamp(now,ZoneInfo('America/Los_Angeles'))
             start=local.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
+        elif slot.provider in ('openrouter','cloudflare'):
+            start=datetime.fromtimestamp(now,ZoneInfo('UTC')).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
         else:start=now-86400
         return [row for row in rows if start<=row['at']<=now]
 
@@ -172,10 +215,14 @@ class ProviderPool:
         if slot.provider=='gemini':
             local=datetime.fromtimestamp(now,ZoneInfo('America/Los_Angeles'))
             return (local.replace(hour=0,minute=0,second=0,microsecond=0)+timedelta(days=1)).timestamp()
+        if slot.provider in ('openrouter','cloudflare'):
+            from trading.agents.external_client import utc_reset
+            return utc_reset(now)
         return min((row['at']+86400 for row in rows if row['at']+86400>now),default=None)
 
     def _cooldown(self, slot, images):
         model=self._model(slot,images)
+        if hasattr(slot.router,'retry_at'):return slot.router.retry_at()
         return slot.router.store.get(slot.provider+':retry_at:'+model,0)
 
     def _reserve(self, candidates, system, user, max_tokens, images):
@@ -186,6 +233,10 @@ class ProviderPool:
             choices=[]
             for slot in candidates:
                 if not self._supports(slot,images):continue
+                if hasattr(slot.router,'capacity_available') and not slot.router.capacity_available():continue
+                if hasattr(slot.router,'request_fits'):
+                    slot.router.decision_schema=self.decision_schema
+                    if not slot.router.request_fits(system,user,max_tokens,images):continue
                 key=self._quota_key(slot,images)
                 if self._cooldown(slot,images)>now:
                     continue
@@ -238,6 +289,7 @@ class ProviderPool:
 
     def snapshot(self):
         """Safe local quota estimates; no provider credit or remaining-quota claim."""
+        self._reload_external()
         now=time.time()
         rows=[]
         seen=set()
@@ -255,7 +307,7 @@ class ProviderPool:
                 rows.append(dict(provider=slot.provider,model=self._model(slot,images),quota_group=slot.group[:12],
                     requests_minute=len(minute),tokens_minute_estimate=sum(r['tokens'] for r in minute),
                     requests_daily=len(day),tokens_daily_estimate=sum(r['tokens'] for r in day),
-                    daily_window='pacific_calendar_day' if slot.provider=='gemini' else 'rolling_24h_conservative',
+                    daily_window='pacific_calendar_day' if slot.provider=='gemini' else 'utc_calendar_day' if slot.provider in ('openrouter','cloudflare') else 'rolling_24h_conservative',
                     next_daily_reset_at=self._daily_reset(slot,day,now),
                     requests_minute_remaining=max(0,rpm-len(minute)) if rpm else None,
                     tokens_minute_remaining_estimate=max(0,tpm-sum(r['tokens'] for r in minute)) if tpm else None,
@@ -264,6 +316,7 @@ class ProviderPool:
                     cooldown_seconds=max(0,state.get('retry_at',0)-now,self._cooldown(slot,images)-now),
                     in_flight=bool(state.get('lease') and state['lease']['until']>now),
                     provider_reported=copy.deepcopy(state.get('provider_reported',{})),local_estimate=True))
+                if slot.provider=='cloudflare':rows[-1].update(slot.router.accounting())
         paid=self.store.get(self._paid_guard_key(),{})
         return dict(groups=rows,quota_window='provider_specific',provider_reported=False,
             paid_guard=dict(model=self.settings.anthropic_model,operational_guard=True,
@@ -276,6 +329,7 @@ class ProviderPool:
         Each quota-group/model already allows one in-flight operation. Never count
         two credentials for the same quota group twice or invent extra paid slots.
         """
+        self._reload_external()
         now=time.time();free=0;details=[];seen=set()
         for slot in self._slots:
             if not self._supports(slot,images):continue
@@ -291,7 +345,10 @@ class ProviderPool:
             rpm,tpm,rpd,tpd=self._limits(slot,images)
             busy=(state.get('lease') or {}).get('until',0)>now
             cooling=max(state.get('retry_at',0),self._cooldown(slot,images))>now
-            allowed=(not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now)
+            external_ok=not hasattr(slot.router,'capacity_available') or slot.router.capacity_available()
+            if external_ok and hasattr(slot.router,'request_fits'):
+                external_ok=slot.router.request_fits('','x'*min(200000,max(0,int(prompt_bytes))+5000),max_tokens,[None]*3 if images else None)
+            allowed=(external_ok and not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now)
                 and (not rpm or len(minute)<rpm) and (not tpm or sum(row['tokens'] for row in minute)+estimate<=tpm)
                 and (not rpd or len(day)<rpd) and (not tpd or sum(row['tokens'] for row in day)+estimate<=tpd))
             free+=int(allowed)
@@ -323,7 +380,7 @@ class ProviderPool:
                 row['successes']+=int(attempt.get('status')=='success')
                 row['failures']+=int(attempt.get('status') in ('failed','rejected','invalid_schema','error_or_invalid_output','provider_credit_exhausted','output_truncated','model_refusal'))
             self.store.put('ai_request_stats',stats)
-            for provider in ('groq','gemini'):
+            for provider in ('groq','gemini','openrouter','cloudflare'):
                 usage=self.store.get(provider+'_usage',dict(successful_calls=0,input_tokens=0,output_tokens=0))
                 for attempt in self.last_trace['attempts']:
                     if attempt.get('provider')!=provider:
@@ -402,7 +459,11 @@ class ProviderPool:
             rpm,tpm,rpd,tpd=self._limits(slot,images)
             cooling=max(state.get('retry_at',0),self._cooldown(slot,images))>now
             busy=(state.get('lease') or {}).get('until',0)>now
-            if (tpm and tokens>tpm) or (tpd and tokens>tpd):reason='request_too_large'
+            external_ok=not hasattr(slot.router,'capacity_available') or slot.router.capacity_available()
+            external_fits=not hasattr(slot.router,'request_fits') or slot.router.request_fits(system,user,max_tokens,images)
+            if not external_ok:reason='external_account_budget_or_cooldown'
+            elif not external_fits:reason='external_context_or_neuron_budget'
+            elif (tpm and tokens>tpm) or (tpd and tokens>tpd):reason='request_too_large'
             elif rpd and len(day)>=rpd:reason='daily_requests' if slot.provider=='gemini' else 'rolling_daily_requests'
             elif tpd and sum(row['tokens'] for row in day)+tokens>tpd:reason='rolling_daily_tokens'
             elif blocked(state.get('provider_reported',{}),tokens,now):reason='provider_reported_limit'
@@ -531,6 +592,7 @@ class ProviderPool:
         return result
 
     def complete_json(self, *, system, user, max_tokens=800, images=None):
+        self._reload_external()
         self.last_trace=dict(attempts=[],status='pending')
         self.last_status='not_called'
         self.last_credential_id=''

@@ -182,6 +182,14 @@ class Settings(BaseSettings):
     ai_schedule_mode: str = Field(default="interval",pattern="^(interval|quota)$")
     ai_provider_pool_enabled: bool = False
     ai_free_model_routes: str = '[]'
+    external_models_enabled: bool = False
+    external_models_file: str = 'data/external-models.json'
+    openrouter_api_key: str = Field(default='',repr=False)
+    cloudflare_api_token: str = Field(default='',repr=False)
+    cloudflare_account_id: str = Field(default='',repr=False)
+    cloudflare_free_plan_confirmed: bool = False
+    cloudflare_daily_neuron_budget: float = Field(default=9000,gt=0,le=10000)
+    external_max_completion_tokens: int = Field(default=2048,ge=700,le=8192)
     ai_parallel_candidates: int = Field(default=2,ge=1,le=8)
     ai_dynamic_parallel_enabled: bool = True
     ai_pool_retry_seconds: float = Field(default=5,ge=0,le=10)

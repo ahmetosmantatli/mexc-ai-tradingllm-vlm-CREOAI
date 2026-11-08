@@ -182,7 +182,7 @@ def format_trace(trace):
     if trace.get('execution_status')=='rejected':
         text+=human_reason(trace.get('execution_reason'))+'\n'
     for attempt in trace.get('attempts',[]):
-        provider={'groq':'Groq','gemini':'Gemini','anthropic':'Claude'}.get(attempt.get('provider'),'AI')
+        provider={'groq':'Groq','gemini':'Gemini','anthropic':'Claude','openrouter':'OpenRouter','cloudflare':'Cloudflare'}.get(attempt.get('provider'),'AI')
         label=f" / {attempt['credential_id']}" if attempt.get('credential_id') else ''
         text+=f"• {provider}{label} ({attempt.get('model','model bilgisi yok')}): {provider_result(attempt)}.\n"
     known=[a['estimated_cost_usd'] for a in trace.get('attempts',[]) if a.get('estimated_cost_usd') is not None]

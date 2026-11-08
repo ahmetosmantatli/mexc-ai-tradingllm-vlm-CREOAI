@@ -238,11 +238,13 @@ class TelegramController:
     def quota_text(self, account_id):
         snapshot=self.snapshot_provider(account_id) or {}
         groups=(snapshot.get('provider_pool') or {}).get('groups',[])
-        text='AI kotaları · yerel tahmin; sağlayıcı bakiyesi değildir.\nGemini: Pasifik günü. Groq: korumacı son24s.\n'
+        text='AI kotaları · yerel tahmin; sağlayıcı bakiyesi değildir.\nGemini: Pasifik günü. Groq: korumacı son24s. OpenRouter/Cloudflare: UTC günü, hesap ortak kotası.\n'
         for group in groups[:24]:
             text+=(f"{group['provider']} / {group['model']} / {group['quota_group']}\n"
                    f"Kalan günlük istek {group.get('requests_daily_remaining','?')} | dk istek {group.get('requests_minute_remaining','?')} | "
                    f"dk token tahmini {group.get('tokens_minute_remaining_estimate','?')} | Meşgul: {'evet' if group.get('in_flight') else 'hayır'}\n")
+            if group.get('provider')=='cloudflare':
+                text+=f"Neuron ayrılan/tahmini: {group.get('neurons_reserved_or_estimated',0):.1f} / yerel bütçe {group.get('neuron_budget',0):.0f}; sağlayıcı faturası değil.\n"
         resets=sorted({g['next_daily_reset_at'] for g in groups if g.get('provider')=='gemini' and g.get('next_daily_reset_at')})
         if resets:text+='Gemini sonraki günlük reset: '+datetime.fromtimestamp(resets[0],ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M')+'\n'
         if len(groups)>24 or len(text)>3750:
@@ -386,7 +388,7 @@ class TelegramController:
                 source='AI seçimi' if p.get('sizing_source')=='model' else 'profil ayarı'
                 text+=f"Kaldıraç/risk: {source} | Planlanan kasa riski: %{p['sizing_risk_fraction']*100:g}\n"
             origin=p.get('decision_ai') or {}
-            provider={'groq':'Groq','gemini':'Gemini','anthropic':'Claude'}.get(origin.get('provider'),'Kayıtlı değil')
+            provider={'groq':'Groq','gemini':'Gemini','anthropic':'Claude','openrouter':'OpenRouter','cloudflare':'Cloudflare'}.get(origin.get('provider'),'Kayıtlı değil')
             text+=f"Giriş kararını veren: {provider} / {origin.get('model') or 'model bilgisi yok'}\n"
         return text
 

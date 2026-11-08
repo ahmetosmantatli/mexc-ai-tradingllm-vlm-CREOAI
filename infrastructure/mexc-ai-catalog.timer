@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh free AI model catalog hourly
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target
