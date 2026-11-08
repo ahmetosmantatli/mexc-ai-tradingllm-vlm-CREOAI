@@ -45,7 +45,7 @@ class Client:
         if self.on_submit:self.on_submit()
         self.order_row=dict(symbol=symbol,side=1 if side=='long' else 3,openType=1,positionMode=position_mode,
             externalOid=external_id,positionId=11,orderId=22,vol=contracts,dealVol=contracts*self.fill_fraction,
-            dealAvgPrice=100.,state=3 if self.fill_fraction==1 else 2)
+            dealAvgPrice=100.,type=5,state=3 if self.fill_fraction==1 else 2)
         self.positions=[dict(symbol=symbol,positionType=1 if side=='long' else 2,positionId=11,holdVol=contracts*self.fill_fraction,
             state=1,openType=1,autoAddIm=0,leverage=leverage,holdAvgPrice=100.,im=20.,unRealizedPnl=0.,liquidatePrice=80.)]
         if self.submit_unknown:raise SimpleError(ambiguous=True)
@@ -264,6 +264,53 @@ def test_unknown_protection_volume_type_does_not_duplicate_order(tmp_path):
     result=executor.reconcile(intent['intent_id'])
     assert result['status']=='close_write_unknown'
     assert len(private.protects)==1 and len(private.closes)==1
+
+
+def test_attached_market_protection_without_stop_type_matches_documented_shape(tmp_path):
+    executor,private,store=setup(tmp_path);intent=approve(executor)
+    def attached():
+        private.stops=[dict(positionId=11,orderId=22,positionType=1,errorCode=0,
+            lossTrend=2,profitTrend=2,stopLossPrice=98.,takeProfitPrice=104.,
+            state=1,isFinished=0,profitLossVolType='SEPARATE',
+            stopLossVol=1000.,takeProfitVol=1000.,vol=1000.,
+            takeProfitType=0,stopLossReverse=2,takeProfitReverse=2)]
+    private.on_submit=attached
+    result=executor.execute(intent['intent_id'])
+    assert result['status']=='protected'
+    assert result['protection_verification']=='attached_market_entry_schema'
+    assert not private.protects and not private.closes
+    restarted=ApprovedLiveExecutor(executor.gates,store,private,executor.public,executor.risk,
+        account_id='ahmet',binding_id='binding-1')
+    assert restarted.reconcile(intent['intent_id'])['status']=='protected'
+    assert len(private.submits)==1
+
+
+@pytest.mark.parametrize('changes',[
+    {'stopLossType':1},{'stopLossType':None},{'stopLossType':False},
+    {'stopLossOrderPrice':97.},{'orderId':99},{'positionType':2},
+    {'errorCode':8912},{'takeProfitType':1},{'takeProfitReverse':1},
+    {'stopLossVol':999.},{'state':2},{'isFinished':1}])
+def test_attached_missing_stop_type_never_hides_conflicting_protection(tmp_path,changes):
+    executor,private,store=setup(tmp_path);intent=approve(executor)
+    executor.execute(intent['intent_id'])
+    native=private.stops[0]
+    native.pop('stopLossType')
+    native.update(orderId=22,positionType=1,errorCode=0,
+        profitLossVolType='SEPARATE',stopLossVol=1000.,takeProfitVol=1000.)
+    native.update(changes)
+    result=executor.reconcile(intent['intent_id'])
+    assert result['status']=='close_write_unknown'
+    assert len(private.closes)==1
+
+
+def test_unknown_stop_type_not_inferred_for_old_or_unconfirmed_entry(tmp_path):
+    executor,private,store=setup(tmp_path);intent=approve(executor)
+    result=executor.execute(intent['intent_id'])
+    private.stops[0].pop('stopLossType')
+    private.stops[0].update(orderId=22,positionType=1,errorCode=0)
+    result.pop('entry_protection_schema')
+    executor._save(result)
+    assert executor.reconcile(intent['intent_id'])['status']=='close_write_unknown'
 
 
 def test_actual_filled_liquidation_risk_can_trigger_one_reduce_close(tmp_path):

@@ -244,7 +244,8 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             if not self._authorized(row):raise LiveExecutionError('entry_authorization_changed')
             self._check_lease(token)
             if row['expires_at']<=time():raise LiveExecutionError('approval_expired_during_preflight')
-            row.update(status='entry_write_unknown',entry_write_attempted=True,contracts=contracts,position_mode=mode)
+            row.update(status='entry_write_unknown',entry_write_attempted=True,contracts=contracts,position_mode=mode,
+                entry_protection_schema='mexc_create_market_attached_v1')
             self._save(row) # Durable before POST; crash requires read-only reconciliation.
             try:
                 self.private.submit_market(symbol=proposal.symbol,side=proposal.side.value,contracts=contracts,
@@ -299,13 +300,31 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                     volume_ok=(self._number(protection.get('vol'))==self.remaining_contracts(row) if volumes=='SAME' else
                         volumes=='SEPARATE' and self._number(protection.get('stopLossVol'))==self.remaining_contracts(row)
                         and self._number(protection.get('takeProfitVol'))==self.remaining_contracts(row))
+                    # MEXC's documented attached-order response example omits
+                    # stopLossType. Recognize that shape only for our confirmed
+                    # market entry and its exact attached native order. Never
+                    # interpret an explicit null/limit type as market, or apply
+                    # this inference to arbitrary position/external protections.
+                    stop_type_ok=type(protection.get('stopLossType')) is int and protection['stopLossType']==0
+                    attached_schema=(row.get('entry_protection_schema')=='mexc_create_market_attached_v1'
+                        and row.get('entry_exchange_type')==5
+                        and str(protection.get('orderId'))==str(row.get('exchange_order_id'))
+                        and str(row.get('exchange_order_id','')).isdigit()
+                        and int(row.get('exchange_order_id','0'))>0
+                        and protection.get('positionType')==(1 if row['proposal']['side']=='long' else 2)
+                        and protection.get('errorCode')==0
+                        and 'stopLossType' not in protection
+                        and ('stopLossOrderPrice' not in protection or
+                             type(protection['stopLossOrderPrice']) in (int,float) and protection['stopLossOrderPrice']==0))
+                    stop_type_ok=stop_type_ok or attached_schema
                     if (str(protection.get('positionId'))==str(position['positionId']) and protection.get('state')==1
                             and protection.get('isFinished')==0 and protection.get('lossTrend')==2 and protection.get('profitTrend')==2
-                            and protection.get('stopLossType')==0 and protection.get('takeProfitType')==0
+                            and stop_type_ok and protection.get('takeProfitType')==0
                             and protection.get('stopLossReverse')==2 and protection.get('takeProfitReverse')==2
                             and volume_ok
                             and self._number(protection.get('stopLossPrice'))==self.protection_levels(row)[0]
                             and self._number(protection.get('takeProfitPrice'))==self.protection_levels(row)[1]):
+                        row['protection_verification']='attached_market_entry_schema' if attached_schema else 'explicit_market_types'
                         return True
                     return None # Existing same-position protection is not safe to duplicate.
                 except (AttributeError,LiveExecutionError):
@@ -380,7 +399,8 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             if not (filled==row['contracts'] and order.get('state')==3 or 0<filled<row['contracts'] and order.get('state') in (4,5)):
                 return self._halt(row,'entry_fill_not_fully_confirmed')
             row.update(effective_contracts=filled,exchange_order_id=str(order['orderId']),
-                entry_fill_price=self._number(order.get('dealAvgPrice')),partial_fill=filled<row['contracts'])
+                entry_fill_price=self._number(order.get('dealAvgPrice')),partial_fill=filled<row['contracts'],
+                entry_exchange_type=order.get('type'))
             position=self._position(row,order)
             if position is None:
                 closed=self._historical_close(row,order)
