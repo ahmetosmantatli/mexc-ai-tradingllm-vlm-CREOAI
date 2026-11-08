@@ -6,6 +6,7 @@ merely finishing later does not authorize replacing a previously reviewed plan.
 Closed candles supplied by the caller must actually be complete observations.
 """
 import copy
+import hashlib
 import json
 from math import isfinite
 from time import time
@@ -37,6 +38,11 @@ class WatchPlan(BaseModel):
         if self.invalidation_condition=='below' and self.invalidation_price>=self.trigger_price:
             raise ValueError('trigger inside invalidation region')
         return self
+
+
+def watch_event_key(card):
+    event=[card.get('created_at'),card.get('triggered_at'),card.get('structure_event')]
+    return hashlib.sha256(json.dumps(event,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
 def _price(value):
@@ -132,7 +138,7 @@ class WatchCoordinator:
             state.update(revision=current['revision']+1,last_action=action,last_rationale=rationale[:1200],updated_at=now)
             if action=='watch':
                 state.update(status='watching',side=candidate.side.value,candidate=_snapshot(candidate),
-                    plan=plan.model_dump(),created_at=now,reason='model_watch',last_closed_at=None,triggered_at=None)
+                    plan=plan.model_dump(),created_at=now,reason='model_watch',last_closed_at=None,triggered_at=None,structure_event=None,structure_events={})
             elif action=='trade':
                 state.update(status='superseded',reason='trade_reviewed',side=candidate.side.value,candidate=_snapshot(candidate))
             self._put(self._key(candidate.symbol),state)
@@ -176,6 +182,26 @@ class WatchCoordinator:
                 return False
         return watch_triggered(plan,price=price,closed_candles=candles,now=now)
 
+    def request_structure_review(self,symbol,event,*,expected_revision,now=None):
+        """Reconsider a changed thesis; this is not a price-trigger confirmation."""
+        now=time() if now is None else now
+        with self.store.lock,self.store.db:
+            self.store.db.execute('BEGIN IMMEDIATE')
+            state=self.card(symbol)
+            if state.get('status') not in ACTIVE or state['revision']!=expected_revision:return False
+            events=state.get('structure_events',{})
+            if events.get(event.get('timeframe'))==event:return False
+            available=event.get('available_at')
+            if not _price(available) or not state.get('created_at',0)<available<=now:return False
+            if event.get('timeframe') not in ('15m','4h') or event.get('direction')!=('bearish' if state['side']=='long' else 'bullish'):
+                return False
+            events[event['timeframe']]=copy.deepcopy(event)
+            state.update(status='triggered',reason='structure_changed',structure_event=copy.deepcopy(event),structure_events=events,
+                triggered_at=now,revision=state['revision']+1,updated_at=now)
+            self._put(self._key(symbol),state)
+            self._event(state,'structure_changed',now)
+            return True
+
     def terminate(self,symbol,reason='cancelled',*,now=None,expected_revision=None):
         if reason not in ('cancelled','position_opened','invalidated','expired'):
             raise ValueError('invalid terminal reason')
@@ -203,5 +229,5 @@ def watch_snapshot(store):
             result.append(dict(symbol=row.get('symbol'),status=row.get('status'),side=row.get('side'),
                 revision=row.get('revision',0),trigger_type=plan.get('trigger_condition'),trigger_price=plan.get('trigger_price'),
                 timeframe_seconds=TIMEFRAMES.get(plan.get('timeframe')),expires_at=plan.get('expires_at'),
-                reason=row.get('last_rationale') or row.get('reason',''),invalidation=dict(condition=plan.get('invalidation_condition'),price=plan.get('invalidation_price'))))
+                reason=row.get('last_rationale') or row.get('reason',''),review_reason=row.get('reason'),last_action=row.get('last_action'),invalidation=dict(condition=plan.get('invalidation_condition'),price=plan.get('invalidation_price'))))
         return result

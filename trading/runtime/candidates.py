@@ -12,11 +12,13 @@ class CandidateQueue:
     def __init__(self, store, ttl_seconds=900, limit=80):
         self.store,self.ttl,self.limit=store,ttl_seconds,limit
 
-    def refresh(self, candidates, now=None):
+    def refresh(self, candidates, now=None, *, refreshed_symbols=None):
         now=time() if now is None else now
         with self.store.lock:
             previous={row['key']:row for row in self.store.get('candidate_queue',[])}
-            current={}
+            touched=set(refreshed_symbols) if refreshed_symbols is not None else None
+            current={key:row for key,row in previous.items() if row['expires_at']>now
+                and touched is not None and row['signal']['symbol'] not in touched}
             for candidate in candidates:
                 key=candidate_key(candidate)
                 old=previous.get(key,{})
@@ -43,7 +45,7 @@ class CandidateQueue:
             eligible=[r for r in rows if r.get('lease_until',0)<=now and r['signal']['symbol'] not in open_symbols and r['signal'].get('features',{}).get('dedup_key') not in seen]
             if not eligible:
                 return None
-            row=min(eligible,key=lambda r:(r['last_considered_at'],r['first_seen'],-r['signal']['confidence'],r['key']))
+            row=min(eligible,key=lambda r:(not bool(r['signal'].get('features',{}).get('watch_review')),r['last_considered_at'],r['first_seen'],-r['signal']['confidence'],r['key']))
             # Reserve consideration before slow provider work; concurrent scans
             # preserve this timestamp, so a refreshed top signal cannot starve peers.
             row['last_considered_at']=now

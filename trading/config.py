@@ -180,7 +180,8 @@ class Settings(BaseSettings):
     research_goal_stretch_multiple: float = Field(default=200, gt=1)
     ai_schedule_mode: str = Field(default="interval",pattern="^(interval|quota)$")
     ai_provider_pool_enabled: bool = False
-    ai_parallel_candidates: int = Field(default=2,ge=1,le=4)
+    ai_parallel_candidates: int = Field(default=2,ge=1,le=8)
+    ai_dynamic_parallel_enabled: bool = True
     ai_pool_retry_seconds: float = Field(default=5,ge=0,le=10)
     ai_pool_max_retry_attempts: int = Field(default=1,ge=0,le=1)
     groq_api_key_2: str = Field(default='',repr=False)

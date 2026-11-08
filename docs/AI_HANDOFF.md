@@ -73,8 +73,12 @@ model entry/SL/TP proposals; null retains quant levels. Actual size is recompute
 and contract steps. No minimum-quantity upsize beyond risk allowance.
 
 Typed conditional watch plans have threshold/candlecross, price invalidation and
-expiry<=24h. They persist outside candidatequeue; max40active. Scanner observes
-withoutAI; triggers require fresh matchingquant setup before review. Canonical
+expiry<=24h. They persist outside candidatequeue; max40active. LIVE scanner rotates persistently across symbols and retains unexpired candidates
+from unscanned groups. Price/candle triggers and closed opposing15m/4h BOS create
+independent watch_review candidates without requiring the original quant signal.
+Trading a watch_review requires a fresh grounded model price plan. Expired/stale
+events cannot trade. ProviderPool local capacity controls LIVE batch size up to
+AI_PARALLEL_CANDIDATES (1..8); AI_DYNAMIC_PARALLEL_ENABLED defaults true. Canonical
 symbolrevision prevents late analysis overriding newer plans; oppositeactive
 plans require explicitrevision acknowledgement and rationale. Watches aren't
 orders. Native LIVE SL/TP is verified. LIVE_POSITION_MANAGEMENT_ENABLED=true
@@ -130,3 +134,10 @@ Review before extending: nativeclosedhistory exactfields, unknownorderrecovery,
 sharedriskacrossparallelplans, credential/mode/grantepochisolation, pausedprotection,
 smallbalancecontractminimums, providerquotadynamiccontextdedup, truthfulLIVE/PAPER
 messages. Preserve existing userchanges; do not reset runtime state to hidelosses.
+
+
+Research instrumentation: valid LIVE decisions append immutable edge_reviews.
+`python -m trading.control.edge_report --root /app/data --fetch-public` compares
+initial quant/model plans with matched next-5m-open replay, estimated trading
+costs, explicit incomplete data and no funding/portfolio/AI-management claim.
+AI usage export now reads account/live DBs as well as PAPER text/vlm DBs.

@@ -221,6 +221,41 @@ class ProviderPool:
                 max_in_flight=1,in_flight=(paid.get('lease') or {}).get('until',0)>now,
                 cooldown_seconds=max(0,paid.get('retry_at',0)-now)))
 
+    def analysis_capacity(self,*,prompt_bytes=18000,max_tokens=1100,images=False,ceiling=8):
+        """Advisory current slots, not a quota guarantee; _reserve remains atomic authority.
+
+        Each quota-group/model already allows one in-flight operation. Never count
+        two credentials for the same quota group twice or invent extra paid slots.
+        """
+        now=time.time();free=0;details=[];seen=set()
+        for slot in self._slots:
+            key=self._quota_key(slot,images)
+            if key in seen:continue
+            seen.add(key)
+            state=self.store.get(key,dict(rows=[]))
+            day=[row for row in state['rows'] if 0<=now-row['at']<86400]
+            minute=[row for row in day if now-row['at']<60]
+            known=sorted(row['tokens'] for row in day[-20:] if row.get('usage_known'))
+            observed=known[min(len(known)-1,math.ceil(.9*len(known))-1)] if known else 0
+            estimate=max(observed,self._estimate(slot,'','x'*min(200000,max(0,int(prompt_bytes))+5000),max_tokens,[None]*3 if images else None))
+            rpm,tpm,rpd,tpd=self._limits(slot)
+            busy=(state.get('lease') or {}).get('until',0)>now
+            cooling=max(state.get('retry_at',0),self._cooldown(slot,images))>now
+            allowed=(not busy and not cooling
+                and (not rpm or len(minute)<rpm) and (not tpm or sum(row['tokens'] for row in minute)+estimate<=tpm)
+                and (not rpd or len(day)<rpd) and (not tpd or sum(row['tokens'] for row in day)+estimate<=tpd))
+            free+=int(allowed)
+            details.append(dict(provider=slot.provider,quota_group=slot.group[:12],estimated_request_tokens=estimate,
+                available=allowed,reason='available' if allowed else 'in_flight' if busy else 'cooldown' if cooling else 'quota_or_request_size'))
+        paid=self.store.get(self._paid_guard_key(),{})
+        paid_available=bool(self.settings.ai_claude_fallback_enabled and self.claude.available
+            and (self._paid_budget is None or self._paid_budget.can_spend())
+            and paid.get('retry_at',0)<=now and (paid.get('lease') or {}).get('until',0)<=now)
+        if self._primary(images)=='anthropic':free=0
+        count=min(max(1,int(ceiling)),free+int(paid_available))
+        return dict(parallel_candidates=count,free_slots=free,paid_slots=int(paid_available),ceiling=ceiling,
+            groups=details,local_estimate=True,reason='capacity_available' if count else 'quota_cooldown_or_in_flight')
+
     def _notify(self):
         self.last_trace.update(status=self.last_status,provider=self.last_provider,
             model=self.last_model,fallback_reason=self.last_fallback_reason,

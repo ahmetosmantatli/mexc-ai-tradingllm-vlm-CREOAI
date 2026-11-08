@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from trading.agents.schemas import EvaluationResult, GraphAction, MarketAnalystNote, StrategyReviewNote, PortfolioAnalystNote
-from trading.evaluation.watch import WatchPlan, WatchCoordinator, ACTIVE
+from trading.evaluation.watch import WatchPlan, WatchCoordinator, ACTIVE, watch_event_key
 from trading.evaluation.price_plan import MarketPricePlan,apply_market_price_plan,evidence_from_market
 from trading.evaluation.planning import PlanSizing, PlanSizingError, apply_decision_sizing
 from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context, economic_review_key, canonical_watch_card, watch_review_key
@@ -33,6 +33,9 @@ SYSTEM_POLICY = (
     'Account operating_context identifies PAPER or LIVE mode, observed balance, closed outcomes and an optional research objective. '
     'A research objective is reporting context only, never a reason to force a trade or exceed risk limits. '
     'Only the supplied candidate may be traded and only when cross-timeframe evidence is coherent. '
+    'A watch_review candidate is an independent watch/structure event, not a fresh SMA/ROC signal. '
+    'Its old SL/TP are context only. Trading watch_review requires a new validated price_plan; otherwise HOLD or update the watch. '
+    'canonical_watch.reason=structure_changed means reconsider the thesis, not that the entry threshold was reached. '
     'Return exactly JSON: action (trade/watch/hold), signal_id (supplied candidate ID or null), '
     'rationale, invalidation, watch_note, sizing_plan, watch_plan, reviewed_watch_revision. '
     'For an actionable watch return watch_plan: trigger_condition (price_above/price_below/closed_candle_cross_above/closed_candle_cross_below), '
@@ -152,6 +155,10 @@ class ContextEvaluator:
             memory['last_outcome']=copy.deepcopy(legacy['last_outcome'])
         coordinator=WatchCoordinator(self.store)
         prior_watch=coordinator.card(symbol)
+        if candidate.features.get('watch_review') and (prior_watch.get('status')!='triggered'
+                or prior_watch.get('plan',{}).get('expires_at',0)<=time.time()
+                or candidate.features.get('review_event_key')!=watch_event_key(prior_watch)):
+            return EvaluationResult(action=GraphAction.HOLD,hold_reason='stale_watch_review',metadata={'provider_called':False})
         live_account=context.pop('live_account_context',None)
         live_positions=context.pop('live_positions',None)
         if live_account is not None and (not isinstance(live_account,dict) or live_account.get('mode')!='LIVE' or live_account.get('currency')!='USDT'):
@@ -184,12 +191,16 @@ class ContextEvaluator:
             self.llm.last_status='budget_exhausted'
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='shared_budget_exhausted',metadata={'provider_called':False})
         changes=change_summary(memory.get('last_market'),chart_context,memory.get('last_fingerprint'),fingerprint)
+        if candidate.features.get('watch_review'):
+            structural=prior_watch.get('reason')=='structure_changed'
+            changes.update(reason='watch_structure_changed' if structural else 'watch_triggered',
+                summary='Takip gerekçesine karşı kapanmış yapısal kırılım oluştu; plan yeniden inceleniyor.' if structural else 'Takip koşulu gerçekleşti; eski algoritmadan yeni sinyal beklenmeden plan inceleniyor.')
         prompt=build_prompt(candidate,chart_context,memory,positions,account,self.cfg.analysis_version,changes)
         charts=render_bundle(bundle,Path(self.cfg.analysis_chart_dir)/symbol/fingerprint[:16])
         paths=[str(c.path) for c in charts]
         started=time.time()
         trace=dict(id=uuid4().hex,mode='LIVE' if live_account is not None else 'PAPER',symbol=symbol,strategy=candidate.strategy.value,confidence=candidate.confidence,
-            started_at=started,status='pending',attempts=[],provider='none',model='',
+            analysis_version=self.cfg.analysis_version,started_at=started,status='pending',attempts=[],provider='none',model='',
             why_reconsidered=changes,market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))
         publish_progress(self.store,trace)
@@ -203,6 +214,8 @@ class ContextEvaluator:
             if (decision.action=='trade' and live_account is not None
                     and (live_account.get('leverage_policy') or {}).get('mode')=='exchange' and decision.sizing_plan is None):
                 raise ValueError('explicit model sizing required for exchange leverage mode')
+            if decision.action=='trade' and candidate.features.get('watch_review') and decision.price_plan is None:
+                raise ValueError('independent watch trade requires a fresh price plan')
             if decision.price_plan is not None:
                 if not price_planning or decision.action!='trade':
                     raise ValueError('price planning disabled or not trade')
@@ -212,6 +225,11 @@ class ContextEvaluator:
                 raise ValueError('unknown signal')
             if decision.watch_plan is not None and decision.action!='watch':
                 raise ValueError('watch plan only allowed for watch action')
+            if decision.watch_plan is not None and decision.watch_plan.trigger_condition in ('price_above','price_below'):
+                price=decision.watch_plan.trigger_price
+                already_met=(price<=candidate.entry_price if decision.watch_plan.trigger_condition=='price_above' else price>=candidate.entry_price)
+                if already_met:
+                    raise ValueError('watch price condition already satisfied; choose a future condition or trade/hold')
             if decision.watch_plan is not None and not time.time()<decision.watch_plan.expires_at<=time.time()+86400:
                 raise ValueError('watch expiry must be within24h')
             return decision
@@ -299,6 +317,9 @@ class ContextEvaluator:
             invalidation=decision.invalidation,watch_note=decision.watch_note,
             execution_status='awaiting_risk' if decision.action=='trade' else 'not_opened')
         self._save_trace(trace)
+        if live_account is not None:
+            from trading.runtime.edge_research import record_review
+            record_review(self.store,trace,candidate,planned_candidate,self.cfg)
         decision_ai=dict(provider=getattr(self.llm,'last_provider','unknown'),model=getattr(self.llm,'last_model','unknown'),
             fallback_reason=getattr(self.llm,'last_fallback_reason',''),
             credential_id=getattr(self.llm,'last_credential_id',''),quota_group=getattr(self.llm,'last_quota_group',''))

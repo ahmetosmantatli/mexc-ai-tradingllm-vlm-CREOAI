@@ -289,7 +289,7 @@ def economic_review_key(account,positions):
 
 def canonical_watch_card(card):
     """Bounded cross-strategy plan, including revision for explicit supersession."""
-    keys=('symbol','revision','status','side','plan','created_at','updated_at','triggered_at','reason','last_action','last_rationale')
+    keys=('symbol','revision','status','side','plan','created_at','updated_at','triggered_at','reason','last_action','last_rationale','structure_event')
     result={key:card[key] for key in keys if key in card}
     candidate=card.get('candidate') or {}
     if candidate:
@@ -299,7 +299,7 @@ def canonical_watch_card(card):
 
 def watch_review_key(card):
     """Changes in active plan/lifecycle trigger a review; HOLD revision alone does not."""
-    result={key:card[key] for key in ('symbol','status','side','plan','created_at','reason') if key in card}
+    result={key:card[key] for key in ('symbol','status','side','plan','created_at','reason','structure_event') if key in card}
     # Triggered lifecycle revisions are meaningful evidence. A HOLD may increment
     # the coordinator revision but must not manufacture a new model call.
     if card.get('status')=='triggered':

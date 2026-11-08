@@ -17,7 +17,7 @@ def read_traces(root):
     for path in sorted(Path(root).rglob('*.sqlite3')):
         relative=path.relative_to(root)
         parts=relative.parts
-        if len(parts)<3 or parts[-2] not in ('text','vlm'):
+        if len(parts)<3 or parts[-2] not in ('text','vlm','live'):
             continue
         db=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=10)
         try:
@@ -33,7 +33,7 @@ def read_traces(root):
             for trace in traces.values():
                 safe={key:trace[key] for key in TRACE_FIELDS if key in trace}
                 safe['attempts']=[{key:a[key] for key in ATTEMPT_FIELDS if key in a} for a in trace.get('attempts',[])]
-                rows.append(dict(account=parts[0],session='/'.join(parts[1:-2]),variant=parts[-2],**safe))
+                rows.append(dict(account=parts[0],session='/'.join(parts[1:-2]),variant=(trace.get('analysis_version','unknown') if parts[-2]=='live' else parts[-2]),**safe))
         finally:
             db.close()
     return sorted(rows,key=lambda r:r.get('started_at',0))

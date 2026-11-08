@@ -225,3 +225,26 @@ def test_management_message_distinguishes_confirmed_stop_from_uncertain_action(t
         f._publish_management('a',row)
         assert 'henüz doğrulanmadı' in f.controller.messages[-1][0][1]
     finally:f.stop()
+
+
+def test_three_slow_jobs_do_not_starve_next_monitor_cycle(tmp_path):
+    import threading
+    f=fleet(tmp_path,live_position_management_enabled=True)
+    release=threading.Event();started=[threading.Event() for _ in range(3)]
+    def slow(index):
+        started[index].set();release.wait(3)
+    runner=f.runners['a']
+    runner.scan_market=lambda:slow(0)
+    runner.cycle=lambda:slow(1)
+    runner.manage_positions=lambda:slow(2)
+    try:
+        f.controller.set_control('a',enabled=True,stopped=False,capital_chosen=True,
+            capital_mode='account',version_chosen=True,profile_chosen=True)
+        f.tick();f.jobs[('a','monitor')].result(timeout=1)
+        assert all(event.wait(1) for event in started)
+        f.last_schedule[('a','monitor')]=0
+        f.tick()
+        f.jobs[('a','monitor')].result(timeout=1)
+        assert runner.calls.count('monitor')==2
+    finally:
+        release.set();f.stop()

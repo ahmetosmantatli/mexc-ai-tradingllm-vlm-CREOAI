@@ -55,7 +55,7 @@ class LiveFleet:
         self.last_schedule={}
         self.started=False
         self.closed=False
-        self.pool=ThreadPoolExecutor(max_workers=max(1,len(self.accounts)*3),thread_name_prefix='live')
+        self.pool=ThreadPoolExecutor(max_workers=max(1,len(self.accounts)*4),thread_name_prefix='live')
         self.connections=ConnectionFlow(self.controller,self.vault,self.bind_account,self.disconnect_account)
         original=self.controller.dispatch
         self.controller.dispatch=lambda update: None if self.connections.handle(update) else original(update)

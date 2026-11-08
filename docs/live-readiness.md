@@ -247,3 +247,79 @@ notifications. Bot/AI Stop (and Pause in the current LIVE panel) cuts new manage
 calls/actions; already-sent writes still reconcile, including protective resize.
 Native SL/TP monitoring is independent of model calls and continues while stopped.
 This release is verified with fake exchanges only, not a live-account execution test.
+
+## Coverage, independent watches and adaptive analysis admission
+
+LIVE scanning persists an alphabetical round-robin cursor over the discovered
+symbol universe. `SCANNER_MAX_SYMBOLS` (default 40) is work per scan, not a fixed
+first-40 universe. Each covered symbol still passes liquidity and fresh-candle
+checks. Explicit watch symbols are checked separately. Rotation ignores API list
+order and fee-free preference for coverage; it does not rank expected returns.
+The bounded candidate queue retains unexpired candidates from unscanned symbols,
+replacing/removing candidates for actually refreshed symbols. Full-queue limits
+and stale-data limits still apply; this does not promise review of every listing.
+
+A price/candle watch trigger now creates a separate `watch_review` opportunity.
+It no longer requires the original SMA/ROC/mean-reversion strategy to emit again.
+Closed opposing BOS observations on 15m/4h after watch creation also request a
+review, without implying an entry trigger or automatically reversing a position.
+Per-timeframe event records prevent the same 15m/4h observations alternating into
+repeat calls. These are explicit structure definitions, not all possible thesis
+changes or a validated ICT strategy. Watch expiration and price invalidation
+remain deterministic; queued expired/superseded events cannot authorize a trade.
+
+Independent reviews retain the canonical prior plan, its rationale and revision
+in self-contained context. Existing entry/SL/TP values are reference-only: trading
+an independent watch requires `LIVE_PRICE_PLAN_ENABLED=true` and a fresh valid
+model price plan. HOLD/watch remains possible without it. Current liquidity,
+closed context, quota, execution costs, margin, risk, native protection and
+credential/start-grant gates are unchanged. Different watch data failures are
+isolated per symbol. Watch candle data is cached through its closed-bar boundary;
+watch monitoring does not itself call a model.
+
+`AI_DYNAMIC_PARALLEL_ENABLED=true` uses ProviderPool local quota state to shrink
+or expand each LIVE entry batch up to `AI_PARALLEL_CANDIDATES` (now 1..8). Capacity
+counts distinct available quota-group/model slots, in-flight leases, cooldowns,
+rolling minute/day requests/tokens and conservative request-size estimates
+including observed token counts. Each existing group mutex permits one operation
+at a time; Claude contributes at most one available paid fallback slot, subject
+to its guard and configured budget. This is advisory scheduling, not real provider
+quota/credit telemetry. Atomic request reservations remain final authority when
+accounts race or actual input sizes differ. An unavailable pool does not consume
+candidate consideration or stop scanning/position reconciliation. The fleet reserves
+four job slots per account (monitor/scan/entry/management), so three slow analysis
+jobs cannot occupy every worker needed by the next monitor cycle. No fallback
+input is truncated. Telegram shows coverage and admission estimates separately
+from last entry status so monitor updates do not hide a waiting entry reason.
+
+## Measuring model contribution without inventing profits
+
+Valid LIVE reviews now append immutable `edge_reviews` records: raw quant plan,
+model action/initial price plan, variant, observed spread and configured estimated
+fee/slippage. Each opportunity is counted once in a matched replay, even if it was
+reviewed repeatedly. Independent watch reviews have no equivalent fresh quant
+baseline and are explicitly excluded from that comparison.
+
+Run the research export in the worker with persisted data available:
+
+```bash
+python -m trading.control.edge_report --root /app/data --fetch-public --output-dir /app/data/reports
+python -m trading.control.usage_report --output-dir /app/data/reports
+```
+
+The first command makes public 5m candle calls only, never model/private order
+calls. Alternatively supply `--candles-json PATH` for fully offline replay.
+Default horizon is 48 closed 5m bars (4h). Both baseline/model use the next-full-bar
+open convention, entry drift validation, adverse gap exits, stop-first treatment
+when a candle hits both levels, configured fees/slippage and a constant observed
+spread assumption. Missing/expired candle history, missing spread or incomplete
+horizons are explicitly incomplete, not zero. Only available recent public history
+is fetched; missing older data is not fabricated or silently interpolated.
+
+This isolates selection and INITIAL price planning on overlapping opportunities;
+it is not a portfolio backtest, exact live fills, dynamic management replay or
+proof of edge. Funding/liquidation/AI API dollars are not combined into a false net
+return. AI usage/cost is exported separately; actual LIVE realized outcomes remain
+exchange-reconciled records. LIVE usage exports now include account/live databases
+and separate known text/VLM variants; legacy untagged LIVE usage is unknown.
+No historical review records are invented for releases before this journal existed.

@@ -13,6 +13,7 @@ from trading.models.domain import Side
 
 
 class StrategyName(str, Enum):
+    WATCH_REVIEW = "watch_review"
     TREND = "trend"
     MOMENTUM = "momentum"
     MEAN_REVERSION = "mean_reversion"

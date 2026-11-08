@@ -362,3 +362,25 @@ def test_anthropic_safe_retry_after_parsed_without_raw_header_or_body(tmp_path,h
     assert 'private' not in str(attempt)
     state=p.store.get(p._paid_guard_key())
     assert state['retry_at']>time.time()+ (expected or 60)-1
+
+
+def test_dynamic_capacity_counts_quota_groups_not_credentials_and_includes_single_paid_guard(tmp_path):
+    cfg=settings(groq_api_key_2='key-2',gemini_api_key='google',gemini_api_key_2='google-2',
+        gemini_quota_group_2='separate',anthropic_api_key='paid',ai_claude_fallback_enabled=True)
+    p,_=pool(tmp_path,cfg)
+    capacity=p.analysis_capacity(prompt_bytes=100,max_tokens=700,ceiling=8)
+    assert capacity['free_slots']==3 # Two Groq keys share ONE organization group.
+    assert capacity['paid_slots']==1 and capacity['parallel_candidates']==4
+    assert p.analysis_capacity(prompt_bytes=100,max_tokens=700,ceiling=2)['parallel_candidates']==2
+
+
+def test_capacity_drops_for_busy_cooldown_and_oversize_requests_without_sending_http(tmp_path):
+    calls=[];p,store=pool(tmp_path,settings(),lambda request:(calls.append(request) or response()))
+    assert p.analysis_capacity(prompt_bytes=100)['parallel_candidates']==1
+    assert p.analysis_capacity(prompt_bytes=100000)['parallel_candidates']==0
+    slot=p._slots[0];key=p._quota_key(slot,False)
+    store.put(key,dict(rows=[],lease={'until':time.time()+30}))
+    assert p.analysis_capacity(prompt_bytes=100)['parallel_candidates']==0
+    store.put(key,dict(rows=[],retry_at=time.time()+30))
+    assert p.analysis_capacity(prompt_bytes=100)['parallel_candidates']==0
+    assert not calls

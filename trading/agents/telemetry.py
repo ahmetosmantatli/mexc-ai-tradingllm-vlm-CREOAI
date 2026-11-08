@@ -146,7 +146,7 @@ def provider_result(attempt):
 
 def format_trace(trace):
     """Simple outcome notification. Technical request details stay in diagnostics."""
-    strategy={'trend':'trend takibi','momentum':'ivme takibi','mean_reversion':'ortalamaya dönüş'}.get(trace.get('strategy'),'aday incelemesi')
+    strategy={'trend':'trend takibi','momentum':'ivme takibi','mean_reversion':'ortalamaya dönüş','watch_review':'takip planı yeniden incelemesi'}.get(trace.get('strategy'),'aday incelemesi')
     text=f"{trace_outcome(trace)}\n{trace.get('symbol','?')} | {strategy}\n"
     if trace.get('rationale'):
         text+='AI gerekçesi: '+str(trace['rationale'])[:1200]+'\n'

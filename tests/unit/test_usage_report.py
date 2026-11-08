@@ -38,3 +38,14 @@ def test_archive_survives_recent_history_rollover_and_separates_variants(tmp_pat
     assert report['evaluations']==70
     assert len(report['groups'])==2
     assert all(g['generation_requests']==35 for g in report['groups'])
+
+
+def test_live_usage_and_position_management_are_exported_with_actual_variant(tmp_path):
+    root=tmp_path/'data';store=RuntimeStore(str(root/'friend'/'live'/'runtime.sqlite3'))
+    for ident,version,strategy in [('entry','text','trend'),('management','vlm','position_management')]:
+        archive_trace(store,dict(id=ident,mode='LIVE',analysis_version=version,strategy=strategy,started_at=100,
+            attempts=[dict(provider='gemini',model='fake',status='success',generation_requests=1,input_tokens=300,output_tokens=50)]))
+    report=export(root,tmp_path/'out')
+    assert report['evaluations']==2
+    assert {g['variant'] for g in report['groups']}=={'text','vlm'}
+    assert 'position_management' in (tmp_path/'out'/'ai-requests.csv').read_text()

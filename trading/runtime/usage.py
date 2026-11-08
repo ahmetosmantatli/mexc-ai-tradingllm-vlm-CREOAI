@@ -1,7 +1,7 @@
 """Durable, allowlisted usage journal; no prompts, secrets or chart content."""
 import json
 
-TRACE_FIELDS=('id','symbol','strategy','confidence','started_at','completed_at','status','action','provider','model','fallback_reason','execution_status','execution_reason','rationale','invalidation','watch_note','why_reconsidered','market_fingerprint','input_fingerprint','context_policy','prompt_bytes')
+TRACE_FIELDS=('id','mode','analysis_version','symbol','strategy','confidence','started_at','completed_at','status','action','provider','model','fallback_reason','execution_status','execution_reason','rationale','invalidation','watch_note','why_reconsidered','market_fingerprint','input_fingerprint','context_policy','prompt_bytes')
 ATTEMPT_FIELDS=('provider','model','status','phase','http_status','error_category','error_code','error_param','latency_ms','generation_requests','count_requests','input_tokens','output_tokens','estimated_cost_usd','pending_usd','estimated_input_tokens','token_budget','completion_token_limit','output_stop_reason','validation_issues','credential_id','quota_group','retry_number')
 
 

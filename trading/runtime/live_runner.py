@@ -210,35 +210,8 @@ class LiveRunner:
         raise ValueError('request-local management model required')
 
     def _watch_candidates(self):
-        coordinator=WatchCoordinator(self.store)
-        produced=[]
-        for summary in [row for row in watch_snapshot(self.store) if row['status'] in ('watching','triggered')][:40]:
-            symbol=summary['symbol']
-            coordinator.observe(symbol)
-            card=coordinator.card(symbol)
-            if card['status'] not in ('watching','triggered'):
-                continue
-            ticker=self.quote(symbol)
-            plan=card['plan'];closed=None
-            if plan['trigger_condition'].startswith('closed_candle'):
-                tf=plan['timeframe'];seconds=TIMEFRAMES[tf]
-                rows=self.public.get_klines(symbol,interval={'5m':'Min5','15m':'Min15','4h':'Hour4'}[tf],limit=4)['candles']
-                now=time.time()
-                observations=[dict(close=float(row[4]),closed_at=float(row[0])+seconds,complete=True)
-                    for row in rows if isinstance(row,(list,tuple)) and len(row)>=5 and float(row[0])+seconds<=now]
-                if observations and now-observations[-1]['closed_at']<seconds*2:
-                    closed={tf:observations}
-            coordinator.observe(symbol,price=ticker.last_price,closed_candles=closed,expected_revision=card['revision'])
-            card=coordinator.card(symbol)
-            if card['status']!='triggered':
-                continue
-            scan=MarketScanner(self.public,max_symbols=1,max_workers=1).scan(symbols=[symbol])
-            latest=coordinator.card(symbol)
-            if latest['revision']!=card['revision']:
-                continue
-            produced.extend(candidate for candidate in scan.candidates if candidate.side.value==card['side']
-                and candidate.strategy.value==card['candidate']['strategy'])
-        return produced
+        from trading.runtime.live_watch import LiveWatchReviewer
+        return LiveWatchReviewer(self).collect()
 
     def scan_market(self):
         if not self._scan_lock.acquire(blocking=False):
@@ -247,7 +220,7 @@ class LiveRunner:
             if not self._enabled():
                 return None
             scan=MarketScanner(self.public,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,
-                self.cfg.scanner_max_spread_bps),max_symbols=self.cfg.scanner_max_symbols).scan()
+                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store).scan()
             errors=dict(scan.errors)
             try:
                 scan.candidates.extend(self._watch_candidates())
@@ -261,14 +234,17 @@ class LiveRunner:
                 opened=candidate.features.get('source_open_at')
                 if candidate.confidence<.65 or not isinstance(closed,(int,float)) or opened is None or not 0<=time.time()-closed<=1200:
                     continue
-                key=hashlib.sha256(f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}:{int(float(opened))}'.encode()).hexdigest()
+                key=hashlib.sha256(f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}:{int(float(opened))}:{candidate.features.get("review_event_key","")}'.encode()).hexdigest()
                 candidate.features['dedup_key']=key
                 eligible.append(candidate)
             if not self._enabled():
                 return None
-            size=self.candidate_queue().refresh(eligible)
+            touched=set(self.store.get('universe_rotation',{}).get('selected',[]))
+            touched.update(row['symbol'] for row in watch_snapshot(self.store) if row['status'] in ('watching','triggered'))
+            size=self.candidate_queue().refresh(eligible,refreshed_symbols=touched or None)
             self.store.put('last_scan_at',time.time())
-            summary=dict(at=time.time(),scanned=scan.scanned,kept=scan.kept,eligible=len(eligible),queue_size=size,errors=errors)
+            summary=dict(at=time.time(),scanned=scan.scanned,kept=scan.kept,eligible=len(eligible),queue_size=size,errors=errors,
+                universe=self.store.get('universe_rotation',{}))
             self.store.put('scan_summary',summary)
             return summary
         finally:
@@ -426,7 +402,16 @@ class LiveRunner:
             if not self.external_scan:
                 self.scan_market()
             waiting={row['symbol'] for row in watch_snapshot(self.store) if row['status']=='watching'}
-            count=min(4,getattr(self.cfg,'ai_parallel_candidates',1)) if callable(getattr(self.llm,'fork',None)) else 1
+            count=min(8,getattr(self.cfg,'ai_parallel_candidates',1)) if callable(getattr(self.llm,'fork',None)) else 1
+            if self.cfg.ai_dynamic_parallel_enabled and callable(getattr(self.llm,'analysis_capacity',None)):
+                history=self.store.get('analysis_history',[])[-10:]
+                prompt_bytes=max([18000]+[row.get('prompt_bytes',0) for row in history])
+                capacity=self.llm.analysis_capacity(prompt_bytes=prompt_bytes,
+                    max_tokens=1100 if self.cfg.live_price_plan_enabled else 700,
+                    images=control.get('version',self.cfg.analysis_version)=='vlm',ceiling=count)
+                self.store.put('analysis_capacity',capacity)
+                count=capacity['parallel_candidates']
+                if count<=0:return self.status('HOLD_LIVE_AI_CAPACITY')
             queue=self.candidate_queue()
             for _ in range(count):
                 candidate=queue.next(open_symbols=set(self._positions(snapshot))|waiting|{c.symbol for c in selected},
@@ -488,6 +473,9 @@ class LiveRunner:
         return self.executor.request_close(intents[0]['intent_id'])
 
     def status(self,reason):
+        if reason.startswith(('HOLD_LIVE','LIVE_PROTECTED','LIVE_PAUSED')) and reason!='HOLD_LIVE_RECONCILIATION':
+            prior=self.store.get('live_entry_status',{})
+            if prior.get('reason')!=reason:self.store.put('live_entry_status',dict(reason=reason,at=time.time()))
         account=self.store.get(self.reconciler.key,{})
         intents=self._intents()
         positions={}
@@ -510,6 +498,7 @@ class LiveRunner:
         snapshot=dict(mode='LIVE',live_orders_enabled=bool(self.executor is not None),observed_at=time.time(),reason=reason,
             account=dict(ready=account.get('ready',False),**account.get('balance',{})),
             live_account=account,real_account=account,balance=account.get('balance'),positions=positions,closed=closed,intents=intents,
+            entry_status=self.store.get('live_entry_status',{}),analysis_capacity=self.store.get('analysis_capacity',{}),scan_summary=self.store.get('scan_summary',{}),
             management_status=self.store.get('management_status',{}),management_trace=self.store.get('management_trace',{}),
             analysis_trace=self.store.get('analysis_trace',{}),analysis_history=self.store.get('analysis_history',[]),
             watchlist=watch_snapshot(self.store),leverage_mode=self.cfg.live_leverage_mode,analysis_version=self.cfg.analysis_version,

@@ -140,7 +140,7 @@ class LivePositionManager:
             ensure_ascii=False,separators=(',',':'),allow_nan=False)
         llm=r.management_llm()
         trace=dict(id=uuid4().hex,started_at=now,symbol=symbol,strategy='position_management',mode='LIVE',
-            status='pending',attempts=[],prompt_bytes=len(prompt.encode()),input_fingerprint=digest(prompt))
+            analysis_version=control.get('version',r.cfg.analysis_version),status='pending',attempts=[],prompt_bytes=len(prompt.encode()),input_fingerprint=digest(prompt))
         def archive(update=None):
             if update:trace.update(copy.deepcopy(update))
             with r.store.lock:

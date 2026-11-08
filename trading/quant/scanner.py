@@ -25,8 +25,11 @@ class LiquidityFilter:
     min_quote_volume_24h: float = 500_000.0
     max_spread_bps: float = 25.0
     require_last_price: bool = True
+    require_complete: bool = False
 
     def passes(self, ticker: TickerSnapshot) -> tuple[bool, str]:
+        if self.require_complete and (ticker.quote_volume_24h is None or ticker.spread_bps is None):
+            return False,'MISSING_LIQUIDITY_DATA'
         if self.require_last_price and (ticker.last_price is None or ticker.last_price <= 0):
             return False, "NO_LAST_PRICE"
         if ticker.quote_volume_24h is not None and ticker.quote_volume_24h < self.min_quote_volume_24h:
@@ -58,6 +61,7 @@ class MarketScanner:
     prefer_fee_free: bool = True
     max_symbols: int = 40
     max_workers: int = 4
+    rotation_store: object | None = None
 
     def scan(self, symbols: Sequence[str] | None = None) -> ScanResult:
         started=time.monotonic()
@@ -75,7 +79,11 @@ class MarketScanner:
             preferred = [s for s in universe if s.upper() in fee_free]
             others = [s for s in universe if s.upper() not in fee_free]
             universe = preferred + others
-        universe = universe[: self.max_symbols]
+        if self.rotation_store is not None and symbols is None:
+            from trading.runtime.universe import select_universe
+            universe=select_universe(self.rotation_store,universe,self.max_symbols)
+        else:
+            universe = universe[: self.max_symbols]
 
         filtered_out: dict[str, str] = {}
         candidates: list[CandidateSignal] = []
@@ -100,6 +108,7 @@ class MarketScanner:
                     fee_free_pair=sym in fee_free or bool(ticker.fee_free),quote_volume_24h=ticker.quote_volume_24h)
                 produced=run_strategies(ctx,self.strategies)
                 for candidate in produced:
+                    candidate.features['observed_spread_bps']=ticker.spread_bps
                     if candles:
                         candidate.features.update(source_open_at=candles[-1][0],source_closed_at=float(candles[-1][0])+900)
                 return sym,passed,produced,None,None

@@ -322,3 +322,15 @@ def test_stub_trade_cannot_reach_live_executor(tmp_path):
     decision.market.mode='stub'
     assert runner._apply(signal,decision,control)['reason']=='HOLD_LIVE_UNVALIDATED_MODEL'
     assert not executor.calls
+
+
+def test_dynamic_zero_capacity_blocks_provider_work_without_consuming_candidate(tmp_path):
+    runner,private,executor,control=prepare(tmp_path)
+    calls=[]
+    runner.llm.analysis_capacity=lambda **kw:dict(parallel_candidates=0,reason='quota_cooldown_or_in_flight')
+    runner.candidate_queue().refresh([candidate()])
+    runner._evaluate=lambda *a,**kw:calls.append('provider')
+    result=runner.cycle()
+    assert result['reason']=='HOLD_LIVE_AI_CAPACITY' and not calls
+    assert runner.store.get('candidate_queue')[0]['last_considered_at']==0
+    assert runner.monitor()['entry_status']['reason']=='HOLD_LIVE_AI_CAPACITY'

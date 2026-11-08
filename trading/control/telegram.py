@@ -142,7 +142,8 @@ class TelegramController:
     def algorithm_text():
         return ('Aday algoritmaları: trend SMA8/21, momentum ROC12, ortalamaya dönüş SMA20 (15dk). '
                 'Sabit yüzde ağırlık yok; güncel adaylar bekleme sırasına göre dönüşümlü değerlendirilir. '
-                'Aday puanı başarı olasılığı değildir. AI ayrıca 4s/15dk/5dk yapısını değerlendirir.')
+                'Aday puanı başarı olasılığı değildir. AI ayrıca 4s/15dk/5dk yapısını değerlendirir. '
+                'LIVE takip koşulu/yapı değişikliği, eski algoritmadan sinyal gerektirmeden ayrı değerlendirme oluşturabilir.')
 
     @staticmethod
     def progress_text(snapshot):
@@ -198,7 +199,10 @@ class TelegramController:
         for row in active[:12]:
             remaining=max(0,(row.get('expires_at') or 0)-time.time())
             text+=f"\n{row.get('symbol','?')} · {row.get('side','?')}\n"
-            text+=statuses.get(row.get('status'),row.get('status','?'))+'\n'
+            status_text=statuses.get(row.get('status'),row.get('status','?'))
+            if row.get('review_reason')=='structure_changed':status_text='Yapı değişti; takip planı yeniden değerlendiriliyor'
+            elif row.get('status')=='triggered' and row.get('last_action')=='hold':status_text='Koşul değerlendirildi; yeni veri bekleniyor'
+            text+=status_text+'\n'
             text+=f"{labels.get(row.get('trigger_type'),'Tetikleyici')}: {row.get('trigger_price','?')}"
             if row.get('timeframe_seconds'):
                 text+=f" | {row['timeframe_seconds']//60} dk"

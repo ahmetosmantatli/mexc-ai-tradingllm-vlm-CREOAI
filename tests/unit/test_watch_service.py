@@ -102,3 +102,32 @@ def test_invalid_sizing_does_not_supersede_existing_valid_watch(tmp_path,monkeyp
     assert result.hold_reason=='invalid_model_sizing'
     assert WatchCoordinator(store).card('BTC_USDT')['status']=='watching'
     assert WatchCoordinator(store).card('BTC_USDT')['revision']==1
+
+
+def test_expired_or_invalidated_independent_watch_never_calls_ai(tmp_path,monkeypatch):
+    from trading.evaluation.watch import watch_event_key
+    store,response,calls,run=evaluate_setup(tmp_path,monkeypatch)
+    run();coordinator=WatchCoordinator(store);coordinator.observe('BTC_USDT',price=102.)
+    review=signal();review.strategy=StrategyName.WATCH_REVIEW
+    review.features.update(watch_review=True,review_event_key=watch_event_key(coordinator.card('BTC_USDT')))
+    coordinator.observe('BTC_USDT',price=96.)
+    before=len(calls)
+    assert run(review).hold_reason=='stale_watch_review' and len(calls)==before
+
+
+def test_independent_watch_trade_cannot_reuse_reference_prices(tmp_path,monkeypatch):
+    from trading.evaluation.watch import watch_event_key
+    store,response,calls,run=evaluate_setup(tmp_path,monkeypatch)
+    run();coordinator=WatchCoordinator(store);coordinator.observe('BTC_USDT',price=102.)
+    review=signal();review.strategy=StrategyName.WATCH_REVIEW
+    review.features.update(watch_review=True,review_event_key=watch_event_key(coordinator.card('BTC_USDT')))
+    response[0]=dict(action='trade',signal_id=review.signal_id,rationale='Yeni giriş planı olmadan referansla işlem açılmasın.',invalidation='',watch_note='')
+    assert run(review).hold_reason=='invalid_or_unavailable_model'
+    assert coordinator.card('BTC_USDT')['status']=='triggered'
+
+
+def test_already_satisfied_price_watch_cannot_create_immediate_rearm_loop(tmp_path,monkeypatch):
+    store,response,calls,run=evaluate_setup(tmp_path,monkeypatch)
+    response[0]['watch_plan']['trigger_price']=99.
+    assert run().hold_reason=='invalid_or_unavailable_model'
+    assert WatchCoordinator(store).card('BTC_USDT')['status']=='none'

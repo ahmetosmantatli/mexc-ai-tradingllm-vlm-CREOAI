@@ -1,5 +1,6 @@
 """Entire LIVE software path against an in-memory fake exchange; no HTTP."""
 import json
+import pytest
 from copy import deepcopy
 from time import time
 from types import SimpleNamespace
@@ -120,7 +121,8 @@ def test_loss_circuit_breaker_blocks_model_but_monitor_keeps_reading(tmp_path):
     assert runner.monitor()['reason']=='LIVE_RECONCILED'
 
 
-def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_path,monkeypatch):
+@pytest.mark.parametrize('independent_watch',[False,True])
+def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_path,monkeypatch,independent_watch):
     cfg=Settings(_env_file=None,broker_mode='live',live_trading_enabled=True,live_automatic_enabled=True,
         live_price_plan_enabled=True,live_allowed_accounts=('ahmet',),risk_profile='balanced',risk_per_trade_pct=.01,
         default_target_leverage=5,kill_switch_path=str(tmp_path/'kill'),analysis_chart_dir=str(tmp_path/'charts'))
@@ -148,7 +150,17 @@ def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_p
         to_context=lambda:{'timeframes':[dict(timeframe='15m',recent_ohlcv=deepcopy(rows))]}))
     monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
     executor.grant_start('7',1)
-    runner.candidate_queue().refresh([candidate()])
+    signal=candidate()
+    if independent_watch:
+        from trading.evaluation.watch import WatchCoordinator,watch_event_key
+        from trading.quant.signals import StrategyName
+        coordinator=WatchCoordinator(store)
+        coordinator.commit(signal,'watch',0,watch_plan=dict(trigger_condition='price_above',trigger_price=99.,
+            invalidation_condition='below',invalidation_price=97.,expires_at=time()+3600))
+        coordinator.observe(signal.symbol,price=100.)
+        signal.strategy=StrategyName.WATCH_REVIEW
+        signal.features.update(watch_review=True,review_event_key=watch_event_key(coordinator.card(signal.symbol)))
+    runner.candidate_queue().refresh([signal])
     status=runner.cycle()
     assert status['reason']=='LIVE_PROTECTED', (status,store.get('live_cycle_error'),executor.intents())
     intent=executor.intents()[0]

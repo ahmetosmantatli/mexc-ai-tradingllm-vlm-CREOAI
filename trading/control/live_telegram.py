@@ -114,6 +114,12 @@ class LiveTelegramController(TelegramController):
               f"Pozisyon marjini: {number(balance.get('position_margin'))} USDT\n"
               f"Açık PnL: {number(balance.get('unrealized'))} USDT\n")
         text+=self.positions_text(account_id,snapshot)
+        scan=snapshot.get('scan_summary') or {}
+        universe=scan.get('universe') or {}
+        if universe:text+=f"Tarama: bu tur {scan.get('scanned','?')} / evren {universe.get('total_symbols','?')} parite; dönüşümlü kapsam.\n"
+        capacity=snapshot.get('analysis_capacity') or {}
+        if capacity:text+=f"Yerel kota tahminine göre paralel analiz: {capacity.get('parallel_candidates',0)} (ücretsiz {capacity.get('free_slots',0)}, ücretli yedek {capacity.get('paid_slots',0)}).\n"
+
         management=snapshot.get('management_status') or {}
         if snapshot.get('position_management_enabled'):
             text+='Açık pozisyon AI yönetimi etkin (olay bazlı).\n'
@@ -121,11 +127,13 @@ class LiveTelegramController(TelegramController):
         text+=('Yeni AI/işlem arayışı açık.\n' if state.get('enabled') and not state.get('stopped') else
                'Yeni AI/işlem arayışı kapalı; açık pozisyon uzlaştırması sürer.\n')
         reason=snapshot.get('reason','')
-        labels={'LIVE_RECONCILED':'Hesap ve işlemler borsayla uzlaştırıldı.', 'LIVE_PROTECTED':'Gerçek işlem açıldı; borsa SL/TP koruması doğrulandı.',
+        labels={'HOLD_LIVE_AI_CAPACITY':'AI kapasitesi/kota bekleniyor; yeni istek gönderilmiyor.', 'LIVE_RECONCILED':'Hesap ve işlemler borsayla uzlaştırıldı.', 'LIVE_PROTECTED':'Gerçek işlem açıldı; borsa SL/TP koruması doğrulandı.',
             'LIVE_PAUSED':'Yeni girişler kapalı; uzlaştırma devam ediyor.', 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER':'Kayıp/düşüş sınırı aşıldı; yeni giriş ve analiz bekliyor.', 'HOLD_LIVE_NO_FUNDS':'Kullanılabilir gerçek bakiye bekleniyor.', 'HOLD_LIVE_NO_CANDIDATE':'Güncel uygun aday bekleniyor.',
             'HOLD_LIVE_MODEL':'AI işlem açmadı; son analiz sonucuna bakabilirsin.', 'HOLD_LIVE_START_REQUIRED':'Başlat yetkisi yok veya süresi doldu; yeni analiz yapılmıyor. Yeniden Başlat kullan.', 'HOLD_LIVE_ERROR':'Yeni işlem açılmadı; veri veya yürütme kontrolü bekliyor.',
             'HOLD_LIVE_RECONCILIATION':'Borsa durumu doğrulanamadı; yeni girişler bekliyor.', 'HOLD_LIVE_POSITION_LIMIT':'Açık pozisyon sınırına ulaşıldı.',
             'HOLD_LIVE_WATCH_CHANGED':'Parite planı değişti; eski kararla işlem açılmadı.', 'HOLD_LIVE_CONTROL_CHANGED':'Ayarlar değişti; eski karar uygulanmadı.'}
+        entry_reason=(snapshot.get('entry_status') or {}).get('reason')
+        if entry_reason and entry_reason!=reason:text+='İşlem arayışı: '+labels.get(entry_reason,entry_reason)+'\n'
         text+=f"Son durum: {snapshot.get('message') or labels.get(reason,'Canlı veri ve risk kontrolleri sürüyor; ayrıntı Son analiz ekranında.')}\n"
         if account.get('observed_at'):text+=f"Borsa verisinin yaşı: {max(0,time.time()-account['observed_at']):.0f} sn\n"
         if snapshot.get('halt') or snapshot.get('live_halt'):text+='Yeni işlem engeli var; belirsiz emir/koruma durumunu kontrol et.\n'
