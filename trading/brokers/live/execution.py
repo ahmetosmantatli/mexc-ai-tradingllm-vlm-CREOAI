@@ -5,12 +5,15 @@ operator approval and fresh deterministic gates. Exchange acknowledgements are
 not fills. Ambiguous writes are reconciled by the original external ID, never
 blindly retried. Native protection must be read back before an exposure is
 reported protected. This module does not guarantee exchange execution or PnL.
+Entries are immediate-or-cancel limits at the worst price that keeps stop
+risk inside the approved loss. A market fill is not used for entries.
 """
 from dataclasses import dataclass
 from datetime import datetime,timezone
 import copy
 import hashlib
 import json
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 from math import isfinite
 from time import time
 from uuid import uuid4
@@ -22,6 +25,67 @@ from trading.runtime.live_account import LiveAccountReconciler,LiveAccountError
 
 class LiveExecutionError(RuntimeError):
     """Safe fixed error category; never a raw exchange response or key."""
+
+
+def entry_stop_loss(side, entry, stop, quantity, fee_rate, slippage_rate):
+    """Loss if `entry` fills and the stop then slips against the position.
+
+    Includes two taker fees. Does not add entry slippage: pass the price that
+    can actually trade. The pre-trade estimate passes a slipped reference.
+    """
+    if side not in ('long', 'short'):
+        raise LiveExecutionError('invalid_entry_side')
+    try:
+        entry, stop, quantity, fee, slip = (float(value) for value in (entry, stop, quantity, fee_rate, slippage_rate))
+    except (TypeError, ValueError):
+        raise LiveExecutionError('invalid_numeric_exchange_field') from None
+    if not all(isfinite(value) for value in (entry, stop, quantity, fee, slip)) or min(entry, stop, quantity) <= 0:
+        raise LiveExecutionError('invalid_numeric_exchange_field')
+    if not 0 <= fee < .1 or not 0 <= slip < 1:
+        raise LiveExecutionError('invalid_execution_cost')
+    worst_stop = stop * (1 - slip if side == 'long' else 1 + slip)
+    if worst_stop <= 0:
+        raise LiveExecutionError('invalid_numeric_exchange_field')
+    return abs(entry - worst_stop) * quantity + fee * quantity * (entry + worst_stop)
+
+
+def worst_entry_price(side, stop, quantity, max_loss, fee_rate, slippage_rate, price_step):
+    """Worst fill that keeps stop risk inside the approved max loss.
+
+    Solved from that loss and the stop, then rounded to the contract price
+    step toward the safer side. A long limit is at or below this price. A
+    short limit is at or above it. The rounded price is checked again.
+    """
+    if side not in ('long', 'short'):
+        raise LiveExecutionError('invalid_entry_side')
+    try:
+        budget = Decimal(str(max_loss))
+        qty = Decimal(str(quantity))
+        fee = Decimal(str(fee_rate))
+        slip = Decimal(str(slippage_rate))
+        stop_price = Decimal(str(stop))
+        step = Decimal(str(price_step))
+    except (ArithmeticError, ValueError):
+        raise LiveExecutionError('entry_price_cap_unavailable') from None
+    if min(budget, qty, stop_price, step) <= 0 or fee < 0 or fee >= 1 or slip < 0 or slip >= 1:
+        raise LiveExecutionError('entry_price_cap_unavailable')
+    worst_stop = stop_price * (1 - slip if side == 'long' else 1 + slip)
+    if worst_stop <= 0:
+        raise LiveExecutionError('entry_price_cap_unavailable')
+    if side == 'long':
+        raw = (budget / qty + (1 - fee) * worst_stop) / (1 + fee)
+        price = (raw / step).to_integral_value(rounding=ROUND_DOWN) * step
+        if price <= stop_price:
+            raise LiveExecutionError('entry_price_cap_unavailable')
+    else:
+        raw = ((1 + fee) * worst_stop - budget / qty) / (1 - fee)
+        price = (raw / step).to_integral_value(rounding=ROUND_CEILING) * step
+        if price <= 0 or price >= stop_price:
+            raise LiveExecutionError('entry_price_cap_unavailable')
+    capped = float(price)
+    if entry_stop_loss(side, capped, stop, quantity, fee_rate, slippage_rate) > float(max_loss) + 1e-8:
+        raise LiveExecutionError('entry_price_cap_unavailable')
+    return capped
 
 
 @dataclass(frozen=True)
@@ -89,9 +153,13 @@ class ApprovedLiveExecutor:
     def _halt(self,row,reason,*,account=True):
         # account=False keeps the intent unresolved without latching every future entry.
         # Unknown writes still latch: a second open is worse than a stopped account.
+        # A fill that exceeded the approved loss stays latched for review. Nothing here clears it.
         if account:
-            self.store.put('live:halt',dict(intent_id=row['intent_id'],reason=reason,at=time()))
-        row.update(halt_reason=reason)
+            current=self.store.get('live:halt') or {}
+            if current.get('requires_review') is not True:
+                self.store.put('live:halt',dict(intent_id=row['intent_id'],reason=reason,at=time()))
+        if row.get('halt_reason')!='filled_position_risk_exceeds_plan':
+            row.update(halt_reason=reason)
         return self._save(row)
 
     def _optional_number(self,value):
@@ -208,7 +276,12 @@ class ApprovedLiveExecutor:
             daily_loss_pct=max(0,1-equity/state['day_start']),drawdown_pct=max(0,1-equity/state['peak']))
         decision=self.risk.evaluate(proposal,context)
         if not decision.accepted:raise LiveExecutionError('deterministic_risk_rejected')
-        return proposal,contracts,mode
+        quantity=contracts*rules.size
+        cap=worst_entry_price(proposal.side.value,sl,quantity,proposal.max_loss_if_stopped,self.fee,self.slip,rules.price_step)
+        if not (sl<cap<tp if proposal.side.value=='long' else tp<cap<sl):
+            raise LiveExecutionError('entry_price_cap_unavailable')
+        return dict(proposal=proposal,contracts=contracts,mode=mode,worst_allowed_price=cap,
+            planned_loss=planned_loss,equity=equity,quantity=quantity)
 
     def _acquire_lease(self,intent_id):
         with self.store.lock,self.store.db:
@@ -244,16 +317,20 @@ class ApprovedLiveExecutor:
                 pending=[json.loads(payload) for _,payload in self.store.db.execute("SELECT key,value FROM state WHERE key LIKE 'live:intent:%'")]
             if any(value['intent_id']!=intent_id and value.get('entry_write_attempted') and value.get('status') not in ('closed','entry_rejected') for value in pending):
                 raise LiveExecutionError('unresolved_live_intent_blocks_entry')
-            proposal,contracts,mode=self._preflight(row)
+            plan=self._preflight(row)
+            proposal=plan['proposal']
             self._gate()
             self._check_lease(token)
             if row['expires_at']<=time():raise LiveExecutionError('approval_expired_during_preflight')
-            row.update(status='entry_write_unknown',entry_write_attempted=True,contracts=contracts,position_mode=mode)
+            row.update(status='entry_write_unknown',entry_write_attempted=True,contracts=plan['contracts'],
+                position_mode=plan['mode'],worst_allowed_price=plan['worst_allowed_price'],
+                planned_loss=plan['planned_loss'],equity=plan['equity'],quantity=plan['quantity'])
             self._save(row) # Durable before POST; crash requires read-only reconciliation.
             try:
-                self.private.submit_market(symbol=proposal.symbol,side=proposal.side.value,contracts=contracts,
+                # IOC at the loss cap. Type 5 market orders can fill through the plan.
+                self.private.submit_ioc(symbol=proposal.symbol,side=proposal.side.value,contracts=plan['contracts'],
                     leverage=int(proposal.leverage),external_id=row['external_id'],stop_loss=proposal.stop_loss.price,
-                    take_profit=proposal.take_profit_price,position_mode=mode)
+                    take_profit=proposal.take_profit_price,price=plan['worst_allowed_price'],position_mode=plan['mode'])
             except Exception as exc:
                 if getattr(exc,'ambiguous',True) is False:
                     row.update(status='entry_rejected')
@@ -322,7 +399,9 @@ class ApprovedLiveExecutor:
 
     def _mark_closed(self,row,report,*,reason):
         self._book_exchange_costs(row,report)
-        row.update(status='closed',close_reason=reason,halt_reason=None)
+        # A fill that broke the plan stays marked after the emergency close. The account halt is separate.
+        kept=row.get('halt_reason') if row.get('halt_reason')=='filled_position_risk_exceeds_plan' else None
+        row.update(status='closed',close_reason=reason,halt_reason=kept)
         return self._save(row)
 
     def _confirmed_close(self,row):
@@ -348,44 +427,141 @@ class ApprovedLiveExecutor:
         except Exception:
             return None
 
+    def _fill_price(self,order):
+        if not isinstance(order,dict) or 'dealAvgPrice' not in order:
+            return None
+        price=self._optional_number(order.get('dealAvgPrice'))
+        if price is None or price<=0:
+            return None
+        return price
+
+    def _filled_quantity(self,row,filled):
+        if row.get('quantity') is None or not row.get('contracts'):
+            return None
+        try:
+            return float(Decimal(str(filled))/Decimal(str(row['contracts']))*Decimal(str(row['quantity'])))
+        except (ArithmeticError, ValueError):
+            return None
+
+    def _accepts_fill(self,row,fill,quantity):
+        """False when the fill is missing, worse than the cap, or over the approved loss."""
+        proposal=row.get('proposal') or {}
+        worst=row.get('worst_allowed_price')
+        stop=(proposal.get('stop_loss') or {}).get('price')
+        side=proposal.get('side')
+        cap=proposal.get('max_loss_if_stopped')
+        if fill is None or worst is None or quantity is None or stop is None or side not in ('long','short') or cap is None:
+            return False,None
+        try:
+            computed=entry_stop_loss(side,fill,stop,quantity,self.fee,self.slip)
+        except LiveExecutionError:
+            return False,None
+        fill_price,worst_price=Decimal(str(fill)),Decimal(str(worst))
+        worse=fill_price>worst_price if side=='long' else fill_price<worst_price
+        return (not worse) and computed<=float(cap)+1e-8,computed
+
+    def _cancel_remainder(self,row,order,token):
+        """One cancel of a still-open entry. Does not submit a second order."""
+        if order.get('state') not in (1,2) or row.get('remainder_cancel_attempted'):
+            return order
+        order_id=order.get('orderId')
+        row['remainder_cancel_attempted']=True
+        self._save(row)
+        if order_id is None:
+            return order
+        try:
+            self._check_lease(token)
+            self.private.cancel_order(order_id)
+        except Exception:
+            pass
+        try:
+            fresh=self.private.order_by_external_id(row['proposal']['symbol'],row['external_id'])
+        except Exception:
+            return order
+        return fresh if isinstance(fresh,dict) else order
+
+    def _matching_position(self,row,filled):
+        positions=self.private.open_positions(row['proposal']['symbol'])
+        expected=1 if row['proposal']['side']=='long' else 2
+        matches=[item for item in positions if item.get('symbol')==row['proposal']['symbol']
+            and item.get('positionType')==expected and item.get('state')==1 and item.get('openType')==1
+            and self._optional_number(item.get('holdVol'))==filled]
+        return matches[0] if len(matches)==1 else None
+
+    def _reject_fill(self,row,position,token,fill,computed):
+        """Persist the prices that failed the plan and latch review. Do not clear that latch."""
+        numbers=dict(fill_price=fill,worst_allowed_price=row.get('worst_allowed_price'),
+            planned_loss=row.get('planned_loss'),computed_loss=computed,equity=row.get('equity'))
+        row.update(numbers,halt_reason='filled_position_risk_exceeds_plan',status='filled_risk_rejected')
+        self._save(row)
+        self.store.put('live:halt',dict(intent_id=row['intent_id'],reason='emergency_close_requires_review',
+            requires_review=True,at=time(),**numbers))
+        hold=None if position is None else self._optional_number(position.get('holdVol'))
+        if hold is None or hold<=0 or not row.get('allow_emergency_close') or row.get('emergency_close_attempted'):
+            return self.state(row['intent_id'])
+        row.update(position_id=str(position['positionId']),close_contracts=hold,
+            emergency_close_attempted=True,status='emergency_close_unknown')
+        self._save(row)
+        try:
+            self._check_lease(token)
+            self.private.close_position(symbol=row['proposal']['symbol'],side=row['proposal']['side'],
+                contracts=hold,position_id=row['position_id'],external_id='close-'+row['intent_id'][:24],
+                position_mode=row['position_mode'])
+        except Exception:
+            return self.state(row['intent_id'])
+        return self.state(row['intent_id'])
+
     def _partial(self,row,order,filled,token):
-        """Keep the original external id. Do not latch the account or send a second entry."""
+        """Keep the original external id. Do not latch the account or send a second entry.
+
+        An unfilled order is not a position. A still-open remainder is cancelled once.
+        A partial that cannot be protected is closed at the filled size only.
+        """
         row.update(status='partial_fill',filled_contracts=filled,halt_reason='entry_fill_not_fully_confirmed')
         self._save(row)
         try:
+            if order.get('state') in (1,2):
+                # Cancel already ran once. An unfilled working order is not a position.
+                # A fill beside a still-open remainder is closed at the filled size only.
+                row.update(halt_reason='entry_remainder_open',filled_contracts=filled)
+                self._save(row)
+                if filled<=0:
+                    return self.state(row['intent_id'])
+                position=self._matching_position(row,filled)
+                if position is None:
+                    return self.state(row['intent_id'])
+                return self._emergency_close(row,position,token,filled,reason='entry_remainder_open')
             if filled<=0 and order.get('state') in (3,4,5):
-                row.update(status='entry_rejected')
+                row.update(status='entry_rejected',halt_reason=None,filled_contracts=0)
                 return self._save(row)
             if filled<=0 or filled>row['contracts']:
                 return self.state(row['intent_id'])
-            positions=self.private.open_positions(row['proposal']['symbol'])
-            expected=1 if row['proposal']['side']=='long' else 2
-            matches=[item for item in positions if item.get('symbol')==row['proposal']['symbol']
-                and item.get('positionType')==expected and item.get('state')==1 and item.get('openType')==1
-                and self._optional_number(item.get('holdVol'))==filled]
-            if len(matches)!=1:
+            position=self._matching_position(row,filled)
+            fill=self._fill_price(order)
+            ok,computed=self._accepts_fill(row,fill,self._filled_quantity(row,filled))
+            if not ok:
+                return self._reject_fill(row,position,token,fill,computed)
+            if position is None:
                 return self.state(row['intent_id'])
-            position=matches[0]
-            row.update(position_id=str(position['positionId']))
+            row.update(position_id=str(position['positionId']),fill_price=fill,computed_loss=computed)
             self._book_exchange_costs(row,order,position)
             self._save(row)
             if self._protected(row,position,filled) is True:
                 row.update(status='partial_protected')
                 return self._save(row)
-            if row.get('partial_protection_attempted'):
-                return self.state(row['intent_id'])
-            row.update(partial_protection_attempted=True)
-            self._save(row)
-            self._check_lease(token)
-            self.private.place_protection(position_id=row['position_id'],contracts=filled,
-                stop_loss=row['proposal']['stop_loss']['price'],take_profit=row['proposal']['take_profit_price'],
-                request_id='psl-'+row['intent_id'][:24])
-            if self._protected(row,position,filled) is True:
-                row.update(status='partial_protected')
-                return self._save(row)
+            if not row.get('partial_protection_attempted'):
+                row.update(partial_protection_attempted=True)
+                self._save(row)
+                self._check_lease(token)
+                self.private.place_protection(position_id=row['position_id'],contracts=filled,
+                    stop_loss=row['proposal']['stop_loss']['price'],take_profit=row['proposal']['take_profit_price'],
+                    request_id='psl-'+row['intent_id'][:24])
+                if self._protected(row,position,filled) is True:
+                    row.update(status='partial_protected')
+                    return self._save(row)
+            return self._emergency_close(row,position,token,filled)
         except Exception:
             return self.state(row['intent_id'])
-        return self.state(row['intent_id'])
 
     def _reconcile(self,row,token):
         self._check_lease(token)
@@ -398,7 +574,7 @@ class ApprovedLiveExecutor:
                 remaining=self.private.open_positions(row['proposal']['symbol'])
                 if (isinstance(close,dict) and close.get('externalOid')=='close-'+row['intent_id'][:24]
                         and close.get('symbol')==row['proposal']['symbol'] and close.get('side')==expected_close_side
-                        and close.get('state')==3 and self._number(close.get('dealVol'))==row['contracts']
+                        and close.get('state')==3 and self._number(close.get('dealVol'))==row.get('close_contracts',row['contracts'])
                         and not any(str(p.get('positionId'))==row['position_id'] and self._number(p.get('holdVol'))>0 for p in remaining)):
                     return self._mark_closed(row,close,reason='emergency_close')
                 return self._halt(row,'emergency_close_not_confirmed')
@@ -417,9 +593,26 @@ class ApprovedLiveExecutor:
             filled=self._number(order.get('dealVol'))
             if filled>row['contracts']:
                 return self._halt(row,'entry_order_identity_mismatch')
+            if order.get('state') in (1,2):
+                order=self._cancel_remainder(row,order,token)
+                if not isinstance(order,dict) or str(order.get('externalOid'))!=row['external_id']:
+                    return self._halt(row,'entry_order_not_reconciled')
+                if (order.get('symbol')!=row['proposal']['symbol'] or order.get('side')!=expected_side
+                        or order.get('openType')!=1 or order.get('positionMode')!=row['position_mode']
+                        or self._number(order.get('vol'))!=row['contracts']):
+                    return self._halt(row,'entry_order_identity_mismatch')
+                filled=self._number(order.get('dealVol'))
+                if filled>row['contracts']:
+                    return self._halt(row,'entry_order_identity_mismatch')
             if filled!=row['contracts'] or order.get('state')!=3:
                 return self._partial(row,order,filled,token)
             position=self._position(row,order)
+            fill=self._fill_price(order)
+            accepted,computed=self._accepts_fill(row,fill,row.get('quantity'))
+            if not accepted:
+                return self._reject_fill(row,position,token,fill,computed)
+            row.update(fill_price=fill,computed_loss=computed)
+            self._save(row)
             if position is None:
                 confirmed=self._confirmed_close(row)
                 if confirmed is not None:
@@ -451,19 +644,22 @@ class ApprovedLiveExecutor:
                     return self._save(row)
             return self._emergency_close(row,position,token)
         except Exception:
-            row.update(halt_reason='reconciliation_incomplete')
+            if row.get('halt_reason')!='filled_position_risk_exceeds_plan':
+                row.update(halt_reason='reconciliation_incomplete')
             return self._save(row)
 
-    def _emergency_close(self,row,position,token):
-        self._halt(row,'native_protection_not_confirmed')
+    def _emergency_close(self,row,position,token,contracts=None,reason='native_protection_not_confirmed'):
+        contracts=row['contracts'] if contracts is None else contracts
+        self._halt(row,reason)
         if not row.get('allow_emergency_close') or row.get('emergency_close_attempted'):
             return self.state(row['intent_id'])
-        row.update(emergency_close_attempted=True,status='emergency_close_unknown')
+        row.update(emergency_close_attempted=True,status='emergency_close_unknown',close_contracts=contracts,
+            position_id=str(position['positionId']))
         self._save(row)
         try:
             self._check_lease(token)
             self.private.close_position(symbol=row['proposal']['symbol'],side=row['proposal']['side'],
-                contracts=row['contracts'],position_id=row['position_id'],external_id='close-'+row['intent_id'][:24],
+                contracts=contracts,position_id=row['position_id'],external_id='close-'+row['intent_id'][:24],
                 position_mode=row['position_mode'])
         except Exception:
             return self.state(row['intent_id'])

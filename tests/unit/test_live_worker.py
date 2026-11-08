@@ -21,6 +21,7 @@ class Fake(Client):
         super().__init__()
         self.submits = []
         self.closes = []
+        self.cancels = []
         self.protection_writes = []
         self.lookups = []
         self.history = []
@@ -35,16 +36,27 @@ class Fake(Client):
         return [row for row in rows if symbol is None or row.get('symbol') == symbol]
 
     def submit_market(self, **kw):
+        return self.submit_ioc(**dict(kw, price=kw.get('price', 100)))
+
+    def submit_ioc(self, **kw):
         self.submits.append(kw)
         filled = 0.5 if self.partial else kw['contracts']
-        self.order_row = dict(externalOid=kw['external_id'], symbol=kw['symbol'], side=1, openType=1,
-            positionMode=1, vol=kw['contracts'], dealVol=filled, state=2 if self.partial else 3, positionId=42)
+        price = kw['price']
+        self.order_row = dict(orderId=9001, externalOid=kw['external_id'], symbol=kw['symbol'], side=1, openType=1,
+            positionMode=kw.get('position_mode', 1), vol=kw['contracts'], dealVol=filled, dealAvgPrice=price,
+            price=price, state=2 if self.partial else 3, positionId=42)
         self.positions = [dict(positionId=42, symbol=kw['symbol'], positionType=1, holdVol=filled, state=1,
-            openType=1, autoAddIm=0, leverage=5, holdAvgPrice=100, im=20, unRealizedPnl=0, liquidatePrice=80)]
+            openType=1, autoAddIm=0, leverage=5, holdAvgPrice=price, im=20, unRealizedPnl=0, liquidatePrice=80)]
         self.protections = [] if self.partial else [self.pair(kw)]
         if self.timeout:
             raise RuntimeError('timeout')
-        return {'orderId': 'o1'}
+        return {'orderId': '9001'}
+
+    def cancel_order(self, order_id):
+        self.cancels.append(order_id)
+        if self.order_row and self.order_row.get('state') in (1, 2):
+            self.order_row['state'] = 4
+        return []
 
     @staticmethod
     def pair(kw):
