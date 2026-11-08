@@ -7,6 +7,7 @@ exchange equity; account versions share this runner's one canonical store.
 """
 import copy
 from concurrent.futures import ThreadPoolExecutor,as_completed
+from dataclasses import replace
 import hashlib
 from math import isfinite
 from pathlib import Path
@@ -21,6 +22,7 @@ from trading.evaluation.service import ContextEvaluator,finalize_trace
 from trading.evaluation.watch import WatchCoordinator,watch_snapshot,TIMEFRAMES
 from trading.quant.scanner import MarketScanner,LiquidityFilter
 from trading.risk.engine import RiskEngine
+from trading.risk.presets import get_preset
 from trading.runtime.candidates import CandidateQueue
 from trading.runtime.live_account import LiveAccountReconciler,observe_risk_reference
 
@@ -36,7 +38,7 @@ class LiveRunner:
         self.external_scan=True
         self.reconciler=LiveAccountReconciler(account_id,store,binding_id=binding_id,
             max_age_seconds=settings.market_max_age_seconds)
-        self.risk=RiskEngine(settings=settings)
+        self.risk=self._risk_engine()
         self.graph=ContextEvaluator(llm,store,public,settings)
         self._cycle_lock,self._monitor_lock,self._scan_lock=threading.Lock(),threading.Lock(),threading.Lock()
         self._management_lock=threading.Lock()
@@ -53,13 +55,20 @@ class LiveRunner:
         control=self._control() if control is None else control
         return bool(control.get('enabled') and not control.get('stopped') and not Path(self.cfg.kill_switch_path).exists())
 
+    def _risk_engine(self):
+        preset=get_preset(self.cfg.risk_profile)
+        limit=self.cfg.live_aggressive_daily_loss_limit_pct
+        if preset.profile==RiskProfile.AGGRESSIVE_GROWTH and limit is not None:
+            preset=replace(preset,daily_loss_halt_pct=limit)
+        return RiskEngine(settings=self.cfg,preset=preset)
+
     def configure(self,control):
         """Called only between analysis jobs; policy limits remain deterministic."""
         profile=control.get('risk_profile',getattr(self.cfg.risk_profile,'value',self.cfg.risk_profile))
         if profile not in ('capital_preservation','balanced','aggressive_growth'):
             profile='balanced'
         self.cfg.risk_profile=RiskProfile(profile)
-        self.risk=RiskEngine(settings=self.cfg)
+        self.risk=self._risk_engine()
         self.cfg.analysis_version=control.get('version',self.cfg.analysis_version)
         if self.cfg.analysis_version not in ('text','vlm'):
             raise ValueError('invalid analysis version')
@@ -530,6 +539,7 @@ class LiveRunner:
             management_status=self.store.get('management_status',{}),management_trace=self.store.get('management_trace',{}),
             analysis_trace=self.store.get('analysis_trace',{}),analysis_history=self.store.get('analysis_history',[]),
             watchlist=watch_snapshot(self.store),leverage_mode=self.cfg.live_leverage_mode,analysis_version=self.cfg.analysis_version,
+            entry_risk_policy=dict(profile=self.risk.preset.profile.value,daily_loss_limit_pct=self.risk.preset.daily_loss_halt_pct),
             ai_status=getattr(self.llm,'last_status','not_called'),live_halt=self.store.get('live:halt'),is_simulated=False)
         with self.lock:
             events=self.store.get('live_events',[])

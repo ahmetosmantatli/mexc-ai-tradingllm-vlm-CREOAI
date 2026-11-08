@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     live_leverage_mode: str = Field(default='profile',pattern='^(profile|exchange)$')
     live_max_leverage: int = Field(default=10,ge=1,le=25)
     live_max_positions: int = Field(default=4,ge=1,le=4)
+    live_aggressive_daily_loss_limit_pct: float | None = Field(default=None,gt=0,le=.20)
     live_automatic_enabled: bool = False
     live_allowed_accounts: tuple[str, ...] = ()
     live_readiness_ack: str = Field(default='', repr=False)

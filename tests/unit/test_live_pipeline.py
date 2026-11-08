@@ -121,6 +121,33 @@ def test_loss_circuit_breaker_blocks_model_but_monitor_keeps_reading(tmp_path):
     assert runner.monitor()['reason']=='LIVE_RECONCILED'
 
 
+def test_live_aggressive_daily_limit_override_reaches_entry_and_executor(tmp_path, monkeypatch):
+    from .test_live_runner import prepare
+    runner, private, executor, control = prepare(tmp_path)
+    control['risk_profile'] = 'aggressive_growth'
+    private.equity = 11.5854
+    runner.monitor()
+    private.equity = 10.87804108
+    assert runner.cycle()['reason'] == 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
+
+    monkeypatch.setenv('LIVE_AGGRESSIVE_DAILY_LOSS_LIMIT_PCT', '0.20')
+    runner.cfg.live_aggressive_daily_loss_limit_pct = Settings(_env_file=None).live_aggressive_daily_loss_limit_pct
+    status = runner.cycle()
+    assert status['reason'] == 'HOLD_LIVE_NO_CANDIDATE'
+    assert status['entry_risk_policy']['daily_loss_limit_pct'] == .20
+    assert executor.risk.preset.daily_loss_halt_pct == .20
+    assert executor.risk.preset.weekly_loss_halt_pct == .135
+    assert executor.risk.preset.max_drawdown_kill_pct == .225
+
+    private.equity = 11.5854 * .85
+    assert runner.cycle()['reason'] == 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
+
+    control['risk_profile'] = 'balanced'
+    private.equity = 10.87804108
+    assert runner.cycle()['reason'] == 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
+    assert executor.risk.preset.daily_loss_halt_pct == .035
+
+
 @pytest.mark.parametrize('independent_watch',[False,True])
 def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_path,monkeypatch,independent_watch):
     cfg=Settings(_env_file=None,broker_mode='live',live_trading_enabled=True,live_automatic_enabled=True,
