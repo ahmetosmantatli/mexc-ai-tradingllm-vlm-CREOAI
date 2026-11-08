@@ -40,7 +40,7 @@ class PositionManagementMixin:
         except Exception:return False
 
     def _target_pair_id(self,row,position):
-        """Verify one explicitly typed native pair and return its identity."""
+        """Verify one owned native pair and return its identity."""
         if str(position.get('positionId'))!=row['position_id']:
             return None
         stop,target=self.protection_levels(row)
@@ -60,7 +60,8 @@ class PositionManagementMixin:
         if (pair.get('state')!=1 or pair.get('isFinished')!=0
                 or pair.get('errorCode')!=0 or pair.get('positionType')!=position.get('positionType')
                 or pair.get('lossTrend')!=2 or pair.get('profitTrend')!=2
-                or type(pair.get('stopLossType')) is not int or pair['stopLossType']!=0
+                or not (type(pair.get('stopLossType')) is int and pair['stopLossType']==0
+                        or self._attached_stop_schema(row,pair))
                 or type(pair.get('takeProfitType')) is not int or pair['takeProfitType']!=0
                 or pair.get('stopLossReverse')!=2 or pair.get('takeProfitReverse')!=2
                 or self._number(pair.get('stopLossPrice'))!=stop

@@ -308,6 +308,26 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             return None
         return values[0] if all(v==values[0] for v in values) else None
 
+    @staticmethod
+    def _attached_stop_schema(row,protection):
+        # MEXC's attached TP/SL example omits stopLossType. Scope compatibility
+        # to our submitted schema and exchange-confirmed entry type and identity.
+        schemas={5:'mexc_create_market_attached_v1',3:'mexc_create_ioc_attached_v1'}
+        kind=row.get('entry_exchange_type')
+        return (type(kind) is int and kind in schemas
+            and row.get('entry_protection_schema')==schemas[kind]
+            and row.get('entry_submitted_type')==kind
+            and str(protection.get('orderId'))==str(row.get('exchange_order_id'))
+            and str(row.get('exchange_order_id','')).isascii()
+            and str(row.get('exchange_order_id','')).isdigit()
+            and int(row.get('exchange_order_id','0'))>0
+            and str(protection.get('positionId'))==str(row.get('position_id'))
+            and protection.get('positionType')==(1 if row['proposal']['side']=='long' else 2)
+            and type(protection.get('errorCode')) is int and protection['errorCode']==0
+            and 'stopLossType' not in protection
+            and ('stopLossOrderPrice' not in protection or
+                 type(protection['stopLossOrderPrice']) in (int,float) and protection['stopLossOrderPrice']==0))
+
     def _protected(self,row,position):
         """True=matching native pair, False=complete list no pair, None=unknown."""
         protections=[]
@@ -323,11 +343,18 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             if not complete:return None
             related=[item for item in protections if isinstance(item,dict)
                 and str(item.get('positionId'))==str(position['positionId'])]
+            row['protection_observation']=dict(at=time(),related_records=len(related))
             if len(related)>1:return None # Extra native orders can conflict or reverse exposure.
             for protection in related:
                 try:
                     if str(protection.get('positionId'))!=str(position['positionId']):
                         continue
+                    row['protection_observation'].update(
+                        missing_stop_type='stopLossType' not in protection,
+                        state=protection.get('state') if type(protection.get('state')) is int else None,
+                        finished=protection.get('isFinished') if type(protection.get('isFinished')) is int else None,
+                        error_code=protection.get('errorCode') if type(protection.get('errorCode')) is int else None,
+                        entry_order_matches=str(protection.get('orderId'))==str(row.get('exchange_order_id')))
                     if row.get('entry_submitted_type')==3 and (
                             str(protection.get('orderId'))!=row.get('exchange_order_id')
                             or protection.get('positionType')!=(1 if row['proposal']['side']=='long' else 2)
@@ -339,22 +366,8 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                     volume_ok=(self._number(protection.get('vol'))==self.remaining_contracts(row) if volumes=='SAME' else
                         volumes=='SEPARATE' and self._number(protection.get('stopLossVol'))==self.remaining_contracts(row)
                         and self._number(protection.get('takeProfitVol'))==self.remaining_contracts(row))
-                    # MEXC's documented attached-order response example omits
-                    # stopLossType. Recognize that shape only for our confirmed
-                    # market entry and its exact attached native order. Never
-                    # interpret an explicit null/limit type as market, or apply
-                    # this inference to arbitrary position/external protections.
                     stop_type_ok=type(protection.get('stopLossType')) is int and protection['stopLossType']==0
-                    attached_schema=(row.get('entry_protection_schema')=='mexc_create_market_attached_v1'
-                        and row.get('entry_exchange_type')==5
-                        and str(protection.get('orderId'))==str(row.get('exchange_order_id'))
-                        and str(row.get('exchange_order_id','')).isdigit()
-                        and int(row.get('exchange_order_id','0'))>0
-                        and protection.get('positionType')==(1 if row['proposal']['side']=='long' else 2)
-                        and protection.get('errorCode')==0
-                        and 'stopLossType' not in protection
-                        and ('stopLossOrderPrice' not in protection or
-                             type(protection['stopLossOrderPrice']) in (int,float) and protection['stopLossOrderPrice']==0))
+                    attached_schema=self._attached_stop_schema(row,protection)
                     stop_type_ok=stop_type_ok or attached_schema
                     if (str(protection.get('positionId'))==str(position['positionId']) and protection.get('state')==1
                             and protection.get('isFinished')==0 and protection.get('lossTrend')==2 and protection.get('profitTrend')==2
@@ -363,7 +376,9 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                             and volume_ok
                             and self._number(protection.get('stopLossPrice'))==self.protection_levels(row)[0]
                             and self._number(protection.get('takeProfitPrice'))==self.protection_levels(row)[1]):
-                        row['protection_verification']='attached_market_entry_schema' if attached_schema else 'explicit_market_types'
+                        row['protection_verification']=(
+                            'attached_ioc_entry_schema' if row.get('entry_exchange_type')==3 else 'attached_market_entry_schema'
+                        ) if attached_schema else 'explicit_market_types'
                         return True
                     return None # Existing same-position protection is not safe to duplicate.
                 except (AttributeError,LiveExecutionError):

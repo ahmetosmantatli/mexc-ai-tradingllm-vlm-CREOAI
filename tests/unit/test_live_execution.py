@@ -188,6 +188,54 @@ def test_runner2_ioc_missing_attachment_closes_without_duplicating_protection(tm
     assert len(private.closes)==1 and not private.protects and calls==[100.]
 
 
+def test_ioc_attached_missing_stop_type_survives_entry_and_restart(tmp_path):
+    executor,private,store,intent,calls=ioc_case(tmp_path)
+    submit=private.submit_ioc
+    def actual_shape(**kwargs):
+        submit(**kwargs)
+        stop=private.stops[0]
+        stop.pop('stopLossType')
+        stop.update(profitLossVolType='SEPARATE',stopLossVol=stop['vol'],takeProfitVol=stop['vol'])
+    private.submit_ioc=actual_shape
+    row=executor.execute(intent['intent_id'])
+    assert row['status']=='protected'
+    assert row['protection_verification']=='attached_ioc_entry_schema'
+    assert not private.closes and not private.protects
+    restarted=ApprovedLiveExecutor(executor.gates,store,private,executor.public,executor.risk,
+                                   account_id='ahmet',binding_id='binding-1')
+    assert restarted.reconcile(row['intent_id'])['status']=='protected'
+    assert len(calls)==1
+
+
+@pytest.mark.parametrize('changes',[
+    {'state':2,'isFinished':1,'errorCode':8912},
+    {'errorCode':8912}, {'stopLossType':None}, {'stopLossType':1},
+    {'stopLossOrderPrice':100}, {'orderId':999}, {'positionId':999},
+    {'positionType':2}, {'stopLossVol':999}, {'stopLossPrice':97},
+    {'takeProfitReverse':1},
+])
+def test_ioc_missing_type_never_hides_conflicting_or_finished_protection(tmp_path,changes):
+    executor,private,store,intent,calls=ioc_case(tmp_path)
+    row=executor.execute(intent['intent_id'])
+    stop=private.stops[0]
+    stop.pop('stopLossType')
+    stop.update(profitLossVolType='SEPARATE',stopLossVol=stop['vol'],takeProfitVol=stop['vol'])
+    stop.update(changes)
+    assert executor._protected(row,private.positions[0]) is not True
+
+
+@pytest.mark.parametrize('field,value',[
+    ('entry_exchange_type',5),('entry_submitted_type',5),
+    ('entry_protection_schema','mexc_create_market_attached_v1'),
+])
+def test_ioc_missing_stop_type_requires_confirmed_entry_provenance(tmp_path,field,value):
+    executor,private,store,intent,calls=ioc_case(tmp_path)
+    row=executor.execute(intent['intent_id'])
+    private.stops[0].pop('stopLossType')
+    row[field]=value
+    assert executor._protected(row,private.positions[0]) is not True
+
+
 @pytest.mark.parametrize('close_reason',['EMERGENCY','MANUAL'])
 def test_close_history_settles_failed_order_lookup_without_another_write(tmp_path,close_reason):
     executor,private,store=setup(tmp_path)

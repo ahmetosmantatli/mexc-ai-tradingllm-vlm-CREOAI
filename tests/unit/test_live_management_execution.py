@@ -140,6 +140,23 @@ def test_runner2_target_requires_explicit_market_stop_evidence(tmp_path):
     assert not private.modifies
 
 
+@pytest.mark.parametrize('short',[False,True])
+def test_runner2_ioc_missing_stop_type_can_revise_target_after_exact_readback(tmp_path,short):
+    executor,private,_,row=prepared(tmp_path,short=short)
+    row=runner2_owned(executor,row)
+    row.update(entry_submitted_type=3,entry_exchange_type=3,
+               entry_protection_schema='mexc_create_ioc_attached_v1')
+    executor._save(row)
+    pair=private.stops[0]
+    pair.pop('stopLossType')
+    pair.update(orderId=int(row['exchange_order_id']),positionType=2 if short else 1,errorCode=0)
+    private.modify_unknown=True
+    changed=manage(executor,row,decision('move_target',target_price=94. if short else 105.))
+    assert changed['management_events'][-1]['status']=='confirmed'
+    assert changed['target_extensions']==1
+    assert not private.closes and len(private.modifies)==1
+
+
 @pytest.mark.parametrize(('field','wrong'),[('id',34),('vol',999.),('stopLossPrice',97.)])
 def test_runner2_target_timeout_requires_exact_pair_stop_and_coverage(tmp_path,field,wrong):
     executor,private,store,row=prepared(tmp_path)

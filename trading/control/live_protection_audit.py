@@ -71,6 +71,7 @@ def main():
             entries.append(dict(
                 recorded_exchange_type=intent.get('entry_exchange_type'),
                 submitted_type=intent.get('entry_submitted_type'),
+                protection_observation=intent.get('protection_observation'),
                 exchange_order={k:v for k,v in safe_protection(order).items()
                     if k in ('orderId','positionId','orderType','type','side','state','vol','dealVol')},
                 exchange_order_id_matches=str(order.get('orderId'))==str(intent.get('exchange_order_id'))))

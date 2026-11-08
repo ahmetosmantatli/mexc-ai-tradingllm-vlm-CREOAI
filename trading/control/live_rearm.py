@@ -1,5 +1,6 @@
 """Acknowledge a reviewed emergency halt locally; never starts trading or sends an order."""
 import argparse
+import copy
 import json
 from pathlib import Path
 import re
@@ -32,7 +33,7 @@ def _verify_protected_positions(store, control_store, client, account_id, pendin
                                   account_id=account_id,binding_id=binding)
     for row in active:
         position=verifier._position(row,dict(positionId=row['position_id']))
-        if position is None or verifier._protected(row,position) is not True:
+        if position is None or verifier._protected(copy.deepcopy(row),position) is not True:
             raise ValueError('protected_position_not_verified')
     orders=client.current_orders(page_num=1,page_size=100)
     if not isinstance(orders,list) or orders:
