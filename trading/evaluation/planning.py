@@ -1,12 +1,10 @@
-"""Bounded model sizing for paper proposals, never executable exchange orders.
+"""Bounded sizing for validated candidate or model-price proposals.
 
-The optional model plan chooses leverage and account risk, not prices or an
-arbitrary cash amount. Risk fractions use .01 for 1%, not the number 1. Entry,
-stop and target remain the selected quant candidate's tested setup. This is
-not yet autonomous entry/SL/TP planning. The caller must reapply sizing with
-fresh equity and current policy/exchange limits immediately before execution.
-Fees, margin, minimum contracts and liquidation remain mandatory runtime gates;
-a too-small plan must be rejected there rather than increased to the minimum.
+Risk fractions use .01 for1%. Prices are supplied by a quant candidate or a
+separately grounded/validated price-plan clone. Reapply with fresh equity and
+current policy/exchange limits immediately before execution. Fees, margin,
+contract minima and liquidation remain mandatory gates; a too-small plan is
+rejected rather than increased to the exchange minimum.
 """
 from math import isfinite
 from typing import Any

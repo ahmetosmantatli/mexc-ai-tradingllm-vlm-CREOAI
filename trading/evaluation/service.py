@@ -6,6 +6,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 from trading.agents.schemas import EvaluationResult, GraphAction, MarketAnalystNote, StrategyReviewNote, PortfolioAnalystNote
 from trading.evaluation.watch import WatchPlan, WatchCoordinator, ACTIVE
+from trading.evaluation.price_plan import MarketPricePlan,apply_market_price_plan,evidence_from_market
 from trading.evaluation.planning import PlanSizing, PlanSizingError, apply_decision_sizing
 from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context, economic_review_key, canonical_watch_card, watch_review_key
 
@@ -13,6 +14,7 @@ from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summ
 class ModelDecision(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
     sizing_plan: PlanSizing | None = None
+    price_plan: MarketPricePlan | None = None
     watch_plan: WatchPlan | None = None
     reviewed_watch_revision: int | None = Field(default=None,ge=0,strict=True)
     action: str = Field(pattern='^(trade|watch|hold)$')
@@ -27,7 +29,7 @@ SYSTEM_POLICY = (
     'Each request is self-contained: current closed 4h/15m/5m evidence, account state and a durable setup card. '
     'Tables use explicit column names. What_changed explains why this review was scheduled; do not assume hidden chat memory. '
     'Treat confirmed swing/BOS/sweep/FVG evidence as hypotheses, never guaranteed edge. HOLD is normal. '
-    'Never force a weekly return, raise risk after losses, invent prices/IDs, or place orders. '
+    'Never force a weekly return, raise risk after losses, invent evidence/IDs, or place orders. '
     'Account operating_context identifies PAPER or LIVE mode, observed balance, closed outcomes and an optional research objective. '
     'A research objective is reporting context only, never a reason to force a trade or exceed risk limits. '
     'Only the supplied candidate may be traded and only when cross-timeframe evidence is coherent. '
@@ -41,7 +43,14 @@ SYSTEM_POLICY = (
     'Never pretend to supersede an unseen plan. For trade choose sizing_plan with integer leverage and '
     'risk_per_trade_pct as an account fraction (.01 means 1%), within supplied limits; null retains policy sizing. '
     'In LIVE exchange leverage mode an explicit sizing_plan is mandatory: never default to the maximum. '
-    'Entry/SL/TP remain the candidate levels; never invent a different setup. Write concise Turkish rationale explaining the concrete missing confirmation '
+    'Only when account.price_planning.enabled is true, you may return an optional price_plan for the same candidate side/symbol. '
+    'Its fields: entry_type=market, entry_price, stop_loss_price, take_profit_price, entry_timeframe=5m/15m/4h, '
+    'stop_reference and target_reference (timeframe, open_time UTC candle-open seconds, field low/high), reason. '
+    'References must exist in supplied recent_ohlcv. LONG stop must be at/below a referenced low, SHORT at/above a high, '
+    'at most one recent average true range beyond it. Target must be within one recent ATR of a referenced opposite high/low '
+    'on the profit side. Prices must respect supplied tick step. Entry is only a current market reference, not a pending order; '
+    'for a distant entry use WATCH. A null price_plan keeps quant levels. When price planning is disabled keep price_plan null. '
+    'Never change prices just to force higher leverage or hit a money target. Write concise Turkish rationale explaining the concrete missing confirmation '
     'or rejection, and a watch_note describing what would justify reconsideration. Do not just say insufficient evidence. '
     'Keep rationale within1200 characters, invalidation within500 and watch_note within1000. '
     'VLM annotations are deterministic observations, not proof of profit.'
@@ -154,6 +163,10 @@ class ContextEvaluator:
             exchange_cap=self.public.get_contract_rules(symbol).max_leverage
         account['sizing_limits']=dict(max_risk_fraction=risk_per_trade_pct,policy_max_leverage=target_leverage,exchange_max_leverage=exchange_cap)
         account['operating_context']=copy.deepcopy(live_account) if live_account is not None else account_research_context(self.store,equity,self.cfg)
+        price_planning=bool(live_account is not None and getattr(self.cfg,'live_price_plan_enabled',False))
+        price_rules=self.public.get_contract_rules(symbol) if price_planning else None
+        account['price_planning']=dict(enabled=price_planning,price_step=price_rules.price_step if price_rules else None,
+            market_entry_only=True,reference_policy='closed recent OHLCV wick + at most1 recent ATR buffer')
         account['canonical_watch']=canonical_watch_card(prior_watch)
         economic_basis=economic_review_key(account,positions)
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
@@ -190,6 +203,11 @@ class ContextEvaluator:
             if (decision.action=='trade' and live_account is not None
                     and (live_account.get('leverage_policy') or {}).get('mode')=='exchange' and decision.sizing_plan is None):
                 raise ValueError('explicit model sizing required for exchange leverage mode')
+            if decision.price_plan is not None:
+                if not price_planning or decision.action!='trade':
+                    raise ValueError('price planning disabled or not trade')
+                apply_market_price_plan(candidate,decision.price_plan,evidence_from_market(chart_context),
+                    price_step=price_rules.price_step,current_price=candidate.entry_price,now=time.time())
             if decision.action=='trade' and decision.signal_id!=candidate.signal_id:
                 raise ValueError('unknown signal')
             if decision.watch_plan is not None and decision.action!='watch':
@@ -199,7 +217,7 @@ class ContextEvaluator:
             return decision
         if hasattr(self.llm,'response_validator'):
             self.llm.response_validator=validate
-        payload=self.llm.complete_json(system=SYSTEM_POLICY,user=prompt,max_tokens=700,
+        payload=self.llm.complete_json(system=SYSTEM_POLICY,user=prompt,max_tokens=1100 if price_planning else 700,
             images=paths if self.cfg.analysis_version=='vlm' else None)
         provider_trace=copy.deepcopy(getattr(self.llm,'last_trace',{}) or {})
         trace.update(provider_trace)
@@ -243,15 +261,25 @@ class ContextEvaluator:
             trace.update(status='decision_expired',action='hold',execution_status='not_opened')
             self._save_trace(trace)
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='decision_expired',metadata=metadata)
+        planned_candidate=candidate
+        price_evidence=evidence_from_market(chart_context) if decision.price_plan is not None else None
+        if decision.price_plan is not None:
+            try:
+                planned_candidate=apply_market_price_plan(candidate,decision.price_plan,price_evidence,
+                    price_step=price_rules.price_step,current_price=candidate.entry_price,now=time.time())
+            except ValueError:
+                return reject_coordinated('invalid_model_price_plan')
+        metadata.update(price_plan=decision.price_plan.model_dump() if decision.price_plan else None,
+            price_evidence=price_evidence,price_plan_enabled=price_planning)
         prepared_proposal=None
         if decision.action=='trade':
             try:
-                prepared_proposal=apply_decision_sizing(candidate,decision.sizing_plan,equity,risk_per_trade_pct,target_leverage,exchange_cap)
+                prepared_proposal=apply_decision_sizing(planned_candidate,decision.sizing_plan,equity,risk_per_trade_pct,target_leverage,exchange_cap)
             except PlanSizingError:
                 return reject_coordinated('invalid_model_sizing')
         coordinated_action='hold' if decision.action=='watch' and decision.watch_plan is None else decision.action
         try:
-            committed=coordinator.commit(candidate,coordinated_action,prior_watch['revision'],
+            committed=coordinator.commit(planned_candidate if decision.action=='trade' else candidate,coordinated_action,prior_watch['revision'],
                 watch_plan=decision.watch_plan,rationale=decision.rationale,reviewed_revision=decision.reviewed_watch_revision)
         except ValueError:
             committed=False
@@ -262,7 +290,7 @@ class ContextEvaluator:
         current_watch=coordinator.card(symbol)
         if current_watch['revision']!=committed_revision:
             return reject_coordinated('watch_revision_changed')
-        trace.update(watch_revision=committed_revision,watch_plan=metadata['watch_plan'])
+        trace.update(watch_revision=committed_revision,watch_plan=metadata['watch_plan'],price_plan=metadata.get('price_plan'))
         # Save dedup against the state our own successful commit created so HOLD
         # cannot invalidate its own cache through a coordinator revision bump.
         economic_basis['account']['canonical_watch']=watch_review_key(current_watch)
@@ -275,11 +303,12 @@ class ContextEvaluator:
             fallback_reason=getattr(self.llm,'last_fallback_reason',''),
             credential_id=getattr(self.llm,'last_credential_id',''),quota_group=getattr(self.llm,'last_quota_group',''))
         record=dict(at=time.time(),action=decision.action,rationale=decision.rationale,decision_ai=decision_ai,
-            invalidation=decision.invalidation,charts=paths,fingerprint=fingerprint)
+            invalidation=decision.invalidation,price_plan=metadata.get('price_plan'),charts=paths,fingerprint=fingerprint)
         card=setup_card(memory)
         card.update(first_reason=card.get('first_reason') or decision.rationale,last_reason=decision.rationale,
             last_action=decision.action,invalidation=decision.invalidation,watch_note=decision.watch_note,
             strategy=candidate.strategy.value,side=candidate.side.value,last_review_at=time.time())
+        if decision.action=='trade':card['last_price_plan']=metadata.get('price_plan')
         memory.pop('last_failure',None)
         memory.update(scope=scope,setup_card=card,watch_note=decision.watch_note,last_fingerprint=fingerprint,
             last_evaluation_key=evaluation_key,last_market=chart_context,
@@ -295,6 +324,7 @@ class ContextEvaluator:
         if decision.action!='trade':
             return EvaluationResult(action=GraphAction.HOLD,hold_reason=decision.action,metadata=metadata)
         proposal=prepared_proposal
+        proposal.metadata.update(price_source='model' if decision.price_plan else 'quant',price_plan=metadata.get('price_plan'))
         proposal.rationale=decision.rationale
         return EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=candidate,
             market=MarketAnalystNote(mode='llm'),strategy=StrategyReviewNote(mode='llm'),

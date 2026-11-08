@@ -118,3 +118,42 @@ def test_loss_circuit_breaker_blocks_model_but_monitor_keeps_reading(tmp_path):
     assert runner.cycle()['reason']=='HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
     assert not executor.calls
     assert runner.monitor()['reason']=='LIVE_RECONCILED'
+
+
+def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_path,monkeypatch):
+    cfg=Settings(_env_file=None,broker_mode='live',live_trading_enabled=True,live_automatic_enabled=True,
+        live_price_plan_enabled=True,live_allowed_accounts=('ahmet',),risk_profile='balanced',risk_per_trade_pct=.01,
+        default_target_leverage=5,kill_switch_path=str(tmp_path/'kill'),analysis_chart_dir=str(tmp_path/'charts'))
+    store=RuntimeStore(str(tmp_path/'live'));private,public=Client(),QuotePublic()
+    control=dict(enabled=True,stopped=False,updated_at=1,version='text',risk_profile='balanced',risk_per_trade_pct=.01,
+        max_leverage=5,max_positions=2,allocation_mode='full')
+    stamp=int(time())-1000
+    rows=[[stamp-900,100,102,99,100,10],[stamp,100,104,99.5,101,12]]
+    selected=dict(entry_type='market',entry_price=100.,stop_loss_price=99.4,take_profit_price=103.9,entry_timeframe='15m',
+        stop_reference=dict(timeframe='15m',open_time=stamp,field='low'),
+        target_reference=dict(timeframe='15m',open_time=stamp,field='high'),reason='Görülen alt fitile dayalı stop ve üst likidite hedefi.')
+    class PlanningModel(Model):
+        def complete_json(self,**kw):
+            response=super().complete_json(**kw)
+            response['price_plan']=deepcopy(selected)
+            response['sizing_plan']['risk_per_trade_pct']=.001
+            return response
+    llm=PlanningModel()
+    executor=AutomaticLiveExecutor(AutomaticLivePolicy(True,('ahmet',),('7',),2),LiveExecutionGates(True,'live',('7',),True),
+        store,private,public,RiskEngine(settings=cfg),control_provider=lambda:dict(control),account_id='ahmet',binding_id='binding-1',
+        can_execute=lambda:control['enabled'])
+    runner=LiveRunner(cfg,store=store,account_id='ahmet',binding_id='binding-1',private=private,public=public,llm=llm,
+        external_control=lambda:dict(control),executor=executor)
+    monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='bars',
+        to_context=lambda:{'timeframes':[dict(timeframe='15m',recent_ohlcv=deepcopy(rows))]}))
+    monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
+    executor.grant_start('7',1)
+    runner.candidate_queue().refresh([candidate()])
+    status=runner.cycle()
+    assert status['reason']=='LIVE_PROTECTED', (status,store.get('live_cycle_error'),executor.intents())
+    intent=executor.intents()[0]
+    assert intent['proposal']['stop_loss']['price']==99.4
+    assert intent['proposal']['take_profit_price']==103.9
+    assert intent['proposal']['metadata']['price_source']=='model'
+    assert private.stops[0]['stopLossPrice']==99.4 and private.stops[0]['takeProfitPrice']==103.9
+    assert len(private.submits)==1 and store.get('paper') is None

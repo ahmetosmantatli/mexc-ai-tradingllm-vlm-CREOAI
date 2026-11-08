@@ -59,9 +59,12 @@ class LiveTelegramController(TelegramController):
         leverage_mode=(self.snapshot_provider(account_id) or {}).get('leverage_mode','profile')
         leverage_text=('Kaldıraç: parite ve hesabın güncel borsa üst sınırı; model seçim yapar. Stop/likidasyon, marjin ve risk kontrolleri geçerlidir.\n'
             if leverage_mode=='exchange' else f"Profil kaldıraç üst sınırı: {state.get('max_leverage','?')}x; gerçek hesap/borsa sınırı daha düşük olabilir.\n")
+        price_planning=(self.snapshot_provider(account_id) or {}).get('price_planning_enabled',False)
+        price_text=('Giriş/SL/TP: AI kapanmış mumlara referanslı plan önerebilir; piyasa ve risk doğrulaması zorunlu.\n'
+            if price_planning else 'Giriş/SL/TP: algoritma seviyeleri.\n')
         return (text+f"Analiz: {'VLM' if state['version']=='vlm' else 'Görselsiz'} | Profil: {mode.get('label','?')}\n"
             f"Planlanan işlem riski üst sınırı: %{state['risk_per_trade_pct']*100:g}\n"
-            +leverage_text+
+            +leverage_text+price_text+
             'Başlat sonrasında model ve risk motoru işlem başına Telegram onayı beklemez. Başlat yetkisi 7 gün geçerlidir.\n'
             'Durdur yeni girişleri/AI çağrılarını keser; açık pozisyonların uzlaştırması ve borsa koruması sürer.')
 
@@ -92,6 +95,8 @@ class LiveTelegramController(TelegramController):
             text+=(f"\n{symbol} · {p.get('side','?')} · {p.get('leverage','?')}x\n"
                    f"Giriş: {number(p.get('entry'),6)} | SL: {number(p.get('stop'),6)} | TP: {number(p.get('target'),6)}\n"
                    f"Açık PnL: {number(p.get('unrealized'))} USDT\n")
+            if p.get('price_source'):
+                text+='Seviyeler: '+('AI planı' if p['price_source']=='model' else 'algoritma')+'\n'
             origin=p.get('decision_ai') or {}
             if origin:text+=f"Karar: {origin.get('provider','?')} / {origin.get('model','?')}\n"
             text+=f"Koruma: {p.get('protection_status','borsa uzlaştırması bekleniyor')}\n"

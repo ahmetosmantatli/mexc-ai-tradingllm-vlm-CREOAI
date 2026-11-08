@@ -281,6 +281,7 @@ class LiveFleet:
         runner=self.runners.get(ident)
         snapshot=copy.deepcopy(runner.status(runner.store.get('status',{}).get('reason','LIVE_STATUS')) if runner else dict(mode='LIVE',reason='ACCOUNT_UNAVAILABLE',positions={},account={'ready':False}))
         snapshot['mode']='LIVE'
+        snapshot['price_planning_enabled']=self.cfg.live_price_plan_enabled
         snapshot['control']=self.controller.control(ident)
         snapshot['version']=snapshot['control'].get('version','text')
         snapshot['ai_budget']=self.budget_store.get('ai_budget',{})
@@ -313,6 +314,10 @@ class LiveFleet:
             stop=proposal.get('stop_loss') or {}
             text+=(f"Yön: {proposal.get('side','?')} | Kaldıraç: {proposal.get('leverage','?')}x\n"
                 f"Gerçekleşen giriş: {row.get('entry_fill_price','doğrulanmadı')} | SL: {stop.get('price','?')} | TP: {proposal.get('take_profit_price','?')}\n")
+            source='AI mum/yapı referanslı planı' if metadata.get('price_source')=='model' else 'algoritma seviyeleri'
+            text+=f'Giriş/SL/TP kaynağı: {source}\n'
+            if metadata.get('price_plan'):
+                text+='Plan gerekçesi: '+str(metadata['price_plan'].get('reason',''))[:600]+'\n'
             ai=metadata.get('decision_ai') or {}
             text+=f"Kararı veren AI: {ai.get('provider','kayıtlı değil')} / {ai.get('model','kayıtlı değil')}\n"
         if state=='closed':

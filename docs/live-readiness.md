@@ -21,8 +21,9 @@ snapshot generation and clock changes do not independently trigger repeat AI
 calls on unchanged closed candles. Quota scheduling and provider fallback remain
 shared across users and variants. A valid model HOLD ends a review.
 
-Models select bounded risk and leverage; entry/SL/TP levels still come from the
-existing quant candidates. Every proposal is rebuilt from fresh equity,
+Models select bounded risk and leverage. By default entry/SL/TP levels come from
+quant candidates; optional grounded model price planning is described below.
+Every proposal is rebuilt from fresh equity,
 contract steps and fees/slippage before a persistent intent is authorized.
 An account-specific leverage change is read back; no ambiguous change is assumed
 successful. External or unidentified orders/positions block new entries rather
@@ -158,3 +159,36 @@ not a feasible500x stop plan. The existing default minimum stop-to-liquidation
 buffer is2% of price, and current quant stops are typically1.5–2% of price; many
 high leverage proposals will correctly be rejected. This setting does not add
 model-selected arbitrary entry/SL/TP levels or alter existing positions.
+
+## Optional model entry / SL / TP planning
+
+`LIVE_PRICE_PLAN_ENABLED=true` lets the same model review return a strict
+`price_plan` for the selected candidate's symbol and side. Default false retains
+quant levels. A null plan also deliberately retains quant levels; a malformed
+plan is rejected, never silently substituted. Text and VLM use the same schema.
+No extra provider call or browser tool is introduced; the typed response budget
+increases from700 to1100 output tokens when planning is enabled.
+
+Only a market entry reference near the current quote is accepted. A distant
+entry must use a conditional watch, not a disguised market/limit order. The plan
+contains entry/SL/TP prices, entry timeframe, stop/target candle references and a
+reason. References use exact candle-open UTC seconds, timeframe and high/low from
+the recent closed OHLCV actually supplied to the model (latest12 per timeframe).
+LONG stops must be at/below a referenced low; SHORT stops at/above a high. Stop
+buffer is at most one recent average true range. Targets reference an opposite
+observed high/low on the profit side, within one recent ATR. These are explicit
+validation definitions, not a calibrated ICT edge or evidence of profitability.
+
+Prices must respect the MEXC tick step, direction and current executable price.
+The server preserves original signal/queue identity and immutable evidence; the
+runtime validates the plan again with fresh price/tick/equity before sizing.
+Fees/slippage, minimum contracts, margin, shared risk, expiry, current plan
+revision and liquidation gates remain mandatory. A target with nonpositive
+estimated net reward after configured costs is rejected. Native stop/target
+verification uses the final model prices, not the original quant levels.
+
+The setup card and canonical symbol plan record the model's actual proposed
+levels. Telegram identifies **AI plan** versus **algorithm levels**, and reports
+the model's plan reason. Existing open positions are not rewritten by enabling
+this option. Continuous model-driven native stop/TP changes and arbitrary
+pending/limit-entry plans are still not provided by this option.

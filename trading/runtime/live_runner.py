@@ -15,6 +15,7 @@ import threading
 import time
 
 from trading.config import RiskProfile
+from trading.evaluation.price_plan import apply_market_price_plan
 from trading.evaluation.planning import apply_decision_sizing,PlanSizingError
 from trading.evaluation.service import ContextEvaluator,finalize_trace
 from trading.evaluation.watch import WatchCoordinator,watch_snapshot,TIMEFRAMES
@@ -263,7 +264,7 @@ class LiveRunner:
             live_context['leverage_policy']=dict(mode=self.cfg.live_leverage_mode,account_exchange_max=exchange_cap,
                 minimum_stop_liquidation_buffer_fraction=self.cfg.liquidation_buffer_pct,
                 fee_rate=self.cfg.paper_fee_rate,slippage_bps=self.cfg.paper_slippage_bps,
-                note='Maximum is an upper bound, not a target. Keep candidate SL/TP, loss budget and liquidation buffer; choose lower leverage or HOLD when incompatible.')
+                note='Maximum is an upper bound, not a target. Use a validated grounded price plan only when price planning is enabled, otherwise keep quant levels. Preserve loss budget and liquidation buffer; choose lower leverage or HOLD when incompatible.')
             return evaluator.evaluate_candidates([candidate],equity=capital,risk_per_trade_pct=self._risk_fraction(control),
                 target_leverage=self._leverage_cap(control,exchange_cap),risk_profile=self.cfg.risk_profile.value,
                 live_account_context=live_context,live_positions=self._positions(snapshot))
@@ -279,22 +280,32 @@ class LiveRunner:
         exchange_cap=min(rules.max_leverage,private_risk['max_leverage'],private_leverage['max_leverage'])
         if self.cfg.live_leverage_mode=='exchange' and result.metadata.get('sizing_plan') is None:
             raise ValueError('model must explicitly choose live leverage and risk')
-        proposal=apply_decision_sizing(candidate,result.metadata.get('sizing_plan'),self._capital(snapshot,control),
-            self._risk_fraction(control),self._leverage_cap(control,exchange_cap),exchange_cap)
         ticker=self.quote(candidate.symbol)
-        if abs(ticker.last_price/candidate.entry_price-1)>min(candidate.stop_distance_pct/2,.005):
+        planning_candidate=candidate
+        if result.metadata.get('price_plan') is not None:
+            if not self.cfg.live_price_plan_enabled:raise ValueError('live model price planning disabled')
+            planning_candidate=apply_market_price_plan(candidate,result.metadata['price_plan'],result.metadata.get('price_evidence') or {},
+                price_step=rules.price_step,current_price=ticker.ask1 if candidate.side.value=='long' else ticker.bid1,now=time.time())
+        proposal=apply_decision_sizing(planning_candidate,result.metadata.get('sizing_plan'),self._capital(snapshot,control),
+            self._risk_fraction(control),self._leverage_cap(control,exchange_cap),exchange_cap)
+        if abs(ticker.last_price/planning_candidate.entry_price-1)>min(planning_candidate.stop_distance_pct/2,.005):
             raise ValueError('live entry price drift')
         entry=ticker.ask1 if candidate.side.value=='long' else ticker.bid1
         slip=self.cfg.paper_slippage_bps/10000;fee=self.cfg.paper_fee_rate
         worst_entry=entry*(1+slip if candidate.side.value=='long' else 1-slip)
         stop=proposal.stop_loss.price*(1-slip if candidate.side.value=='long' else 1+slip)
         loss_fraction=(abs(worst_entry-stop)+fee*(worst_entry+stop))/entry
+        if result.metadata.get('price_plan') is not None:
+            worst_target=proposal.take_profit_price*(1-slip if candidate.side.value=='long' else 1+slip)
+            expected_net=(worst_target-worst_entry if candidate.side.value=='long' else worst_entry-worst_target)-fee*(worst_entry+worst_target)
+            if expected_net<=0:raise ValueError('model target does not cover expected trading costs')
         max_notional=min(proposal.notional,proposal.max_loss_if_stopped/loss_fraction,
             snapshot['balance']['available']/(max(1/proposal.leverage,private_risk['initial_rate'])+fee)*.95)
         _,notional=rules.size_order(max_notional,entry,proposal.leverage)
         proposal.notional=notional
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)
-        proposal.metadata.update(contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
+        proposal.metadata.update(price_plan=result.metadata.get('price_plan'),price_source='model' if result.metadata.get('price_plan') else 'quant',
+            contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
             decision_ai=result.metadata.get('decision_ai',{}),account_generation=snapshot['generation'])
         return proposal
 
@@ -470,7 +481,7 @@ class LiveRunner:
                 stop=proposal.get('stop_loss',{}).get('price'),target=proposal.get('take_profit_price'),
                 opened_at=row.get('opened_at'),intent_id=intent.get('intent_id'),
                 protection_status=intent.get('status','unmanaged'),analysis_version=metadata.get('analysis_version'),
-                decision_ai=metadata.get('decision_ai',{}))
+                decision_ai=metadata.get('decision_ai',{}),price_source=metadata.get('price_source','quant'))
         closed=[row for row in intents if row.get('status')=='closed']
         snapshot=dict(mode='LIVE',live_orders_enabled=bool(self.executor is not None),observed_at=time.time(),reason=reason,
             account=dict(ready=account.get('ready',False),**account.get('balance',{})),
