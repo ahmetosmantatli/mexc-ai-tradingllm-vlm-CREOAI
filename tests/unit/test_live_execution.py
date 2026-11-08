@@ -23,7 +23,7 @@ class Exchange(Client):
         self.order_row=None;self.protections=[];self.timeout=False
         self.native=True;self.protection_fail=False
         self.fill_price=None;self.unfilled=False;self.partial_fill=False;self.resting=False
-        self.cancel_leaves_open=False
+        self.cancel_leaves_open=False;self.close_confirmed=True
     def open_positions(self,symbol=None):
         return deepcopy(self.positions)
     def submit_market(self,**kw):
@@ -65,6 +65,8 @@ class Exchange(Client):
             profitLossVolType='SAME',vol=kw['contracts'],stopLossPrice=kw['stop_loss'],takeProfitPrice=kw['take_profit'])
     def order_by_external_id(self,symbol,external_id):
         if external_id.startswith('close-'):
+            if not self.close_confirmed:
+                return dict(externalOid=external_id,symbol=symbol,side=4,state=2,dealVol=0)
             vol=self.closes[-1]['contracts'] if self.closes else 1
             return dict(externalOid=external_id,symbol=symbol,side=4,state=3,dealVol=vol)
         return deepcopy(self.order_row)
@@ -131,9 +133,12 @@ def test_ambiguous_entry_is_reconciled_by_original_id_without_second_write(tmp_p
 def test_failed_native_protection_closes_once_only_with_prior_operator_permission(tmp_path):
     executor,private,proposal=setup(tmp_path)
     row=approved(executor,proposal);private.native=False;private.protection_fail=True
-    assert executor.execute(row['intent_id'])['status']=='emergency_close_unknown'
+    unknown=executor.execute(row['intent_id'])
+    assert unknown['status']=='emergency_close_unknown'
+    assert executor.store.get('live:halt')['reason']=='native_protection_not_confirmed'
     assert len(private.protection_writes)==1 and len(private.closes)==1
     assert executor.reconcile(row['intent_id'])['status']=='closed'
+    assert not executor.store.get('live:halt')
     assert len(private.protection_writes)==1 and len(private.closes)==1
 
 
@@ -286,14 +291,46 @@ def test_hot_fill_at_or_inside_the_worst_price_is_protected(tmp_path,fill):
     assert not private.closes
 
 
-def test_hot_market_fill_is_rejected_and_the_review_halt_stays(tmp_path):
+def _later_symbol(proposal,symbol='DOGE_USDT',proposal_id='later-doge'):
+    return proposal.model_copy(update={'proposal_id':proposal_id,'symbol':symbol})
+
+
+def _approve_later(executor,proposal):
+    staged=executor.stage(proposal)
+    return executor.approve(staged['intent_id'],staged['proposal_fingerprint'],'11',allow_emergency_close=True)
+
+
+def test_unknown_emergency_close_still_blocks_a_later_symbol(tmp_path):
+    worst=worst_entry_price('long',0.0004266,18607,0.334134912,0.0006,0.0005,0.0000001)
+    executor,private,proposal=hot_setup(tmp_path,fill_price=0.0004494)
+    private.close_confirmed=False
+    row=approved(executor,proposal)
+    rejected=executor.execute(row['intent_id'])
+    assert private.market_orders==[]
+    assert len(private.submits)==1 and private.submits[0]['price']==worst
+    assert private.submits[0]['price']<0.0004494
+    assert rejected['status']=='emergency_close_unknown'
+    assert rejected['halt_reason']=='filled_position_risk_exceeds_plan'
+    assert private.closes[0]['contracts']==18607
+    halt=executor.store.get('live:halt')
+    assert halt['intent_id']==row['intent_id'] and halt['reason']=='emergency_close_not_confirmed'
+    note=executor.store.get('live:review:'+row['intent_id'])
+    assert note['reason']=='emergency_close_requires_review' and note['requires_review'] is True
+    assert note['symbol']=='HOT_USDT' and note['fill_price']==0.0004494 and note['worst_allowed_price']==worst
+    still=executor.reconcile(row['intent_id'])
+    assert still['status']=='emergency_close_unknown'
+    assert executor.store.get('live:halt')['reason']=='emergency_close_not_confirmed'
+    later=_approve_later(executor,_later_symbol(proposal))
+    with pytest.raises(LiveExecutionError,match='live_halt_latched'):
+        executor.execute(later['intent_id'])
+    assert len(private.submits)==1 and len(private.closes)==1 and private.market_orders==[]
+
+
+def test_confirmed_hot_emergency_close_does_not_block_a_different_symbol(tmp_path):
     worst=worst_entry_price('long',0.0004266,18607,0.334134912,0.0006,0.0005,0.0000001)
     executor,private,proposal=hot_setup(tmp_path,fill_price=0.0004494)
     row=approved(executor,proposal)
     rejected=executor.execute(row['intent_id'])
-    assert private.market_orders==[]
-    assert len(private.submits)==1
-    assert private.submits[0]['price']==worst
     assert rejected['status']=='emergency_close_unknown'
     assert rejected['halt_reason']=='filled_position_risk_exceeds_plan'
     assert rejected['fill_price']==0.0004494
@@ -301,24 +338,58 @@ def test_hot_market_fill_is_rejected_and_the_review_halt_stays(tmp_path):
     assert rejected['planned_loss']==0.3341300874356986
     assert rejected['computed_loss']==entry_stop_loss('long',0.0004494,0.0004266,18607,0.0006,0.0005)
     assert rejected['equity']==11.1378304
-    assert private.closes[0]['contracts']==18607
-    halt=executor.store.get('live:halt')
-    assert halt['reason']=='emergency_close_requires_review' and halt['requires_review'] is True
-    assert halt['fill_price']==0.0004494 and halt['worst_allowed_price']==worst
-    assert halt['planned_loss']==0.3341300874356986
-    assert halt['computed_loss']==rejected['computed_loss'] and halt['equity']==11.1378304
+    assert private.market_orders==[] and private.submits[0]['price']==worst
+    assert executor.store.get('live:halt')['reason']=='emergency_close_not_confirmed'
     closed=executor.reconcile(row['intent_id'])
     assert closed['status']=='closed' and closed['close_reason']=='emergency_close'
     assert closed['halt_reason']=='filled_position_risk_exceeds_plan'
     assert closed['fill_price']==0.0004494 and closed['computed_loss']==rejected['computed_loss']
-    assert executor.store.get('live:halt')['requires_review'] is True
+    note=executor.store.get('live:review:'+row['intent_id'])
+    assert note['reason']=='emergency_close_requires_review' and note['requires_review'] is True
+    assert note['fill_price']==0.0004494 and note['worst_allowed_price']==worst
+    assert note['planned_loss']==0.3341300874356986 and note['computed_loss']==rejected['computed_loss']
+    assert not executor.store.get('live:halt')
     assert len(private.closes)==1 and len(private.submits)==1
-    fresh=proposal.model_copy(update={'proposal_id':'second-hot-entry'})
-    staged=executor.stage(fresh)
-    executor.approve(staged['intent_id'],staged['proposal_fingerprint'],'11',allow_emergency_close=True)
+    private.fill_price=None
+    later=_approve_later(executor,_later_symbol(proposal))
+    opened=executor.execute(later['intent_id'])
+    assert opened['status']=='protected' and opened['proposal']['symbol']=='DOGE_USDT'
+    assert opened['fill_price']<=worst and opened['computed_loss']<=proposal.max_loss_if_stopped+1e-8
+    assert len(private.submits)==2 and private.submits[1]['symbol']=='DOGE_USDT'
+    assert private.submits[1]['price']==worst and private.market_orders==[]
+    assert len(private.closes)==1 and not executor.store.get('live:halt')
+
+
+def test_confirmed_close_does_not_clear_an_unknown_entry_halt(tmp_path):
+    executor,private,proposal=hot_setup(tmp_path,fill_price=0.0004494)
+    row=approved(executor,proposal)
+    executor.execute(row['intent_id'])
+    executor.store.put('live:halt',dict(intent_id='other-unknown-entry',reason='entry_write_outcome_unknown',at=1))
+    closed=executor.reconcile(row['intent_id'])
+    assert closed['status']=='closed' and closed['close_reason']=='emergency_close'
+    halt=executor.store.get('live:halt')
+    assert halt['intent_id']=='other-unknown-entry' and halt['reason']=='entry_write_outcome_unknown'
+    later=_approve_later(executor,_later_symbol(proposal))
     with pytest.raises(LiveExecutionError,match='live_halt_latched'):
-        executor.execute(staged['intent_id'])
-    assert len(private.submits)==1 and len(private.closes)==1
+        executor.execute(later['intent_id'])
+    assert len(private.submits)==1 and private.market_orders==[]
+
+
+def test_leftover_confirmed_close_halt_does_not_block_a_different_symbol(tmp_path):
+    worst=worst_entry_price('long',0.0004266,18607,0.334134912,0.0006,0.0005,0.0000001)
+    executor,private,proposal=hot_setup(tmp_path,fill_price=0.0004494)
+    row=approved(executor,proposal)
+    executor.execute(row['intent_id'])
+    assert executor.reconcile(row['intent_id'])['status']=='closed'
+    executor.store.put('live:halt',dict(intent_id=row['intent_id'],reason='emergency_close_requires_review',
+        requires_review=True,at=1,fill_price=0.0004494,worst_allowed_price=worst))
+    private.fill_price=None
+    later=_approve_later(executor,_later_symbol(proposal))
+    opened=executor.execute(later['intent_id'])
+    assert opened['status']=='protected' and opened['proposal']['symbol']=='DOGE_USDT'
+    assert not executor.store.get('live:halt')
+    assert executor.store.get('live:review:'+row['intent_id'])['requires_review'] is True
+    assert private.submits[-1]['price']==worst and private.market_orders==[]
 
 
 def test_risk_engine_still_rejects_before_any_entry_order(tmp_path):

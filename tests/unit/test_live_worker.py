@@ -284,6 +284,17 @@ def test_stop_blocks_new_entries_but_exchange_close_fees_and_funding_are_booked(
     assert private.submits[1]['external_id'] != private.submits[0]['external_id']
 
 
+def test_confirmed_risk_close_message_is_a_review_not_a_halt():
+    text = LiveRunner._text(dict(
+        status='closed', proposal=dict(symbol='HOT_USDT'), position_id='42',
+        halt_reason='filled_position_risk_exceeds_plan', fill_price=0.0004494,
+        worst_allowed_price=0.0004438, computed_loss=0.437985930976139, exchange_costs={}), None)
+    assert text.startswith('Exchange confirmed close HOT_USDT')
+    assert 'Review: fill 0.0004494 passed worst allowed 0.0004438' in text
+    assert 'does not halt entries on other symbols' in text
+    assert 'live:halt' not in text
+
+
 def test_partial_fill_does_not_latch_the_account_or_send_a_second_entry(tmp_path):
     runner, private, _cfg = build(tmp_path)
     runner.arm('11')
