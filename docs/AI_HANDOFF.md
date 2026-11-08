@@ -172,3 +172,24 @@ Edge report adds decision/family groups and collision bounds; preserves original
 quant reference across selected direction changes. Missing data, failed decisions,
 partial structural references and old watch levels never become fake wins.
 See docs/live-readiness.md for caveats and read-only report commands.
+
+
+## Provider quota follow-up
+
+Gemini day accounting now uses Pacific calendar midnight (not previous conservative
+rolling24h). Do not repeat that Groq and Gemini both reset at Türkiye midnight.
+Groq stays rolling24h conservative locally plus allowlisted last-response
+remaining/reset headers. Gemini structured daily429 waits until Pacific reset;
+short transient retries retain Retry-After. No quota/balance was read live here.
+`provider_status --catalog` GET-only lists configured-key model IDs; it does not
+establish free access, independent quota or vision support. Optional
+AI_FREE_MODEL_ROUTES defaults[] and requires explicit verified model/mode/quota
+configuration. Shared quota_bucket aliases share conservative caps/leases.
+No new provider model or paid fallback was enabled on the server.
+User subsequently supplied model quotas. scripts/configure-free-models.py applies
+those specific nonzero general-model routes only, backs up host.env and disables
+paid fallback while preserving keys/live gates. Gemma4 native adapter preserves
+system/context/images and enforces local decision schema/STOP. Gemma variants
+share a conservative per-project bucket until independent quotas confirmed.
+All Groq general model routes retain the supplied8K TPM; no fake free capacity
+is created and no audio/guard/embedding model is used for trade decisions.

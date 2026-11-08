@@ -67,22 +67,41 @@ class GeminiClient:
             if not self.can_call():
                 self.last_status='stopped'
                 return None
+            native=model.startswith('gemma-4-')
+            endpoint=self.ENDPOINT
+            headers={'Authorization':'Bearer '+self.settings.gemini_api_key}
+            if native:
+                parts=[{'text':user}]
+                for path in images or []:
+                    parts.append({'inlineData':{'mimeType':'image/png','data':base64.b64encode(Path(path).read_bytes()).decode('ascii')}})
+                payload=dict(systemInstruction={'parts':[{'text':system}]},contents=[{'role':'user','parts':parts}],
+                    generationConfig={'maxOutputTokens':max(self.settings.gemini_max_completion_tokens,max_tokens),
+                                      'thinkingConfig':{'thinkingLevel':'minimal'}})
+                endpoint='https://generativelanguage.googleapis.com/v1beta/models/'+model+':generateContent'
+                headers={'x-goog-api-key':self.settings.gemini_api_key}
             attempt.update(phase='generation',status='requesting',generation_requests=1)
-            response=self.client.post(self.ENDPOINT,
-                headers={'Authorization':'Bearer '+self.settings.gemini_api_key},json=payload)
+            response=self.client.post(endpoint,headers=headers,json=payload)
             if response.status_code==429:
-                try:
-                    retry=float(response.headers.get('retry-after','60'))
-                    if not math.isfinite(retry):retry=60
-                except (TypeError,ValueError):
-                    retry=60
-                self._cooldown(key,max(1,min(retry,86400)))
+                from trading.agents.provider_limits import gemini_retry
+                retry,daily=gemini_retry(response)
+                attempt.update(retry_after_seconds=retry,daily_quota_exhausted=daily)
+                self._cooldown(key,retry)
             response.raise_for_status()
             attempt['http_status']=response.status_code
             data=response.json()
             usage=data.get('usage',{})
+            if native:
+                usage=data.get('usageMetadata',{})
+                output=usage.get('candidatesTokenCount')
+                thought=usage.get('thoughtsTokenCount',0)
+                usage=dict(prompt_tokens=usage.get('promptTokenCount'),completion_tokens=output+thought if type(output) is int and type(thought) is int else None)
             attempt.update(input_tokens=usage.get('prompt_tokens'),output_tokens=usage.get('completion_tokens'))
-            result=json.loads(data['choices'][0]['message']['content'])
+            if native:
+                selected=data['candidates'][0]
+                if selected.get('finishReason')!='STOP':raise ValueError('native output incomplete')
+                content=''.join(part.get('text','') for part in selected.get('content',{}).get('parts',[]) if not part.get('thought'))
+            else:content=data['choices'][0]['message']['content']
+            result=json.loads(content)
             if not isinstance(result,dict):
                 raise ValueError('expected JSON object')
             if self.response_validator:

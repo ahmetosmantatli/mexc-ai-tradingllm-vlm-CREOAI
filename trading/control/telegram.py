@@ -4,6 +4,8 @@ Run on a dedicated control thread with its own RuntimeStore connection, never on
 position protection's hot path. Account status is supplied by the orchestrator.
 """
 from contextlib import ExitStack
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import json
 import logging
 from math import isfinite
@@ -241,12 +243,17 @@ class TelegramController:
                    f"başarılı {counts.get('successes',0)}, başarısız {counts.get('failures',0)}\n")
         groups=(snapshot.get('provider_pool') or {}).get('groups',[]) if isinstance(snapshot.get('provider_pool'),dict) else []
         if groups:
-            text+='Yerel kota havuzu (sağlayıcı paneli değil; günlük sayaç son24 saat):\n'
+            text+='Yerel kota tahmini (sağlayıcı paneli değil; Gemini Pasifik günü, Groq korumacı son24s):\n'
             for group in groups:
                 text+=(f"{group['provider']} / {group['model']} / {group['quota_group']} | "
                        f"Kalan dk istek {group.get('requests_minute_remaining','?')}, tahmini token {group.get('tokens_minute_remaining_estimate','?')} | "
-                       f"Kalan24s istek {group.get('requests_rolling_24h_remaining','?')} | "
+                       f"Kalan günlük istek {group.get('requests_daily_remaining','?')} | "
                        f"Meşgul: {'evet' if group.get('in_flight') else 'hayır'}\n")
+                reset=group.get('next_daily_reset_at')
+                if reset:text+='Yerel sonraki günlük hak zamanı: '+datetime.fromtimestamp(reset,ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M')+'\n'
+                reported=group.get('provider_reported') or {}
+                if reported:
+                    text+=f"Son sağlayıcı yanıtı: kalan istek {reported.get('requests_remaining','?')}, token {reported.get('tokens_remaining','?')} (anlık panel değildir).\n"
         latest=snapshot.get('analysis_trace') or {}
         history=snapshot.get('analysis_history') or []
         traces=history[-3:] if history else ([latest] if latest else [])
@@ -260,8 +267,6 @@ class TelegramController:
             text += (f"\nAnaliz {trace.get('id','?')} | {trace.get('symbol','?')} | {trace.get('strategy','?')}\n"
                      f"Aday puanı {score_text} (olasılık değil) | Sonuç: {trace.get('status','?')}\n")
             if trace.get('started_at'):
-                from datetime import datetime
-                from zoneinfo import ZoneInfo
                 text+='Analiz saati: '+datetime.fromtimestamp(trace['started_at'],ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M:%S')+'\n'
             if trace.get('rationale'):
                 text+='Gerekçe: '+str(trace['rationale'])[:500]+'\n'

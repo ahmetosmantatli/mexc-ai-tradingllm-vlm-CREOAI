@@ -448,3 +448,77 @@ python -m trading.control.edge_report --root /app/data --output-dir /app/data/re
 
 Historical unrecorded decisions or the old STONK exception reason cannot be
 reconstructed. This release does not establish their cause or live profitability.
+
+
+### Provider day boundaries and explicit extra free models
+
+Gemini admission now follows the America/Los_Angeles calendar day, not a rolling
+24h request window. The UTC offset is calculated by zoneinfo (including DST).
+Minute history and in-flight leases survive midnight; they are never cleared to
+manufacture new minute capacity. Existing archived usage is preserved. Groq daily
+admission remains conservative rolling24h locally; only last-response allowlisted
+remaining/reset header values are additionally used to block known exhausted
+requests/tokens until reset. These are LAST RESPONSE observations, not an API to
+read live credit or exact remaining account-wide quota. Other applications on the
+same project/organization remain outside the local journal.
+
+Gemini429 structured RetryInfo is respected. An explicit QuotaFailure per-day
+quotaId causes waiting until next Pacific midnight (or a longer Retry-After),
+not a five-second retry loop. Unknown errors never reset usage counters.
+
+```sh
+python -m trading.control.provider_status
+python -m trading.control.provider_status --catalog
+```
+
+The first prints local quota state only, no model request. The optional catalog
+performs only authenticated model-list GETs for the existing configured keys;
+it does NOT generate completions, place orders or verify free access. Pagination
+is explicitly flagged. The catalog lists names without keys or raw error bodies.
+It cannot infer each project's/org's actual model quotas or vision/JSON support.
+
+`AI_FREE_MODEL_ROUTES` is an optional JSON list (default `[]`). Each route requires
+provider, exact model ID, modes (`text` and/or `vlm`), quota_bucket, RPM/TPM/RPD/TPD
+and explicit free_access_verified=true. Verify these in the provider's account
+console before enabling. There are no automatically enabled additional models.
+The existing credentials are reused; adding a model is not a new quota grant.
+Aliases sharing a real quota MUST use the same quota_bucket; matching original
+model ID uses its existing bucket. Shared buckets use the lower configured
+limits and one lease, never summed allowance. Separate model buckets are valid
+only when independent allowance has been confirmed. Every route receives the
+same full policy/context/images and uses the same structured decision validator.
+Text-only routes never receive VLM requests. Oversize data is rejected, not cut.
+The model response may still be invalid or unavailable; all execution risk gates
+remain unchanged.
+
+Sources: [Gemini rate limits](https://ai.google.dev/gemini-api/docs/rate-limits),
+[Groq rate limits/response headers](https://console.groq.com/docs/rate-limits),
+[Groq model-list API](https://console.groq.com/docs/api-reference),
+[Gemini models API](https://ai.google.dev/api/models).
+
+For the quotas explicitly supplied by Ahmet on2026-11-08, a standalone host-side
+configuration script is provided (operator-specific values, not general free-tier
+limits):
+
+```sh
+python3 scripts/configure-free-models.py
+```
+
+It backs up `.env`, preserves API keys and all live/risk gates, replaces only pool
+settings, disables paid Claude fallback, and installs verified general text/vision
+routes. It does not start trading, reset counters or call any API. It reuses the
+existing quota-group mapping for the user's independent organizations/projects.
+Groq120B and Qwen remain subject to8K TPM, so switching to them cannot solve an
+oversized prompt. Speech/Whisper/Orpheus, guard-only, embeddings, agent-specific,
+zero-quota and live-audio models are not configured for trade decisions.
+Gemini3Flash preview is excluded pending exact catalog ID verification. Gemini
+3.1Flash-Lite and nonzero2.5/3.6/3.8Flash quotas are included. Gemma4 variants use
+one conservative shared quota bucket per project until separate metrics are
+verified, rather than asserting two independent14.4K daily allowances.
+
+Gemma4 uses the documented native generateContent endpoint with systemInstruction,
+unchanged user context and inline PNG images. Thinking is minimal. Native JSON
+is validated locally with the same decision schema; non-STOP/truncated, malformed
+or unvalidated results cannot open an order. No text/image data is removed to fit
+quota. Every fallback shares the original deadline; no unbounded retry loop.
+Reference: [Gemma on Gemini API](https://ai.google.dev/gemma/docs/core/gemma_on_gemini_api).

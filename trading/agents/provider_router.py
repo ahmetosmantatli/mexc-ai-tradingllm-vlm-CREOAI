@@ -152,6 +152,8 @@ class ProviderRouter:
             self._trace()
             response=self.client.post('https://api.groq.com/openai/v1/chat/completions',
                 headers={'Authorization':'Bearer '+self.settings.groq_api_key},json=payload)
+            from trading.agents.provider_limits import read_groq_headers
+            attempt['provider_reported']=read_groq_headers(response.headers)
             if response.status_code==429:
                 try:
                     retry=float(response.headers.get('retry-after','60'))

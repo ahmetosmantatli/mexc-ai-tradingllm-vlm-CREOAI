@@ -2,10 +2,12 @@
 
 A second API key does not imply a second provider quota. Configure distinct
 quota groups only for genuinely separate projects/organizations. Local token
-estimates and rolling-24h limits are safeguards, not provider quota telemetry.
+estimates and provider-specific daily windows are safeguards, not live quota telemetry.
 All routes receive identical context/images. Valid HOLD never triggers fallback.
 """
 from dataclasses import dataclass, field
+from datetime import datetime,timedelta
+from zoneinfo import ZoneInfo
 import copy
 import hashlib
 import json
@@ -17,6 +19,7 @@ from uuid import uuid4
 import httpx
 
 from trading.agents.anthropic_client import AnthropicClient
+from trading.agents.provider_limits import blocked
 from trading.agents.provider_router import ProviderRouter
 
 
@@ -39,6 +42,10 @@ class _Slot:
     label: str
     group: str
     router: object = field(repr=False)
+    model: str | None = None
+    modes: tuple = ('text','vlm')
+    limits: tuple | None = None
+    quota_bucket: str | None = None
 
 
 class ProviderPool:
@@ -64,6 +71,8 @@ class ProviderPool:
         self._slots = []
         self._sleep = time.sleep
         seen = set()
+        from trading.agents.quota_routes import parse_routes
+        routes=parse_routes(getattr(settings,'ai_free_model_routes','[]'))
         for provider in ('groq','gemini'):
             for number in (1,2):
                 suffix = '' if number == 1 else '_2'
@@ -87,6 +96,13 @@ class ProviderPool:
                 prefix='pool:route:'+group_id+':'+label+':'
                 router=ProviderRouter(child_settings,None,PrefixStore(store,prefix),self.client)
                 self._slots.append(_Slot(provider,label,group_id,router))
+                for index,route in enumerate(routes):
+                    if route.provider!=provider:continue
+                    extra=settings.model_copy(update={**overrides,provider+'_text_model':route.model,provider+'_vision_model':route.model})
+                    route_label=label+'-model-'+str(index+1)
+                    child=ProviderRouter(extra,None,PrefixStore(store,'pool:route:'+group_id+':'+route_label+':'),self.client)
+                    self._slots.append(_Slot(provider,route_label,group_id,child,route.model,tuple(route.modes),
+                        (route.rpm,route.tpm,route.rpd,route.tpd),route.quota_bucket))
 
     def fork(self):
         """Fresh request-local state/clients; quota leases and paid budget remain shared."""
@@ -118,19 +134,45 @@ class ProviderPool:
         return bool(self._slots or (self.settings.ai_claude_fallback_enabled and self.claude.available))
 
     def _model(self, slot, images):
-        return getattr(self.settings, slot.provider+('_vision_model' if images else '_text_model'))
+        return slot.model or getattr(self.settings, slot.provider+('_vision_model' if images else '_text_model'))
 
     def _estimate(self, slot, system, user, max_tokens, images):
         completion=max(max_tokens,getattr(self.settings,slot.provider+'_max_completion_tokens'))
         return math.ceil(len((system+user).encode('utf-8'))/3)+512+2048*len(images or [])+completion
 
     def _quota_key(self,slot,images):
-        return 'pool:quota:'+slot.group+':'+hashlib.sha256(self._model(slot,images).encode()).hexdigest()
+        return 'pool:quota:'+slot.group+':'+hashlib.sha256((slot.quota_bucket or self._model(slot,images)).encode()).hexdigest()
 
-    def _limits(self,slot):
+    def _raw_limits(self,slot):
+        if slot.limits is not None:return slot.limits
         defaults = (30,8000,1000,200000) if slot.provider=='groq' else (15,250000,500,0)
         return tuple(getattr(self.settings,slot.provider+'_'+name,default)
                      for name,default in zip(('rpm','tpm','rpd','tpd'),defaults))
+
+    def _limits(self,slot,images=False):
+        # Aliases explicitly sharing a quota bucket never multiply allowance.
+        caps=[self._raw_limits(other) for other in self._slots
+              if self._supports(other,images) and self._quota_key(other,images)==self._quota_key(slot,images)]
+        return tuple(min((cap[i] for cap in caps if cap[i]>0),default=0) for i in range(4))
+
+    @staticmethod
+    def _supports(slot,images):
+        return ('vlm' if images else 'text') in slot.modes
+
+    @staticmethod
+    def _daily_rows(slot,rows,now):
+        if slot.provider=='gemini':
+            local=datetime.fromtimestamp(now,ZoneInfo('America/Los_Angeles'))
+            start=local.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
+        else:start=now-86400
+        return [row for row in rows if start<=row['at']<=now]
+
+    @staticmethod
+    def _daily_reset(slot,rows,now):
+        if slot.provider=='gemini':
+            local=datetime.fromtimestamp(now,ZoneInfo('America/Los_Angeles'))
+            return (local.replace(hour=0,minute=0,second=0,microsecond=0)+timedelta(days=1)).timestamp()
+        return min((row['at']+86400 for row in rows if row['at']+86400>now),default=None)
 
     def _cooldown(self, slot, images):
         model=self._model(slot,images)
@@ -143,26 +185,29 @@ class ProviderPool:
             self.store.db.execute('BEGIN IMMEDIATE')
             choices=[]
             for slot in candidates:
+                if not self._supports(slot,images):continue
                 key=self._quota_key(slot,images)
                 if self._cooldown(slot,images)>now:
                     continue
                 state=self.store.get(key,dict(rows=[],last_used=0,lease=None))
                 rows=[row for row in state['rows'] if now-row['at']<86400]
-                recent=[row for row in rows if now-row['at']<60]
+                recent=[row for row in rows if 0<=now-row['at']<60]
+                daily=self._daily_rows(slot,rows,now)
                 lease=state.get('lease')
                 if state.get('retry_at',0)>now:
                     continue
                 if lease and lease['until']>now:
                     continue
                 tokens=self._estimate(slot,system,user,max_tokens,images)
-                rpm,tpm,rpd,tpd=self._limits(slot)
+                if blocked(state.get('provider_reported',{}),tokens,now):continue
+                rpm,tpm,rpd,tpd=self._limits(slot,images)
                 minute_tokens=sum(row['tokens'] for row in recent)
-                daily_tokens=sum(row['tokens'] for row in rows)
+                daily_tokens=sum(row['tokens'] for row in daily)
                 if ((rpm and len(recent)+1>rpm) or (tpm and minute_tokens+tokens>tpm)
-                        or (rpd and len(rows)+1>rpd) or (tpd and daily_tokens+tokens>tpd)):
+                        or (rpd and len(daily)+1>rpd) or (tpd and daily_tokens+tokens>tpd)):
                     continue
                 utilization=max((len(recent)/rpm if rpm else 0),
-                    minute_tokens/tpm if tpm else 0,len(rows)/rpd if rpd else 0,
+                    minute_tokens/tpm if tpm else 0,len(daily)/rpd if rpd else 0,
                     daily_tokens/tpd if tpd else 0)
                 priority=int(slot.provider!=getattr(self,'_preferred_provider','groq'))
                 choices.append((priority,utilization,state.get('last_used',0),slot.label,slot,key,state,rows,tokens))
@@ -181,6 +226,7 @@ class ProviderPool:
             state=self.store.get(key)
             if state and (state.get('lease') or {}).get('id')==lease_id:
                 state['lease']=None
+                if attempt and attempt.get('provider_reported'):state['provider_reported']=copy.deepcopy(attempt['provider_reported'])
                 if cooldown:
                     state['retry_at']=max(state.get('retry_at',0),cooldown)
                 if attempt and all(isinstance(attempt.get(field),int) and attempt[field]>=0 for field in ('input_tokens','output_tokens')):
@@ -197,26 +243,29 @@ class ProviderPool:
         seen=set()
         for slot in self._slots:
             for images in (False,True):
+                if not self._supports(slot,images):continue
                 key=self._quota_key(slot,images)
                 if key in seen:
                     continue
                 seen.add(key)
                 state=self.store.get(key,dict(rows=[],lease=None))
-                day=[r for r in state['rows'] if now-r['at']<86400]
-                minute=[r for r in day if now-r['at']<60]
-                rpm,tpm,rpd,tpd=self._limits(slot)
+                day=self._daily_rows(slot,state['rows'],now)
+                minute=[r for r in state['rows'] if 0<=now-r['at']<60]
+                rpm,tpm,rpd,tpd=self._limits(slot,images)
                 rows.append(dict(provider=slot.provider,model=self._model(slot,images),quota_group=slot.group[:12],
                     requests_minute=len(minute),tokens_minute_estimate=sum(r['tokens'] for r in minute),
-                    requests_rolling_24h=len(day),tokens_rolling_24h_estimate=sum(r['tokens'] for r in day),
+                    requests_daily=len(day),tokens_daily_estimate=sum(r['tokens'] for r in day),
+                    daily_window='pacific_calendar_day' if slot.provider=='gemini' else 'rolling_24h_conservative',
+                    next_daily_reset_at=self._daily_reset(slot,day,now),
                     requests_minute_remaining=max(0,rpm-len(minute)) if rpm else None,
                     tokens_minute_remaining_estimate=max(0,tpm-sum(r['tokens'] for r in minute)) if tpm else None,
-                    requests_rolling_24h_remaining=max(0,rpd-len(day)) if rpd else None,
-                    tokens_rolling_24h_remaining_estimate=max(0,tpd-sum(r['tokens'] for r in day)) if tpd else None,
+                    requests_daily_remaining=max(0,rpd-len(day)) if rpd else None,
+                    tokens_daily_remaining_estimate=max(0,tpd-sum(r['tokens'] for r in day)) if tpd else None,
                     cooldown_seconds=max(0,state.get('retry_at',0)-now,self._cooldown(slot,images)-now),
                     in_flight=bool(state.get('lease') and state['lease']['until']>now),
-                    local_estimate=True))
+                    provider_reported=copy.deepcopy(state.get('provider_reported',{})),local_estimate=True))
         paid=self.store.get(self._paid_guard_key(),{})
-        return dict(groups=rows,quota_window='rolling_24h',provider_reported=False,
+        return dict(groups=rows,quota_window='provider_specific',provider_reported=False,
             paid_guard=dict(model=self.settings.anthropic_model,operational_guard=True,
                 max_in_flight=1,in_flight=(paid.get('lease') or {}).get('until',0)>now,
                 cooldown_seconds=max(0,paid.get('retry_at',0)-now)))
@@ -229,19 +278,20 @@ class ProviderPool:
         """
         now=time.time();free=0;details=[];seen=set()
         for slot in self._slots:
+            if not self._supports(slot,images):continue
             key=self._quota_key(slot,images)
             if key in seen:continue
             seen.add(key)
             state=self.store.get(key,dict(rows=[]))
-            day=[row for row in state['rows'] if 0<=now-row['at']<86400]
-            minute=[row for row in day if now-row['at']<60]
+            day=self._daily_rows(slot,state['rows'],now)
+            minute=[row for row in state['rows'] if 0<=now-row['at']<60]
             known=sorted(row['tokens'] for row in day[-20:] if row.get('usage_known'))
             observed=known[min(len(known)-1,math.ceil(.9*len(known))-1)] if known else 0
             estimate=max(observed,self._estimate(slot,'','x'*min(200000,max(0,int(prompt_bytes))+5000),max_tokens,[None]*3 if images else None))
-            rpm,tpm,rpd,tpd=self._limits(slot)
+            rpm,tpm,rpd,tpd=self._limits(slot,images)
             busy=(state.get('lease') or {}).get('until',0)>now
             cooling=max(state.get('retry_at',0),self._cooldown(slot,images))>now
-            allowed=(not busy and not cooling
+            allowed=(not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now)
                 and (not rpm or len(minute)<rpm) and (not tpm or sum(row['tokens'] for row in minute)+estimate<=tpm)
                 and (not rpd or len(day)<rpd) and (not tpd or sum(row['tokens'] for row in day)+estimate<=tpd))
             free+=int(allowed)
@@ -338,7 +388,7 @@ class ProviderPool:
 
         In-flight work is contention, not evidence that a paid model is needed.
         A busy slot only qualifies for waiting if this request can fit its own
-        limits and its rolling daily allowance has room for another request.
+        limits and its applicable daily allowance has room for another request.
         """
         now=time.time();rows=[];seen=set()
         for slot in slots:
@@ -346,15 +396,16 @@ class ProviderPool:
             if key in seen:continue
             seen.add(key)
             state=self.store.get(key,dict(rows=[]))
-            day=[row for row in state.get('rows',[]) if 0<=now-row['at']<86400]
-            minute=[row for row in day if now-row['at']<60]
+            day=self._daily_rows(slot,state.get('rows',[]),now)
+            minute=[row for row in state.get('rows',[]) if 0<=now-row['at']<60]
             tokens=self._estimate(slot,system,user,max_tokens,images)
-            rpm,tpm,rpd,tpd=self._limits(slot)
+            rpm,tpm,rpd,tpd=self._limits(slot,images)
             cooling=max(state.get('retry_at',0),self._cooldown(slot,images))>now
             busy=(state.get('lease') or {}).get('until',0)>now
             if (tpm and tokens>tpm) or (tpd and tokens>tpd):reason='request_too_large'
-            elif rpd and len(day)>=rpd:reason='rolling_daily_requests'
+            elif rpd and len(day)>=rpd:reason='daily_requests' if slot.provider=='gemini' else 'rolling_daily_requests'
             elif tpd and sum(row['tokens'] for row in day)+tokens>tpd:reason='rolling_daily_tokens'
+            elif blocked(state.get('provider_reported',{}),tokens,now):reason='provider_reported_limit'
             elif cooling:reason='provider_cooldown'
             elif busy:reason='free_capacity_in_flight'
             elif rpm and len(minute)>=rpm:reason='minute_requests'
@@ -492,7 +543,7 @@ class ProviderPool:
             return self._finish(None)
         primary=self._primary(images)
         self._preferred_provider=primary
-        remaining=list(self._slots) if primary!='anthropic' else []
+        remaining=[slot for slot in self._slots if self._supports(slot,images)] if primary!='anthropic' else []
         retry=None
         waited_for_capacity=False
         while remaining and self._allowed():

@@ -122,6 +122,8 @@ def provider_result(attempt):
         reasons={
             'shared_minute_token_budget':'ortak dakika kotası dolu; bu sağlayıcıya yeni istek gönderilmedi',
             'free_capacity_in_flight':'ücretsiz model başka analizi tamamlıyor; ücretli modele geçilmeden sıra bekleniyor',
+            'daily_requests':'sağlayıcının günlük dönemine göre yerel istek kotası dolu; yeni istek gönderilmedi',
+            'provider_reported_limit':'son sağlayıcı yanıtındaki kalan kota/reset bilgisi bekleniyor; yeni istek gönderilmedi',
             'rolling_daily_requests':'son 24 saatlik yerel istek kotası dolu; bu sağlayıcıya yeni istek gönderilmedi',
             'rolling_daily_tokens':'son 24 saatlik yerel token kotası dolu; bu sağlayıcıya yeni istek gönderilmedi',
             'minute_requests':'dakikalık yerel istek kotası dolu; yeni istek gönderilmedi',
