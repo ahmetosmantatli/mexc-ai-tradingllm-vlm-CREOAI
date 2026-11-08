@@ -104,3 +104,12 @@ def test_http_error_does_not_store_provider_message(tmp_path):
     assert client.complete_json(system='JSON',user='context') is None
     assert client.last_attempt['http_status']==400
     assert secret not in json.dumps(client.last_attempt)
+
+
+def test_safe_domain_validation_reason_is_visible_without_model_output(tmp_path):
+    client=setup(tmp_path,lambda request:good_response())
+    def reject(payload):raise ValueError('independent watch trade requires a fresh price plan')
+    client.response_validator=reject
+    assert client.complete_json(system='JSON',user='context') is None
+    assert client.last_attempt['validation_issues']==[dict(field='response',type='watch_requires_fresh_price_plan')]
+    assert client.last_attempt['input_tokens']==100

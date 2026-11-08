@@ -222,6 +222,7 @@ class LiveRunner:
             scan=MarketScanner(self.public,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,
                 self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store).scan()
             errors=dict(scan.errors)
+            quant_count=len(scan.candidates)
             try:
                 scan.candidates.extend(self._watch_candidates())
             except sqlite3.Error:
@@ -243,7 +244,9 @@ class LiveRunner:
             touched.update(row['symbol'] for row in watch_snapshot(self.store) if row['status'] in ('watching','triggered'))
             size=self.candidate_queue().refresh(eligible,refreshed_symbols=touched or None)
             self.store.put('last_scan_at',time.time())
-            summary=dict(at=time.time(),scanned=scan.scanned,kept=scan.kept,eligible=len(eligible),queue_size=size,errors=errors,
+            summary=dict(at=time.time(),scanned=scan.scanned,kept=scan.kept,candidates=len(scan.candidates),
+                quant_candidates=quant_count,watch_candidates=len(scan.candidates)-quant_count,eligible=len(eligible),queue_size=size,
+                duration_seconds=scan.duration_seconds,filtered_out=scan.filtered_out,errors=errors,
                 universe=self.store.get('universe_rotation',{}))
             self.store.put('scan_summary',summary)
             return summary

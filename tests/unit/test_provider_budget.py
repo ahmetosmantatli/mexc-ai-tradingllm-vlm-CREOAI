@@ -200,7 +200,10 @@ def test_forced_tool_decision_uses_counted_payload_and_larger_output_budget(tmp_
     assert output_limit==getattr(llm.settings,'anthropic_decision_max_tokens',1200)
     assert counts[0]==arguments
     assert arguments['tool_choice']==dict(type='tool',name='submit_trade_decision',disable_parallel_tool_use=True)
-    assert arguments['tools'][0]['input_schema']==DECISION_SCHEMA
+    sent_schema=arguments['tools'][0]['input_schema']
+    assert sent_schema['properties']['signal_id']['anyOf']==[{'type':'string'},{'type':'null'}]
+    assert sent_schema['required']==DECISION_SCHEMA['required']
+    assert llm.decision_schema==DECISION_SCHEMA
     assert arguments['tools'][0]['strict'] is True
     assert llm.last_attempt['output_stop_reason']=='tool_use'
     assert llm.last_attempt['validation_issues']==[]
@@ -284,3 +287,26 @@ def test_router_validation_issues_use_only_known_fields_and_categories(tmp_path)
     assert issues==[dict(field='action',type='string_pattern_mismatch'),dict(field='field',type='extra_forbidden')]
     assert 'private' not in str(issues)
     router.close()
+
+
+def test_real_decision_schema_is_converted_for_strict_api_but_local_bounds_survive(tmp_path):
+    import copy
+    from pydantic import ValidationError
+    from trading.evaluation.service import ModelDecision
+    from trading.runtime.live_management import ManagementDecision
+    for model in (ModelDecision,ManagementDecision):
+        llm,store,counts,generations=structured_client(tmp_path)
+        original=model.model_json_schema();llm.decision_schema=copy.deepcopy(original)
+        llm.complete_json(system='JSON schema',user='context')
+        assert len(counts)==len(generations)==1
+        sent=generations[0]['tools'][0]['input_schema']
+        def inspect(node):
+            if isinstance(node,dict):
+                assert not {'minimum','maximum','exclusiveMinimum','exclusiveMaximum','minLength','maxLength'}&set(node)
+                for value in node.values():inspect(value)
+            elif isinstance(node,list):
+                for value in node:inspect(value)
+        inspect(sent)
+        assert llm.decision_schema==original
+    with pytest.raises(ValidationError):
+        ModelDecision.model_validate(dict(action='hold',signal_id=None,rationale='x'*1201,invalidation='',watch_note=''))

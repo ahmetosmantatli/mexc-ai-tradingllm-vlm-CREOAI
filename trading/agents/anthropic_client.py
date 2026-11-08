@@ -21,6 +21,16 @@ from trading.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 
+def _normalize_schema_unions(node):
+    # SDK transformer expects anyOf rather than JSON Schema's type-array spelling.
+    if isinstance(node,list):return [_normalize_schema_unions(value) for value in node]
+    if not isinstance(node,dict):return node
+    result={key:_normalize_schema_unions(value) for key,value in node.items()}
+    if isinstance(result.get('type'),list):
+        result['anyOf']=[{'type':kind} for kind in result.pop('type')]
+    return result
+
+
 @dataclass
 class AnthropicClient:
     """Thin wrapper. Missing key → stub/fallback mode (deterministic, test-safe)."""
@@ -89,6 +99,9 @@ class AnthropicClient:
                 self.last_status = "missing_key"
                 return None
             client = self._ensure_sdk()
+            if schema is not None:
+                from anthropic import transform_schema
+                schema=transform_schema(_normalize_schema_unions(schema))
             content = [{"type": "text", "text": user}]
             for path in images or []:
                 content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png",
@@ -217,7 +230,9 @@ class AnthropicClient:
             elif status_code in (408, 499) or isinstance(exc,httpx.TimeoutException) or type(exc).__name__=="APITimeoutError":
                 attempt['error_category'] = 'ambiguous_timeout'
             elif isinstance(status_code, int) and 400 <= status_code < 500:
-                attempt['error_category'] = 'request_rejected'
+                attempt['error_category'] = ('schema_unsupported' if any(word in message for word in ('schema','minlength','maxlength','minimum','maximum'))
+                    else 'model_unavailable' if 'model' in message and any(word in message for word in ('not found','not exist','invalid'))
+                    else 'request_rejected')
             elif isinstance(status_code, int) and status_code >= 500:
                 attempt['error_category'] = 'provider_server_error'
             elif attempt['input_tokens'] is not None:

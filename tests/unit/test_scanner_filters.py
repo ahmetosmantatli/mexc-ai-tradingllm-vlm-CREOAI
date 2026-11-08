@@ -93,3 +93,15 @@ def test_scanner_filters_symbols_and_emits_candidates() -> None:
     assert any(c.symbol == "BTC_USDT" for c in result.candidates)
     assert all(c.stop_loss_price > 0 for c in result.candidates)
     assert all(0.0 <= c.confidence <= 1.0 for c in result.candidates)
+
+
+def test_scan_records_safe_http_category_not_response_body():
+    import httpx
+    client=MexcPublicClient(use_fixtures=True,fixture_symbols=['BTC_USDT'])
+    def rejected(symbol):
+        response=httpx.Response(429,request=httpx.Request('GET','https://example.test'),text='PRIVATE RESPONSE')
+        response.raise_for_status()
+    client.get_ticker=rejected
+    result=MarketScanner(client).scan()
+    assert result.errors=={'BTC_USDT':'HTTP_429'}
+    assert 'PRIVATE' not in str(result)

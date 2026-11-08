@@ -175,3 +175,42 @@ def format_trace(trace):
         text+='Bu analizin ücreti doğrulanmadı; sıfır ücret anlamına gelmez.\n'
     text+='Açık işlemler: /positions · Teknik ayrıntı: /diagnostics'
     return text[:3500]
+
+
+def validation_issues(exc,schema=None):
+    """Only static field names/categories; never rejected values or provider text."""
+    known={'response'}
+    def collect(node):
+        if isinstance(node,dict):
+            known.update(node.get('properties',{}))
+            for value in node.values():collect(value)
+        elif isinstance(node,list):
+            for value in node:collect(value)
+    collect(schema)
+    semantic={
+        'independent watch trade requires a fresh price plan':'watch_requires_fresh_price_plan',
+        'explicit model sizing required for exchange leverage mode':'explicit_sizing_required',
+        'watch price condition already satisfied; choose a future condition or trade/hold':'watch_condition_already_met',
+        'unknown signal':'unknown_signal_id',
+        'price planning disabled or not trade':'price_plan_not_allowed',
+        'watch plan only allowed for watch action':'watch_plan_action_conflict',
+        'watch expiry must be within24h':'watch_expiry_invalid',
+        'missing_or_open_candle_reference':'price_reference_missing_or_open',
+        'price_tick_mismatch':'price_tick_mismatch',
+        'market_entry_reference_too_far':'entry_reference_too_far',
+        'price_plan_direction_invalid':'price_direction_invalid',
+        'wrong_reference_direction':'reference_direction_invalid',
+        'stop_not_beyond_observed_wick':'stop_wick_invalid',
+        'stop_too_far_from_reference':'stop_buffer_invalid',
+        'target_reference_wrong_side':'target_direction_invalid',
+        'target_too_far_from_reference':'target_buffer_invalid',
+    }
+    message=str(exc)
+    if message in semantic:return [dict(field='response',type=semantic[message])]
+    categories={'missing','extra_forbidden','string_type','string_pattern_mismatch','string_too_long','string_too_short',
+        'float_type','float_parsing','finite_number','greater_than','greater_than_equal','less_than','less_than_equal',
+        'int_type','literal_error','enum','dict_type','list_type','bool_type','value_error'}
+    try:errors=exc.errors(include_input=False,include_context=False,include_url=False)
+    except Exception:return [dict(field='response',type='invalid_json' if type(exc).__name__=='JSONDecodeError' else 'custom_validation')]
+    return [dict(field=('.'.join(str(p) if p in known else 'field' for p in error.get('loc',())) or 'response')[:160],
+        type=error.get('type') if error.get('type') in categories else 'schema_validation') for error in errors[:12]]

@@ -162,8 +162,18 @@ class TelegramController:
                      f"Üretilen aday {scan.get('candidates',0)} | AI için uygun {scan.get('eligible',0)}\n")
             if scan.get('duration_seconds') is not None:
                 text+=f"Tarama süresi: {scan['duration_seconds']:.2f} sn\n"
+            if scan.get('queue_size') is not None:text+=f"Kuyrukta korunan güncel aday: {scan['queue_size']}\n"
             if scan.get('errors'):
-                text+=f"Veri hatası nedeniyle atlanan parite: {len(scan['errors']) if isinstance(scan['errors'],dict) else scan['errors']}\n"
+                symbol_errors={key:value for key,value in scan['errors'].items() if key.endswith('_USDT')} if isinstance(scan['errors'],dict) else None
+                text+=f"Veri hatası nedeniyle atlanan parite: {len(symbol_errors) if symbol_errors is not None else scan['errors']}\n"
+                if isinstance(scan['errors'],dict):
+                    from collections import Counter
+                    counts=Counter(scan['errors'].values())
+                    text+='Hata türleri: '+', '.join(f'{kind}: {count}' for kind,count in counts.most_common(5))+'\n'
+                    text+='Örnekler: '+', '.join(f'{symbol} ({kind})' for symbol,kind in list(scan['errors'].items())[:3])+'\n'
+                    extra=set(scan['errors'])-set(symbol_errors or {})
+                    if extra:text+='Ek veri kontrollerinde sorun: '+', '.join(sorted(extra))+'\n'
+
         queue=snapshot.get('queue_status') or {}
         if queue:
             text+=f"Kuyruktaki güncel aday: {queue.get('size',0)}\n"
@@ -261,6 +271,7 @@ class TelegramController:
                 errors=[f"{label}: {attempt[key]}" for key,label in (('http_status','HTTP'),('error_category','Tür'),('error_code','Kod'),('error_param','Alan')) if attempt.get(key) is not None]
                 if errors:
                     text+=' | '.join(errors)+'\n'
+                if attempt.get('phase'):text+=f"Aşama: {attempt['phase']}\n"
                 text+=f"Üretim isteği {attempt.get('generation_requests',0)} | Token sayımı {attempt.get('count_requests',0)}\n"
                 if attempt.get('output_stop_reason'):
                     text+=f"Yanıt bitiş nedeni: {attempt['output_stop_reason']}\n"

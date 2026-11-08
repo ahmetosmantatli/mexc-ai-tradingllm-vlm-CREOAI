@@ -7,8 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 import time
 import sqlite3
+import httpx
 
-from trading.exchange.mexc_public import MexcPublicClient, TickerSnapshot
+from trading.exchange.mexc_public import MexcPublicClient, TickerSnapshot, PublicMarketError
 from trading.quant.signals import CandidateSignal
 from trading.quant.strategies import (
     DEFAULT_STRATEGIES,
@@ -115,7 +116,11 @@ class MarketScanner:
             except sqlite3.Error:
                 raise
             except Exception as exc:
-                return sym,passed,[],'SYMBOL_DATA_ERROR',type(exc).__name__
+                category=('MEXC_CODE_'+str(exc.public_error_code) if isinstance(exc,PublicMarketError)
+                    else 'HTTP_'+str(exc.response.status_code) if isinstance(exc,httpx.HTTPStatusError)
+                    else 'TIMEOUT' if isinstance(exc,httpx.TimeoutException) else 'NETWORK_ERROR' if isinstance(exc,httpx.TransportError)
+                    else 'DATA_FORMAT' if isinstance(exc,(ValueError,TypeError,KeyError,IndexError)) else type(exc).__name__)
+                return sym,passed,[],'SYMBOL_DATA_ERROR',category
 
         # httpx clients may be shared between threads. Metadata calls above have
         # initialized the dedicated scan client's connection pool before workers.

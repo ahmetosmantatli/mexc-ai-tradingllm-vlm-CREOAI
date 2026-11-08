@@ -10,6 +10,12 @@ import httpx
 from trading.exchange.order_deny import assert_not_private_order_path
 
 
+class PublicMarketError(ValueError):
+    def __init__(self,code):
+        super().__init__('MEXC public request rejected')
+        self.public_error_code=code if type(code) is int and 0<=code<=1000000000 else None
+
+
 class HttpTransport(Protocol):
     def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response: ...
 
@@ -115,7 +121,7 @@ class MexcPublicClient:
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict) and (payload.get("success") is False or payload.get("code", 0) != 0):
-            raise ValueError("MEXC market response unsuccessful")
+            raise PublicMarketError(payload.get("code"))
         return payload
 
     def list_contract_symbols(self) -> list[str]:

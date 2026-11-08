@@ -62,34 +62,8 @@ class ProviderRouter:
         return payload
 
     def _validation_issues(self, exc):
-        """Keep only schema-known field names/error categories, never input values."""
-        known = {'response'}
-        def collect(node):
-            if isinstance(node, dict):
-                known.update(node.get('properties', {}).keys())
-                for value in node.values():
-                    collect(value)
-            elif isinstance(node, list):
-                for value in node:
-                    collect(value)
-        collect(self.decision_schema)
-        # Pydantic errors can contain the rejected input and arbitrary extra keys.
-        # Use a closed set of error categories and known schema field names only.
-        categories = {'missing','extra_forbidden','string_type','string_pattern_mismatch',
-            'string_too_long','string_too_short','float_type','float_parsing','finite_number',
-            'greater_than','greater_than_equal','less_than','less_than_equal','int_type',
-            'literal_error','enum','dict_type','list_type','bool_type','value_error'}
-        try:
-            errors = exc.errors(include_input=False, include_context=False, include_url=False)
-        except Exception:
-            return [dict(field='response', type='custom_validation')]
-        issues = []
-        for error in errors[:12]:
-            location = error.get('loc', ())
-            field = '.'.join(str(part) if part in known else 'field' for part in location) or 'response'
-            kind = error.get('type')
-            issues.append(dict(field=field[:160], type=kind if kind in categories else 'schema_validation'))
-        return issues or [dict(field='response', type='schema_validation')]
+        from trading.agents.telemetry import validation_issues
+        return validation_issues(exc,self.decision_schema)
 
     def _cooldown(self, model, seconds):
         self.store.put('groq:retry_at:'+model, time.time()+seconds)
@@ -238,6 +212,7 @@ class ProviderRouter:
                 self.last_model=self.settings.gemini_vision_model if images else self.settings.gemini_text_model
                 self.gemini.can_call=self._allowed
                 self.gemini.response_validator=self.response_validator
+                self.gemini.decision_schema=copy.deepcopy(self.decision_schema)
                 self.last_trace['attempts'].append(dict(provider='gemini',model=self.last_model,status='requesting',generation_requests=0,count_requests=0,latency_ms=0))
                 self._trace()
                 result=self.gemini.complete_json(system=system,user=user,max_tokens=max_tokens,images=images)

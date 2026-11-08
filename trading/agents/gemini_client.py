@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 
-from trading.agents.telemetry import safe_error
+from trading.agents.telemetry import safe_error,validation_issues
 
 
 class GeminiClient:
@@ -22,6 +22,7 @@ class GeminiClient:
     def __init__(self, settings, store, client):
         self.settings, self.store, self.client=settings, store, client
         self.response_validator=None
+        self.decision_schema=None
         self.can_call=lambda:True
         self.last_status='not_called'
         self.last_attempt={}
@@ -110,6 +111,8 @@ class GeminiClient:
             attempt['error_category']=('network_timeout' if isinstance(exc,httpx.TimeoutException)
                 else 'network_error' if isinstance(exc,httpx.TransportError)
                 else 'invalid_output_or_local_validation')
+            if attempt['error_category']=='invalid_output_or_local_validation':
+                attempt['validation_issues']=validation_issues(exc,self.decision_schema)
             self._cooldown(key)
             return None
         finally:

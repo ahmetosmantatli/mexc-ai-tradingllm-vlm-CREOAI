@@ -323,3 +323,23 @@ return. AI usage/cost is exported separately; actual LIVE realized outcomes rema
 exchange-reconciled records. LIVE usage exports now include account/live databases
 and separate known text/VLM variants; legacy untagged LIVE usage is unknown.
 No historical review records are invented for releases before this journal existed.
+
+## Provider schema compatibility and actionable diagnostics
+
+Anthropic strict tool schemas are passed through the official SDK
+`transform_schema` before both count_tokens and generation. Unsupported numeric
+and length constraints move into descriptions; original Pydantic and deterministic
+execution checks still enforce them locally. Nullable type arrays are normalized
+to anyOf for SDK compatibility. The Anthropic SDK floor is 2.6.0.
+Reference: [schema transformation and limitations](https://platform.claude.com/docs/en/build-with-claude/structured-outputs).
+This fixes a concrete incompatible raw-schema path; an observed HTTP 400 may also
+have other causes, so safe phase/category diagnostics remain necessary.
+
+Gemini/Router validation telemetry now preserves allowlisted schema fields and
+fixed semantic categories (for example watch_requires_fresh_price_plan or
+watch_condition_already_met), never raw model output or rejected field values.
+Market scans report safe HTTP status, timeout/network or format categories and
+numeric exchange rejection codes. Diagnostics distinguish generated candidates,
+eligible candidates and retained queue size, and do not count metadata failures
+as skipped individual symbols. Shared request statistics and local quota-pool
+snapshots are included in LIVE diagnostics as well as PAPER diagnostics.

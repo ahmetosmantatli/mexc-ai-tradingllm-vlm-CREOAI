@@ -138,7 +138,7 @@ def test_scanner_one_symbol_failure_does_not_discard_other_results():
         def get_klines(self,*a,**kw):
             return {'candles':[[i,100+i*.5,101+i*.5,99+i*.5,100+i*.5,1] for i in range(40)]}
     result=MarketScanner(Public()).scan()
-    assert result.scanned==2 and result.errors=={'BAD_USDT':'ValueError'}
+    assert result.scanned==2 and result.errors=={'BAD_USDT':'DATA_FORMAT'}
     assert any(c.symbol=='GOOD_USDT' for c in result.candidates)
     assert result.duration_seconds>=0
 

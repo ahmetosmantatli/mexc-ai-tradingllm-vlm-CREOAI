@@ -286,6 +286,9 @@ class LiveFleet:
         snapshot['control']=self.controller.control(ident)
         snapshot['version']=snapshot['control'].get('version','text')
         snapshot['ai_budget']=self.budget_store.get('ai_budget',{})
+        snapshot['ai_request_stats']=self.budget_store.get('ai_request_stats',{})
+        llm=getattr(runner,'llm',None)
+        if callable(getattr(llm,'snapshot',None)):snapshot['provider_pool']=llm.snapshot()
         if runner is not None:
             grant=runner.store.get('live:automatic_grant:'+ident,{})
             snapshot['automatic_grant']={key:grant.get(key) for key in ('expires_at','revoked','control_revision')}
