@@ -150,6 +150,7 @@ class TelegramController:
 
     @staticmethod
     def progress_text(snapshot):
+        from trading.control.activity import activity_summary
         stage=snapshot.get('stage')
         label={'fetching_multitimeframe_context':'4 saat / 15 dakika / 5 dakika verileri hazırlanıyor',
                'scanning_market':'Pariteler taranıyor', 'model_evaluation':'AI yanıtı bekleniyor',
@@ -157,7 +158,7 @@ class TelegramController:
                'analysis_error_backoff':'Bu analizde hata alındı; kısa hata beklemesi sürüyor',
                'candidates_filtered':'Aday filtreleri tamamlandı', 'model_completed':'AI analizi tamamlandı',
                'model_provider_wait':'AI sağlayıcı kapasitesi bekleniyor; yeni istek gönderilmiyor', 'model_invalid_or_unavailable_model':'AI analizi sonuçlanmadı', 'awaiting_scan':'İlk tarama bekleniyor'}.get(stage,'Piyasa ve işlem durumu izleniyor')
-        text=f"Şu an: {label}\n"
+        text=activity_summary(snapshot)['text']+f"Şu an: {label}\n"
         public=snapshot.get('public_data') or {}
         if public.get('cooldown_seconds',0)>0:text+=f"MEXC veri beklemesi: {public['cooldown_seconds']:.0f} sn; yeni public istekler bekletiliyor.\n"
         scan=snapshot.get('scan_summary') or {}
@@ -253,6 +254,7 @@ class TelegramController:
 
     def diagnostics_text(self, account_id):
         snapshot=self.snapshot_provider(account_id) or {}
+        snapshot={**snapshot,'control':self.control(account_id)}
         text='Analiz / AI istekleri | PAPER\n'+self.progress_text(snapshot)+'\n'
         for provider,counts in snapshot.get('ai_request_stats',{}).items():
             text+=(f"Ortak {provider}: üretim isteği {counts.get('generation_requests',0)}, token sayımı {counts.get('count_requests',0)}, "
@@ -416,7 +418,7 @@ class TelegramController:
             return text+'Henüz piyasa gözlemi yok. Ayrıntı ve yenileme aşağıdaki düğmelerde.'
         age=max(0,time.time()-snapshot.get('observed_at',0))
         text+=f"Son durum: {human_reason(snapshot.get('reason'))}\nVeri yaşı: {age:.0f} saniye\n"
-        text+=self.progress_text(snapshot)
+        text+=self.progress_text({**snapshot,'control':control})
         trace=snapshot.get('analysis_trace') or {}
         if trace:
             text+=f"Son aday: {trace.get('symbol','?')} · {trace_outcome(trace)}\n"

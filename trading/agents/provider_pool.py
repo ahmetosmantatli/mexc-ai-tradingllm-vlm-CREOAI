@@ -319,6 +319,7 @@ class ProviderPool:
                 if slot.provider=='cloudflare':rows[-1].update(slot.router.accounting())
         paid=self.store.get(self._paid_guard_key(),{})
         return dict(groups=rows,quota_window='provider_specific',provider_reported=False,
+            paid_fallback_enabled=self.settings.ai_claude_fallback_enabled,
             paid_guard=dict(model=self.settings.anthropic_model,operational_guard=True,
                 max_in_flight=1,in_flight=(paid.get('lease') or {}).get('until',0)>now,
                 cooldown_seconds=max(0,paid.get('retry_at',0)-now)))

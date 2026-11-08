@@ -230,6 +230,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_status_interval_seconds: float = Field(default=3600, ge=60)
+    telegram_activity_interval_seconds: float = Field(default=900, ge=120)
 
     @field_validator("broker_mode", mode="before")
     @classmethod

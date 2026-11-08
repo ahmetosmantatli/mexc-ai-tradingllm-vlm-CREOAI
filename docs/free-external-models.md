@@ -91,6 +91,19 @@ The manifest is stored on the existing `/app/data` Docker volume. Running
 discovery on the host writes a different `data` directory, so use the container.
 Updated routes load without restarting the worker; manifests expire after 24h.
 
+Status and diagnostics now include counts of plans waiting for entry, triggered
+plans waiting for review, plans waiting for fresh data after HOLD, and queued
+analysis candidates. These are plans, not pending exchange orders. They also show
+the last completed analysis/execution outcome and whether paid fallback is on.
+LIVE/PAPER share the activity message formatter. Enabled accounts receive a
+summary every 15 minutes (`TELEGRAM_ACTIVITY_INTERVAL_SECONDS=900`); category
+changes can notify after at least two minutes. This creates no AI request.
+LIVE tasks taking longer than max(180s, three scan intervals, two provider
+timeouts + 30s) are flagged as delayed, not conclusively deadlocked. Trading
+controls are not changed by the warning. If the entire process/server or Telegram
+connection is down, self-notification cannot be guaranteed; that needs an
+independent watchdog. No alert here automatically re-arms or retries an order.
+
 Optional small inference check (one text request, no market/broker calls):
 
 ```sh

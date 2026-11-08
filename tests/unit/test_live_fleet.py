@@ -75,6 +75,20 @@ def test_first_live_boot_does_not_reuse_running_paper_control(tmp_path):
     finally: f.stop()
 
 
+def test_live_delayed_job_is_visible_and_notified_without_changing_entry_control(tmp_path):
+    import time
+    f=fleet(tmp_path)
+    try:
+        f.controller.set_control('a',enabled=True,stopped=False)
+        f.jobs[('a','analysis')]=SimpleNamespace(done=lambda:False)
+        f.last_schedule[('a','analysis')]=time.time()-400
+        result=f.publish(f.accounts[0])
+        assert result['worker_health']['delayed_jobs'][0]['kind']=='analysis'
+        assert 'Geciken görev: AI analizi' in f.controller.messages[-1][0][1]
+        assert f.controller.control('a')['enabled']
+    finally:f.stop()
+
+
 def test_paused_live_continues_monitor_only_and_publishes_actual_balance(tmp_path):
     f=fleet(tmp_path)
     try:

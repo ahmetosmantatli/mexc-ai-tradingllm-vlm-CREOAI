@@ -296,6 +296,8 @@ class Fleet:
             self.controller.enqueue(account.account_id,self.controller.status_text(account.account_id,True),event_id=f'positions:{time.time()}')
             self.control_store.put(f'account:{account.account_id}:position_update_at',time.time())
         self.control_store.put(f'account:{account.account_id}:status',snapshot)
+        from trading.control.activity import publish_activity
+        publish_activity(self.controller,self.control_store,account.account_id,snapshot,self.cfg)
         for version in ('text','vlm'):
             r = self.runners[(account.account_id,version)]
             with r.lock:

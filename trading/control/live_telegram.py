@@ -139,7 +139,7 @@ class LiveTelegramController(TelegramController):
         text+=f"Son durum: {snapshot.get('message') or labels.get(reason,'Canlı veri ve risk kontrolleri sürüyor; ayrıntı Son analiz ekranında.')}\n"
         if account.get('observed_at'):text+=f"Borsa verisinin yaşı: {max(0,time.time()-account['observed_at']):.0f} sn\n"
         if snapshot.get('halt') or snapshot.get('live_halt'):text+='Yeni işlem engeli var; belirsiz emir/koruma durumunu kontrol et.\n'
-        return text+self.progress_text(snapshot)
+        return text+self.progress_text({**snapshot,'control':state})
 
     def watchlist_text(self,account_id):
         return super().watchlist_text(account_id).replace('Takip listesi · PAPER','Takip listesi · LIVE',1)

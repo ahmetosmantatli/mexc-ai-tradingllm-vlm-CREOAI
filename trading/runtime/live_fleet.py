@@ -292,7 +292,18 @@ class LiveFleet:
         if runner is not None:
             grant=runner.store.get('live:automatic_grant:'+ident,{})
             snapshot['automatic_grant']={key:grant.get(key) for key in ('expires_at','revoked','control_revision')}
+        now=time.time()
+        delayed=[]
+        for kind in ('analysis','scan','monitor','management'):
+            job=self.jobs.get((ident,kind))
+            began=self.last_schedule.get((ident,kind))
+            limit=max(180,3*self.cfg.worker_loop_interval_seconds,2*self.cfg.ai_provider_timeout_seconds+30)
+            if job is not None and not job.done() and began is not None and now-began>limit:
+                delayed.append(dict(kind=kind,age_seconds=now-began))
+        snapshot['worker_health']=dict(observed_at=now,delayed_jobs=delayed)
         self.control_store.put(f'account:{ident}:status',snapshot)
+        from trading.control.activity import publish_activity
+        publish_activity(self.controller,self.control_store,ident,snapshot,self.cfg,now)
         executor=getattr(runner,'executor',None)
         if executor is not None and callable(getattr(executor,'intents',None)):
             for row in executor.intents():
