@@ -188,3 +188,29 @@ def test_execution_exception_finalizes_exact_trade_trace_with_safe_reason(tmp_pa
     completed=runner.store.get('analysis_trace')
     assert completed['execution_status']=='rejected'
     assert completed['execution_details']['code']=='CONTRACT_QUANTITY_LIMIT'
+
+
+def test_unrelated_parallel_symbols_do_not_retrigger_same_market_review(tmp_path,monkeypatch):
+    from .test_live_runner import prepare
+    from trading.evaluation.service import ContextEvaluator
+    runner,private,executor,control=prepare(tmp_path)
+    calls=[]
+    class Hold:
+        budget=None
+        last_status='success';last_trace={'attempts':[{'generation_requests':1}]}
+        def complete_json(self,**kw):
+            calls.append(json.loads(kw['user']))
+            return dict(action='hold',signal_id=None,rationale='Yeni yapı bekleniyor.',invalidation='',watch_note='')
+    runner.llm=Hold();runner.graph=ContextEvaluator(runner.llm,runner.store,runner.public,runner.cfg)
+    monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='same',to_context=lambda:{'timeframes':[]}))
+    monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
+    source=candidate()
+    first=runner._refresh(['BTC_USDT','ETH_USDT'])
+    runner._evaluate(source,first,control)
+    second=runner._refresh(['BTC_USDT','SOL_USDT'])
+    assert runner._evaluate(source,second,control).metadata['provider_called'] is False
+    assert len(calls)==1
+    assert set(calls[0]['account']['operating_context']['leverage'])=={'BTC_USDT'}
+    second['risk_limits']['BTC_USDT'][0]['max_leverage']=10
+    runner._evaluate(source,second,control)
+    assert len(calls)==2 # own-symbol risk evidence must not be suppressed

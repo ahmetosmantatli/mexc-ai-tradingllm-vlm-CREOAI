@@ -220,7 +220,7 @@ class LiveRunner:
             if not self._enabled():
                 return None
             scan=MarketScanner(self.public,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,
-                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True).scan()
+                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True,structure_setups_enabled=self.cfg.live_structure_setups_enabled and self.cfg.live_price_plan_enabled).scan()
             errors=dict(scan.errors)
             quant_count=len(scan.candidates)
             try:
@@ -260,7 +260,18 @@ class LiveRunner:
             evaluator=ContextEvaluator(child,self.store,self.public,self.cfg) if child is not self.llm else self.graph
             capital=self._capital(snapshot,control)
             live_context=self._live_context(snapshot,control)
+            # Other parallel candidates' leverage rows are not this symbol's
+            # decision evidence. Portfolio positions/risk remain fully supplied.
+            for field in ('risk_limits','leverage'):
+                live_context[field]={candidate.symbol:copy.deepcopy(live_context.get(field,{}).get(candidate.symbol,[]))}
             exchange_cap=self._symbol_leverage_cap(candidate,snapshot)
+            if self.cfg.live_structure_setups_enabled and self.cfg.live_price_plan_enabled:
+                from trading.models.domain import Side
+                opposite=candidate.model_copy(update={'side':Side.SHORT if candidate.side==Side.LONG else Side.LONG})
+                exchange_cap=min(exchange_cap,self._symbol_leverage_cap(opposite,snapshot))
+                candidate=candidate.model_copy(deep=True)
+                ticker=self.quote(candidate.symbol)
+                candidate.entry_price=ticker.last_price
             live_context['leverage_policy']=dict(mode=self.cfg.live_leverage_mode,account_exchange_max=exchange_cap,
                 minimum_stop_liquidation_buffer_fraction=self.cfg.liquidation_buffer_pct,
                 fee_rate=self.cfg.paper_fee_rate,slippage_bps=self.cfg.paper_slippage_bps,
@@ -305,6 +316,8 @@ class LiveRunner:
         proposal.notional=notional
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)
         proposal.metadata.update(price_plan=result.metadata.get('price_plan'),price_source='model' if result.metadata.get('price_plan') else 'quant',
+            setup_family=(result.metadata.get('setup_selection') or {}).get('family',candidate.features.get('setup_family')),
+            setup_id=(result.metadata.get('setup_selection') or {}).get('setup_id'),
             contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
             decision_ai=result.metadata.get('decision_ai',{}),account_generation=snapshot['generation'])
         return proposal
@@ -341,15 +354,20 @@ class LiveRunner:
             return finish('HOLD_LIVE_SYMBOL_OPEN')
         if len(snapshot['positions'])>=min(control.get('max_positions',getattr(self.cfg,'live_max_positions',4)),getattr(self.cfg,'live_max_positions',4),self.risk.preset.max_concurrent_positions):
             return finish('HOLD_LIVE_POSITION_LIMIT')
-        proposal=self._final_proposal(candidate,result,snapshot,control)
+        selected=result.selected_signal
+        if selected.symbol!=candidate.symbol:
+            return finish('HOLD_LIVE_UNVALIDATED_MODEL')
+        if selected.side!=candidate.side and not result.metadata.get('setup_selection'):
+            return finish('HOLD_LIVE_UNVALIDATED_MODEL')
+        proposal=self._final_proposal(selected,result,snapshot,control)
         # Execution performs its own fresh account/risk/quote and grant checks.
         self.executor.allowed_capital=self._capital(snapshot,control)
         intent=self.executor.authorize(proposal,control_revision=control.get('updated_at'))
-        observed=next(row for row in snapshot['leverage'][candidate.symbol] if row['side']==(1 if candidate.side.value=='long' else 2))
+        observed=next(row for row in snapshot['leverage'][candidate.symbol] if row['side']==(1 if selected.side.value=='long' else 2))
         if observed['leverage']!=proposal.leverage:
             if not self._enabled() or self._control().get('updated_at')!=control.get('updated_at'):
                 return finish('HOLD_LIVE_CONTROL_CHANGED')
-            self.private.change_leverage(symbol=candidate.symbol,side=candidate.side.value,leverage=int(proposal.leverage),
+            self.private.change_leverage(symbol=candidate.symbol,side=selected.side.value,leverage=int(proposal.leverage),
                 request_id='lev-'+intent['intent_id'][:24])
             self._refresh([candidate.symbol]) # Never assume the leverage write applied.
         # Revision/control may have changed during HTTP. Executor calls this guard

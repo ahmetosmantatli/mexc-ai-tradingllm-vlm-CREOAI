@@ -141,3 +141,34 @@ Research instrumentation: valid LIVE decisions append immutable edge_reviews.
 initial quant/model plans with matched next-5m-open replay, estimated trading
 costs, explicit incomplete data and no funding/portfolio/AI-management claim.
 AI usage export now reads account/live DBs as well as PAPER text/vlm DBs.
+
+
+## Structural review and cost incident follow-up (2026-11-08)
+
+User's retrospective report: 1,357 reviews, validated WATCH246/HOLD823/TRADE1;
+one STONK short20x proposal was policy_authorized but no durable entry attempt.
+Its old LiveExecutionError text is absent: do not invent the historical cause.
+Anthropic443 generations consumed known estimated$19.037187; pending$1.12701
+is uncertain reservation, not confirmed additional spend. Gemini groups each
+reached500 generation requests; Groq handled11 total. Do not ask user to top up
+as a substitute for diagnosing repeated reviews and eligibility.
+
+Optional `LIVE_STRUCTURE_SETUPS_ENABLED=true` + `LIVE_PRICE_PLAN_ENABLED=true`:
+independent closed15m structural seeds, then full4h/15m/5m hypotheses for continuation,
+pullback and countertrend sweep/reclaim, both directions. Every TRADE in this mode
+must select a supplied READYsetup_id and return a grounded price_plan. Preserve
+original signal identity/queue lease; all execution uses selected side. Countertrend
+risk <= half the current normal limit. Source seeds are not executable baselines.
+Symbol/version review dedup collapses legacy algorithm siblings; transient option
+entry/RR and unrelated parallel symbols' leverage data cannot generate new calls.
+Own-symbol caps and portfolio positions still matter; no data or quotas fabricated.
+
+Free capacity only busy after5s now yields provider_wait, not paid fallback.
+Oversize/daily exhaustion may still use explicitly enabled Claude fallback.
+Recommended operator action while preserving remaining credit: free primaries,
+AI_CLAUDE_FALLBACK_ENABLED=false; budget/risk/keys were not edited on server.
+Usage report adds paid routes, strategy/family costs and exact/same-market repeats.
+Edge report adds decision/family groups and collision bounds; preserves original
+quant reference across selected direction changes. Missing data, failed decisions,
+partial structural references and old watch levels never become fake wins.
+See docs/live-readiness.md for caveats and read-only report commands.

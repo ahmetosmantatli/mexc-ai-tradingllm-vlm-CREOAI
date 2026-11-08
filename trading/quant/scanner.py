@@ -65,6 +65,7 @@ class MarketScanner:
     max_workers: int = 4
     rotation_store: object | None = None
     bulk_tickers: bool = False
+    structure_setups_enabled: bool = False
 
     def scan(self, symbols: Sequence[str] | None = None) -> ScanResult:
         started=time.monotonic()
@@ -126,6 +127,19 @@ class MarketScanner:
                 ctx=StrategyContext(symbol=sym,last_price=float(ticker.last_price or 0),klines=candles,
                     fee_free_pair=sym in fee_free or bool(ticker.fee_free),quote_volume_24h=ticker.quote_volume_24h)
                 produced=run_strategies(ctx,self.strategies)
+                if self.structure_setups_enabled:
+                    from trading.analysis.market import closed_candles,structure_features
+                    from trading.quant.structure_setups import build_structure_setups
+                    from trading.quant.signals import CandidateSignal,StrategyName
+                    observed=time.time()
+                    confirmed=closed_candles(candles,900,observed)
+                    market=dict(symbol=sym,observed_at=observed,timeframes=[dict(timeframe='15m',features=structure_features(confirmed),recent_ohlcv=[c.row() for c in confirmed[-12:]])])
+                    for setup in build_structure_setups(market,current_price=ctx.last_price):
+                        if setup['state']!='ready':continue
+                        produced.append(CandidateSignal(symbol=sym,side=setup['side'],strategy=StrategyName.STRUCTURE_SETUP,
+                            entry_price=ctx.last_price,stop_loss_price=setup['stop_loss_price'],take_profit_price=setup['take_profit_price'],
+                            confidence=.65,fee_free_pair=ctx.fee_free_pair,rationale='Kapanmış 15dk yapısal ön eleme; 4s/5dk teyidi henüz değerlendirilmedi.',
+                            features=dict(structure_seed=True,setup_family=setup['family'],setup_id=setup['setup_id'],requires_full_context=True)))
                 for candidate in produced:
                     candidate.features['observed_spread_bps']=ticker.spread_bps
                     if candles:

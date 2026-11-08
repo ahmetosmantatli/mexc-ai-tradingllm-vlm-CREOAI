@@ -13,6 +13,7 @@ from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summ
 
 class ModelDecision(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
+    setup_id: str | None = Field(default=None,max_length=64)
     sizing_plan: PlanSizing | None = None
     price_plan: MarketPricePlan | None = None
     watch_plan: WatchPlan | None = None
@@ -32,12 +33,19 @@ SYSTEM_POLICY = (
     'Never force a weekly return, raise risk after losses, invent evidence/IDs, or place orders. '
     'Account operating_context identifies PAPER or LIVE mode, observed balance, closed outcomes and an optional research objective. '
     'A research objective is reporting context only, never a reason to force a trade or exceed risk limits. '
-    'Only the supplied candidate may be traded and only when cross-timeframe evidence is coherent. '
+    'Only the supplied symbol may be traded. The seed direction is a screening hypothesis, not a mandatory bias. '
+    'When account.setup_selection.enabled, every TRADE MUST select a supplied READY setup_id and provide a grounded price_plan. '
+    'This chooses its direction/family; the seed is not a substitute. With no ready setup choose HOLD or a future WATCH. Never invent a setup ID. '
+    'Trend continuation needs confirmed directional BOS and structural invalidation; pullback needs a macro-direction retest/reclaim, '
+    'so 5m may temporarily oppose 4h. Countertrend needs an actual sweep plus closed reclaim and explicit invalidation, not an overextended indicator. '
+    'Universal agreement of 4h/15m/5m is NOT required: explain the relationship for the selected family. '
+    'A countertrend selection must choose risk_per_trade_pct no more than half the supplied max_risk_fraction. '
+    'READY hypotheses are evidence, not a command to trade; WATCH hypotheses lack the named trigger and cannot be traded yet. '
     'A watch_review candidate is an independent watch/structure event, not a fresh SMA/ROC signal. '
     'Its old SL/TP are context only. Trading watch_review requires a new validated price_plan; otherwise HOLD or update the watch. '
     'canonical_watch.reason=structure_changed means reconsider the thesis, not that the entry threshold was reached. '
     'Return exactly JSON: action (trade/watch/hold/cancel_watch), signal_id (supplied candidate ID or null), '
-    'rationale, invalidation, watch_note, sizing_plan, watch_plan, reviewed_watch_revision. '
+    'rationale, invalidation, watch_note, sizing_plan, watch_plan, reviewed_watch_revision; optional setup_id selects a supplied setup. '
     'For an actionable watch return watch_plan: trigger_condition (price_above/price_below/closed_candle_cross_above/closed_candle_cross_below), '
     'trigger_price, timeframe (5m/15m/4h, required for candle triggers), invalidation_condition (above/below), '
     'invalidation_price, expires_at (UTC epoch seconds within24h). Null watch_plan is a passive note without automatic triggers. '
@@ -49,7 +57,8 @@ SYSTEM_POLICY = (
     'Never pretend to supersede an unseen plan. For trade choose sizing_plan with integer leverage and '
     'risk_per_trade_pct as an account fraction (.01 means 1%), within supplied limits; null retains policy sizing. '
     'In LIVE exchange leverage mode an explicit sizing_plan is mandatory: never default to the maximum. '
-    'Only when account.price_planning.enabled is true, you may return an optional price_plan for the same candidate side/symbol. '
+    'Only when account.price_planning.enabled is true, return a price_plan for the selected setup side and supplied symbol; '
+    'without setup selection the original seed side applies. '
     'Its fields: entry_type=market, entry_price, stop_loss_price, take_profit_price, entry_timeframe=5m/15m/4h, '
     'stop_reference and target_reference (timeframe, open_time UTC candle-open seconds, field low/high), reason. '
     'References must exist in supplied recent_ohlcv. LONG stop must be at/below a referenced low, SHORT at/above a high, '
@@ -139,7 +148,8 @@ class ContextEvaluator:
             return EvaluationResult(action=GraphAction.HOLD, hold_reason='no_candidates',metadata={'provider_called':False})
         candidate = max(candidates, key=lambda c:c.confidence)
         symbol = candidate.symbol
-        scope = f'{candidate.strategy.value}:{candidate.side.value}'
+        selection_enabled=bool(context.get('live_account_context') is not None and getattr(self.cfg,'live_structure_setups_enabled',False) and getattr(self.cfg,'live_price_plan_enabled',False))
+        scope = 'symbol_setups' if selection_enabled else f'{candidate.strategy.value}:{candidate.side.value}'
         if context.get('live_account_context') is not None:
             scope=f'{self.cfg.analysis_version}:'+scope
         self.store.put('stage','fetching_multitimeframe_context')
@@ -179,6 +189,13 @@ class ContextEvaluator:
         account['price_planning']=dict(enabled=price_planning,price_step=price_rules.price_step if price_rules else None,
             market_entry_only=True,reference_policy='closed recent OHLCV wick + at most1 recent ATR buffer')
         account['canonical_watch']=canonical_watch_card(prior_watch)
+        options=[]
+        if selection_enabled:
+            from trading.quant.structure_setups import build_structure_setups
+            options=build_structure_setups(chart_context,current_price=candidate.entry_price,price_step=price_rules.price_step)
+        account['setup_selection']=dict(enabled=selection_enabled,options=options,
+            countertrend_max_risk_fraction=risk_per_trade_pct*.5,
+            note='Select setup_id and provide a fresh grounded price_plan for TRADE. No hypothesis means no forced trade.')
         economic_basis=economic_review_key(account,positions)
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
         evaluation_key=digest(dict(policy=POLICY_VERSION,market=fingerprint,scope=scope,economic_basis=economic_basis))
@@ -215,6 +232,11 @@ class ContextEvaluator:
             self.llm.on_trace=lambda update:publish_progress(self.store,{**trace,**copy.deepcopy(update)})
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
+            from trading.evaluation.setup_selection import validate_selection
+            chosen,option=validate_selection(decision,candidate,options,selection_enabled)
+            if (option and option['family']=='countertrend_sweep_reclaim' and decision.action=='trade'
+                    and (decision.sizing_plan is None or decision.sizing_plan.risk_per_trade_pct>risk_per_trade_pct*.5)):
+                raise ValueError('countertrend sizing exceeds reduced risk limit')
             if decision.action=='cancel_watch':
                 if (prior_watch.get('status') not in ACTIVE or decision.reviewed_watch_revision!=prior_watch['revision']
                         or len(decision.rationale.strip())<12 or any(v is not None for v in (decision.signal_id,decision.sizing_plan,decision.price_plan,decision.watch_plan))):
@@ -227,7 +249,7 @@ class ContextEvaluator:
             if decision.price_plan is not None:
                 if not price_planning or decision.action!='trade':
                     raise ValueError('price planning disabled or not trade')
-                apply_market_price_plan(candidate,decision.price_plan,evidence_from_market(chart_context),
+                apply_market_price_plan(chosen,decision.price_plan,evidence_from_market(chart_context),
                     price_step=price_rules.price_step,current_price=candidate.entry_price,now=time.time())
             if decision.action=='trade' and decision.signal_id!=candidate.signal_id:
                 raise ValueError('unknown signal')
@@ -263,6 +285,9 @@ class ContextEvaluator:
             waiting_only=(attempts is not None and not provider_called and (not attempts or all(a.get('status') in wait_statuses for a in attempts)))
             trace.update(status='provider_wait' if waiting_only else 'invalid_or_unavailable_model',action='hold',execution_status='not_opened')
             self._save_trace(trace)
+            if live_account is not None and provider_called:
+                from trading.runtime.edge_research import record_review
+                record_review(self.store,trace,candidate,None,self.cfg)
             if provider_called:
                 # This is an error retry delay for identical inputs, never an
                 # interval imposed on valid HOLD/WATCH or newly changed evidence.
@@ -271,9 +296,18 @@ class ContextEvaluator:
                 metadata['retry_at']=memory['last_failure']['retry_at']
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_or_unavailable_model',metadata=metadata)
         trace['model_action']=decision.action
+        source_candidate=candidate
+        from trading.evaluation.setup_selection import validate_selection
+        candidate,selection=validate_selection(decision,candidate,options,selection_enabled)
+        trace.update(setup_id=decision.setup_id,setup_family=selection['family'] if selection else candidate.features.get('setup_family'),side=candidate.side.value)
+        metadata['setup_selection']=copy.deepcopy(selection)
+        shadow_plan=None
         def reject_coordinated(reason):
             trace.update(status=reason,action='hold',execution_status='not_opened',rationale=decision.rationale)
             self._save_trace(trace)
+            if live_account is not None:
+                from trading.runtime.edge_research import record_review
+                record_review(self.store,trace,source_candidate,shadow_plan,self.cfg)
             if provider_called:
                 memory['last_failure']=dict(evaluation_key=evaluation_key,retry_at=time.time()+60)
                 self.store.put(key,memory)
@@ -300,6 +334,7 @@ class ContextEvaluator:
                 return reject_coordinated('invalid_model_price_plan')
         metadata.update(price_plan=decision.price_plan.model_dump() if decision.price_plan else None,
             price_evidence=price_evidence,price_plan_enabled=price_planning)
+        shadow_plan=planned_candidate if decision.action=='trade' else None
         prepared_proposal=None
         if decision.action=='trade':
             try:
@@ -330,7 +365,7 @@ class ContextEvaluator:
         self._save_trace(trace)
         if live_account is not None:
             from trading.runtime.edge_research import record_review
-            record_review(self.store,trace,candidate,planned_candidate,self.cfg)
+            record_review(self.store,trace,source_candidate,planned_candidate,self.cfg)
         decision_ai=dict(provider=getattr(self.llm,'last_provider','unknown'),model=getattr(self.llm,'last_model','unknown'),
             fallback_reason=getattr(self.llm,'last_fallback_reason',''),
             credential_id=getattr(self.llm,'last_credential_id',''),quota_group=getattr(self.llm,'last_quota_group',''))
@@ -356,6 +391,7 @@ class ContextEvaluator:
         if decision.action!='trade':
             return EvaluationResult(action=GraphAction.HOLD,hold_reason=decision.action,metadata=metadata)
         proposal=prepared_proposal
+        proposal.metadata.update(setup_family=trace.get('setup_family'),setup_id=decision.setup_id)
         proposal.metadata.update(price_source='model' if decision.price_plan else 'quant',price_plan=metadata.get('price_plan'))
         proposal.rationale=decision.rationale
         return EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=candidate,

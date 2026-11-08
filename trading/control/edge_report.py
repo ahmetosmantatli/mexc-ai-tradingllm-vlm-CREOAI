@@ -36,10 +36,17 @@ def export(root,output,*,bars=None,fetch_public=False,horizon_bars=48):
     report['horizon_5m_bars']=horizon_bars
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     (output/'edge-comparison.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
-    (output/'edge-comparison.txt').write_text(
-        f"Kayıtlı değerlendirme: {len(rows)}\nTekil fırsat: {report['unique_opportunities']}\nEşleşen karşılaştırma: {report['matched']}\n"
-        f"Ortalama fark (R, tahmini işlem maliyeti sonrası, funding hariç): {report['mean_delta_r']}\n"
-        'Canlı kâr raporu veya kârlılık kanıtı değildir. AI giderleri ayrı usage_report içindedir.\n'+report['limitations']+'\n')
+    lines=[f"Kayıtlı değerlendirme: {len(rows)}",f"Tekil fırsat: {report['unique_opportunities']}",
+        f"Eşleşen karşılaştırma: {report['matched']}",
+        f"Aynı mumda SL/TP sırası belirsiz karşılaştırma: {report['ambiguous_matched']}",
+        f"Belirsiz mumlar hariç ortalama fark (R): {report['mean_decisive_delta_r']}",
+        "R sonuçlarında tahmini işlem maliyetleri var; funding yok.",
+        "İşlem açılmayan adayların referans sonuçları: "+json.dumps(report['withheld_reference_outcomes'],ensure_ascii=False),
+        "Pozitif referans sonucu, gerçekleştirilebilir kaçan fırsat veya yanlış BEKLE kararı kanıtı değildir."]
+    for group in report['groups']:
+        lines.append(json.dumps(group,ensure_ascii=False))
+    lines+=['Canlı kâr raporu veya kârlılık kanıtı değildir. AI giderleri ayrı usage_report içindedir.',report['limitations']]
+    (output/'edge-comparison.txt').write_text('\n'.join(lines)+'\n')
     return report
 
 

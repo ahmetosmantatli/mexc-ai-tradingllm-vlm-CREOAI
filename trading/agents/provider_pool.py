@@ -333,6 +333,39 @@ class ProviderPool:
         return any((self.store.get(self._quota_key(slot,images),{}).get('lease') or {}).get('until',0)>now
                    for slot in slots)
 
+    def _unavailable_routes(self,slots,system,user,max_tokens,images):
+        """Explain local admission without sending HTTP or revealing credentials.
+
+        In-flight work is contention, not evidence that a paid model is needed.
+        A busy slot only qualifies for waiting if this request can fit its own
+        limits and its rolling daily allowance has room for another request.
+        """
+        now=time.time();rows=[];seen=set()
+        for slot in slots:
+            key=self._quota_key(slot,images)
+            if key in seen:continue
+            seen.add(key)
+            state=self.store.get(key,dict(rows=[]))
+            day=[row for row in state.get('rows',[]) if 0<=now-row['at']<86400]
+            minute=[row for row in day if now-row['at']<60]
+            tokens=self._estimate(slot,system,user,max_tokens,images)
+            rpm,tpm,rpd,tpd=self._limits(slot)
+            cooling=max(state.get('retry_at',0),self._cooldown(slot,images))>now
+            busy=(state.get('lease') or {}).get('until',0)>now
+            if (tpm and tokens>tpm) or (tpd and tokens>tpd):reason='request_too_large'
+            elif rpd and len(day)>=rpd:reason='rolling_daily_requests'
+            elif tpd and sum(row['tokens'] for row in day)+tokens>tpd:reason='rolling_daily_tokens'
+            elif cooling:reason='provider_cooldown'
+            elif busy:reason='free_capacity_in_flight'
+            elif rpm and len(minute)>=rpm:reason='minute_requests'
+            elif tpm and sum(row['tokens'] for row in minute)+tokens>tpm:reason='minute_tokens'
+            else:reason='reservation_race'
+            rows.append(dict(provider=slot.provider,model=self._model(slot,images),credential_id=slot.label,
+                quota_group=slot.group[:12],status='quota_skipped',phase='routing',error_category=reason,
+                generation_requests=0,count_requests=0,estimated_input_tokens=tokens,
+                token_budget=tpm))
+        return rows
+
     def _retryable(self,slot,images):
         attempts=self.last_trace.get('attempts',[])
         if not attempts:
@@ -473,6 +506,14 @@ class ProviderPool:
                         self.last_status='stopped'
                         return self._finish(None)
                     continue
+                unavailable=self._unavailable_routes(remaining,system,user,max_tokens,images)
+                self.last_trace['attempts'].extend(unavailable)
+                if any(row['error_category']=='free_capacity_in_flight' for row in unavailable):
+                    # Five seconds expiring is not consent to convert parallel
+                    # free requests into paid traffic. Yield to the scheduler.
+                    self.last_status='quota_skipped'
+                    self.last_fallback_reason='free_capacity_in_flight'
+                    return self._finish(None)
                 break
             slot=reservation[0]
             # One attempt per quota group/model per pass, not one per nominal key.

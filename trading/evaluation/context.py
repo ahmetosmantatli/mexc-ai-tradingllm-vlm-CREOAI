@@ -8,7 +8,7 @@ transcript or a promise that old detail remains in a model's hidden memory.
 import hashlib
 import json
 
-POLICY_VERSION = 'pa-context-v3'
+POLICY_VERSION = 'pa-context-v4'
 POSITION_FIELDS = ('symbol','side','entry','stop','target','quantity','leverage','risk',
                    'opened_at','initial_stop','current_r','mfe_r','mae_r','unrealized','margin','notional','stop_loss_estimate','stop_risk_pct')
 
@@ -254,6 +254,9 @@ def economic_review_key(account,positions):
     risk settings and objective policy changes do.
     """
     stable={key:value for key,value in account.items() if key not in ('equity','operating_context')}
+    selection=stable.get('setup_selection')
+    if isinstance(selection,dict):
+        stable['setup_selection']={**selection,'options':[{key:row.get(key) for key in ('setup_id','family','side','state')} for row in selection.get('options',[])]}
     operating=account.get('operating_context') or {}
     if operating.get('mode')=='LIVE':
         ignored_live={'observed_at','generation','started_at','equity','current_equity','equity_snapshot_usdt',

@@ -143,6 +143,7 @@ class TelegramController:
         return ('Aday algoritmaları: trend SMA8/21, momentum ROC12, ortalamaya dönüş SMA20 (15dk). '
                 'Sabit yüzde ağırlık yok; güncel adaylar bekleme sırasına göre dönüşümlü değerlendirilir. '
                 'Aday puanı başarı olasılığı değildir. AI ayrıca 4s/15dk/5dk yapısını değerlendirir. '
+                'LIVE_STRUCTURE_SETUPS_ENABLED açıkken bağımsız yapısal ön eleme ve aynı paritede trend devamı/geri çekilme/karşı trend sweep seçenekleri eklenir. '
                 'LIVE takip koşulu/yapı değişikliği, eski algoritmadan sinyal gerektirmeden ayrı değerlendirme oluşturabilir.')
 
     @staticmethod
@@ -266,6 +267,7 @@ class TelegramController:
                 text+='Gerekçe: '+str(trace['rationale'])[:500]+'\n'
             model_action=trace.get('model_action') or (trace.get('action') if trace.get('status')=='completed' else None)
             if model_action:text+='Model kararı: '+{'trade':'İşlem öner','watch':'Takibe al','hold':'Bekle','cancel_watch':'Takibi iptal et'}.get(model_action,'Bilinmiyor')+'\n'
+            if trace.get('setup_family'):text+='Seçilen kurulum: '+str(trace['setup_family'])+' | Yön: '+str(trace.get('side','?'))+'\n'
             if trace.get('execution_reason'):text+='Yürütme sonucu: '+str(trace['execution_reason'])+'\n'
             if trace.get('execution_details'):text+='Kontrol ayrıntısı: '+str(trace['execution_details'])[:400]+'\n'
             if trace.get('why_reconsidered'):

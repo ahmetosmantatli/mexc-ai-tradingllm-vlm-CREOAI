@@ -49,3 +49,25 @@ def test_live_usage_and_position_management_are_exported_with_actual_variant(tmp
     assert report['evaluations']==2
     assert {g['variant'] for g in report['groups']}=={'text','vlm'}
     assert 'position_management' in (tmp_path/'out'/'ai-requests.csv').read_text()
+
+
+
+def test_review_summary_separates_exact_repeats_market_repeats_and_paid_causes(tmp_path):
+    from trading.control.usage_report import review_summary
+    rows=[]
+    for ident,fingerprint in [('one','first-input'),('two','second-input'),('three','second-input')]:
+        rows.append(dict(id=ident,account='friend',variant='text',symbol='BTC_USDT',strategy='watch_review',
+            status='completed',action='hold',market_fingerprint='same-market',input_fingerprint=fingerprint,
+            fallback_reason='free_pool_quota_or_cooldown',attempts=[
+                dict(provider='groq',status='quota_skipped',error_category='request_too_large',generation_requests=0),
+                dict(provider='anthropic',status='success',generation_requests=1,estimated_cost_usd=.04)]))
+    rows.append(dict(account='friend',variant='text',status='provider_wait',attempts=[
+        dict(provider='gemini',status='quota_skipped',error_category='free_capacity_in_flight',generation_requests=0)]))
+    result=review_summary(rows)
+    assert result['model_decisions']=={'hold':3}
+    assert result['routing_skip_reasons']=={'request_too_large':3,'free_capacity_in_flight':1}
+    assert result['paid_by_strategy'][0]['known_estimated_cost_usd']==.12
+    assert result['review_counts'][0]['exact_input_repeat_reviews']==1
+    assert result['review_counts'][0]['same_market_repeat_reviews']==2
+    assert result['review_counts'][0]['sent_analyses']==3
+    assert result['paid_route_reasons']=={'free_pool_quota_or_cooldown':3}

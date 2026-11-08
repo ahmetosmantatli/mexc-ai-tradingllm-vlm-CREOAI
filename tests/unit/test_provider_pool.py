@@ -394,3 +394,54 @@ def test_gemini_semantic_issue_survives_complete_pool_route(tmp_path):
     attempt=p.last_trace['attempts'][0]
     assert attempt['validation_issues']==[dict(field='response',type='watch_requires_fresh_price_plan')]
     assert attempt['phase']=='generation'
+
+
+@pytest.mark.parametrize('retry_enabled',[False,True])
+def test_free_slot_still_busy_yields_without_turning_contention_into_paid_spend(tmp_path,retry_enabled):
+    p,store=pool(tmp_path,settings(ai_pool_retry_seconds=5,ai_pool_max_retry_attempts=int(retry_enabled),
+        anthropic_api_key='paid',ai_claude_fallback_enabled=True))
+    reservation=p._reserve(p._slots,'s','u',800,None)
+    p._wait=lambda seconds:True # another request is still running after bounded wait
+    p.claude.complete_json=lambda **kw:pytest.fail('contention must not spend paid budget')
+    assert p.complete_json(system='s',user='u') is None
+    assert p.last_status=='quota_skipped'
+    assert p.last_fallback_reason=='free_capacity_in_flight'
+    assert p.last_trace['attempts'][0]['error_category']=='free_capacity_in_flight'
+    assert sum(a['generation_requests'] for a in p.last_trace['attempts'])==0
+    # Releasing the other request allows this identical context to run for free.
+    p._release(reservation[1],reservation[2])
+    assert p.complete_json(system='s',user='u')=={'action':'hold'}
+    assert p.last_provider=='groq'
+
+
+def test_busy_but_daily_exhausted_group_does_not_block_configured_paid_fallback(tmp_path):
+    p,store=pool(tmp_path,settings(groq_rpd=1,anthropic_api_key='paid',ai_claude_fallback_enabled=True))
+    p._reserve(p._slots,'s','u',800,None)
+    paid_response(p.claude)
+    assert p.complete_json(system='s',user='u')=={'action':'hold'}
+    assert p.last_provider=='anthropic'
+    assert p.last_trace['attempts'][0]['error_category']=='rolling_daily_requests'
+
+
+def test_oversized_request_skip_reason_and_original_context_are_visible(tmp_path):
+    p,store=pool(tmp_path,settings(anthropic_api_key='paid',ai_claude_fallback_enabled=True))
+    paid=[]
+    def complete(**kw):
+        paid.append(kw)
+        p.claude.last_status='success'
+        p.claude.last_attempt=dict(provider='anthropic',status='success',generation_requests=1,count_requests=1)
+        return {'action':'hold'}
+    p.claude.complete_json=complete
+    context='unchanged-context '*3000
+    assert p.complete_json(system='s',user=context)=={'action':'hold'}
+    assert p.last_trace['attempts'][0]['error_category']=='request_too_large'
+    assert paid[0]['user']==context # never truncate data to squeeze into free quota
+
+
+
+def test_user_facing_skip_messages_distinguish_contention_and_daily_quota():
+    from trading.agents.telemetry import provider_result
+    busy=provider_result(dict(status='quota_skipped',error_category='free_capacity_in_flight',generation_requests=0))
+    daily=provider_result(dict(status='quota_skipped',error_category='rolling_daily_requests',generation_requests=0))
+    assert 'başka analizi' in busy and 'sığmadığı' not in busy
+    assert '24 saatlik' in daily and 'sığmadığı' not in daily

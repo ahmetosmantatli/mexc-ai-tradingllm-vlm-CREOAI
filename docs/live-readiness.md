@@ -392,3 +392,59 @@ a substantive rationale and no order fields. This cancels the watch only, never
 an existing position. HOLD and prose containing “invalid” preserve the watch.
 The context policy is v3; the policy version participates in deduplication so the
 new action becomes available without clearing durable plans or order state.
+
+
+### Structural alternatives, matched shadow outcomes, and free-capacity waits
+
+`LIVE_STRUCTURE_SETUPS_ENABLED=true` together with `LIVE_PRICE_PLAN_ENABLED=true`
+enables an independent closed-15m structure screen in addition to the old SMA/ROC
+candidates. No extra scanner HTTP calls are required. Partial seeds are not
+execution permission: the evaluator loads the full 4h/15m/5m bundle and offers
+bounded same-symbol trend-continuation, pullback and countertrend sweep/reclaim
+hypotheses. Every TRADE in this mode must select a supplied READY `setup_id` and
+supply a grounded current-market price plan. Arbitrary direction strings are not
+accepted. A selected opposite-side plan retains the original queue lease and
+passes its actual side into quote, account leverage, sizing and native order
+checks. The conservative common leverage cap across both account sides is used
+for initial choice; final checks use the selected side. Countertrend risk may not
+exceed half the normal profile/account limit. These definitions are hypotheses,
+not validated profitable strategies or an increased-trade-count target.
+
+Entry-review memory is shared per symbol/version in this mode: legacy SMA/ROC
+siblings with unchanged closed evidence and account/plan state do not each get a
+fresh model call. Current account and price validation still run before any real
+entry. Small quote changes alone do not change the review key. New closed bars,
+watch triggers, structural and account/plan events can still cause reviews;
+there is no promise that free daily allowance is sufficient for 24/7 scanning.
+
+Free-pool contention after the bounded wait now yields `provider_wait`, not a
+paid call solely because another free request is in flight. Intrinsically large
+requests, exhausted daily allowance and failed free models may still reach
+Claude when paid fallback is enabled. To preserve remaining paid credit, an
+operator can set `AI_CLAUDE_FALLBACK_ENABLED=false` with a free primary provider.
+If all eligible free routes are unavailable, new analyses wait while scanning
+and existing native-protection reconciliation continue. No quota reset/bypass
+or automatic credit top-up occurs.
+
+The existing read-only `usage_report` now includes paid use by setup/strategy,
+routing skips, exact input repeats and same-market repeated reviews (the latter
+can be legitimate after account changes). `edge_report` separately groups HOLD,
+WATCH and validated-but-rejected proposals; it preserves the ORIGINAL quant
+reference when the model selects the opposite direction. Partial structural
+seeds and old watch-review levels are explicitly not executable quant baselines.
+They cannot be counted as missed tradable wins. Same-bar SL/TP collisions provide
+lower/upper R bounds; the decisive comparison excludes ambiguous samples.
+Opening gaps resolve known barrier order. Missing bars, missing spreads and
+unknown model decisions remain unknown. Funding, real fills, liquidation,
+contract feasibility, AI dollar costs and portfolio overlap remain outside this
+initial-plan counterfactual comparison.
+
+Read-only reports (the second performs PUBLIC data reads only):
+
+```sh
+python -m trading.control.usage_report --output-dir /app/data/reports
+python -m trading.control.edge_report --root /app/data --output-dir /app/data/reports --fetch-public
+```
+
+Historical unrecorded decisions or the old STONK exception reason cannot be
+reconstructed. This release does not establish their cause or live profitability.

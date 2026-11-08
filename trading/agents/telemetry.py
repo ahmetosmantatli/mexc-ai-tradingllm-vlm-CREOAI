@@ -119,8 +119,17 @@ def provider_result(attempt):
     if status=='success':
         return 'yanıt alındı'
     if status=='quota_skipped' and not attempt.get('generation_requests',0):
-        if category=='shared_minute_token_budget':
-            return 'ortak dakika kotası dolu; bu sağlayıcıya yeni istek gönderilmedi'
+        reasons={
+            'shared_minute_token_budget':'ortak dakika kotası dolu; bu sağlayıcıya yeni istek gönderilmedi',
+            'free_capacity_in_flight':'ücretsiz model başka analizi tamamlıyor; ücretli modele geçilmeden sıra bekleniyor',
+            'rolling_daily_requests':'son 24 saatlik yerel istek kotası dolu; bu sağlayıcıya yeni istek gönderilmedi',
+            'rolling_daily_tokens':'son 24 saatlik yerel token kotası dolu; bu sağlayıcıya yeni istek gönderilmedi',
+            'minute_requests':'dakikalık yerel istek kotası dolu; yeni istek gönderilmedi',
+            'minute_tokens':'dakikalık yerel token kotasında yer yok; yeni istek gönderilmedi',
+            'provider_cooldown':'sağlayıcı bekleme süresinde; yeni istek gönderilmedi',
+            'reservation_race':'kapasite yeniden kontrol edilecek; yeni istek gönderilmedi',
+        }
+        if category in reasons:return reasons[category]
         return 'analiz bu modelin token bütçesine sığmadığı için istek gönderilmedi'
     if status=='cooldown_skipped':
         return 'limit sonrası beklemede; yeni istek gönderilmedi'
@@ -197,6 +206,10 @@ def validation_issues(exc,schema=None):
             for value in node:collect(value)
     collect(schema)
     semantic={
+        'unknown or inapplicable setup selection':'unknown_setup_id',
+        'structure seed requires explicit setup selection':'structure_seed_requires_selection',
+        'selected setup requires confirmed full context and fresh price plan':'setup_requires_ready_context_price_plan',
+        'countertrend sizing exceeds reduced risk limit':'countertrend_risk_limit',
         'cancel_watch requires active reviewed revision and no order fields':'cancel_watch_revision_or_fields',
         'independent watch trade requires a fresh price plan':'watch_requires_fresh_price_plan',
         'explicit model sizing required for exchange leverage mode':'explicit_sizing_required',
