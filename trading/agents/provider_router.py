@@ -108,18 +108,18 @@ class ProviderRouter:
         self._trace()
         return result
 
-    def _groq(self, system, user, max_tokens, images, *, request_timeout=None):
+    def _groq(self, system, user, max_tokens, images, *, request_timeout=None, capacity_probe=False):
         self.last_provider='groq'
-        model=self.settings.groq_vision_model if images else self.settings.groq_text_model
+        model=self.settings.groq_vision_model if images or (capacity_probe and getattr(self,'_probe_vision',False)) else self.settings.groq_text_model
         self.last_model=model
         attempt=dict(provider='groq',model=model,status='preparing',generation_requests=0,count_requests=0,
             latency_ms=0,input_tokens=None,output_tokens=None,estimated_cost_usd=None)
         self.last_trace['attempts'].append(attempt)
-        if time.time()<self.store.get('groq:retry_at:'+model,0):
+        if not capacity_probe and time.time()<self.store.get('groq:retry_at:'+model,0):
             self.last_fallback_reason='groq_cooldown'
             attempt['status']='cooldown_skipped'
             return None
-        completion=max(self.settings.groq_max_completion_tokens,max_tokens)
+        completion=max_tokens if capacity_probe else max(self.settings.groq_max_completion_tokens,max_tokens)
         estimated_input=math.ceil(len((system+user).encode('utf-8'))/3)+512+2048*len(images or [])
         total=estimated_input+completion
         budget=self.settings.groq_request_token_budget
@@ -196,7 +196,7 @@ class ProviderRouter:
     def complete_vision_probe(self, *, system, user, max_tokens, images):
         return self.complete_json(system=system,user=user,max_tokens=max_tokens,images=images,vision_probe=True)
 
-    def complete_json(self, *, system, user, max_tokens=800, images=None, vision_probe=False):
+    def complete_json(self, *, system, user, max_tokens=800, images=None, vision_probe=False, capacity_probe=False):
         self.last_trace={'attempts':[],'status':'pending'}
         self.last_fallback_reason=''
         self.last_provider='none'
@@ -205,26 +205,28 @@ class ProviderRouter:
         if not self._allowed():
             self.last_status='stopped'
             return self._finish(None)
-        primary=self._primary(images)
-        if primary=='anthropic' and vision_probe:
+        self.gemini._probe_vision=bool(capacity_probe and getattr(self,'_probe_vision',False))
+        primary=self._primary(images or self.gemini._probe_vision)
+        if primary=='anthropic' and (vision_probe or capacity_probe):
             primary='gemini'
         order=[] if primary=='anthropic' else [primary, 'gemini' if primary=='groq' else 'groq']
-        request_timeout = max(.01, self.deadline-time.time()) if vision_probe and self.deadline is not None else None
+        request_timeout = max(.01, self.deadline-time.time()) if (vision_probe or capacity_probe) and self.deadline is not None else None
         for provider in order:
             if not self._allowed():
                 self.last_status='stopped'
                 return self._finish(None)
             if provider=='groq' and self.settings.groq_api_key:
-                result=self._groq(system,user,max_tokens,images,request_timeout=request_timeout)
+                result=self._groq(system,user,max_tokens,images,request_timeout=request_timeout,capacity_probe=capacity_probe)
             elif provider=='gemini' and self.settings.gemini_api_key:
                 self.last_provider='gemini'
-                self.last_model=self.settings.gemini_vision_model if images else self.settings.gemini_text_model
+                self.last_model=self.settings.gemini_vision_model if images or self.gemini._probe_vision else self.settings.gemini_text_model
                 self.gemini.can_call=self._allowed
                 self.gemini.response_validator=self.response_validator
                 self.gemini.decision_schema=copy.deepcopy(self.decision_schema)
                 self.last_trace['attempts'].append(dict(provider='gemini',model=self.last_model,status='requesting',generation_requests=0,count_requests=0,latency_ms=0))
                 self._trace()
                 result=self.gemini.complete_json(system=system,user=user,max_tokens=max_tokens,images=images,
+                    capacity_probe=capacity_probe,
                     **({'request_timeout':request_timeout} if request_timeout is not None else {}))
                 self.last_trace['attempts'][-1]=copy.deepcopy(self.gemini.last_attempt)
                 self.last_status=self.gemini.last_status
@@ -237,9 +239,9 @@ class ProviderRouter:
                 continue
             if result is not None:
                 return self._finish(result)
-            if self.last_status=='stopped' or vision_probe and any(a.get('generation_requests') for a in self.last_trace['attempts']):
+            if self.last_status=='stopped' or (vision_probe or capacity_probe) and any(a.get('generation_requests') for a in self.last_trace['attempts']):
                 return self._finish(None)
-        if vision_probe:
+        if vision_probe or capacity_probe:
             return self._finish(None)
         if not self._allowed():
             self.last_status='stopped'

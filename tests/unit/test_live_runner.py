@@ -336,6 +336,45 @@ def test_dynamic_zero_capacity_blocks_provider_work_without_consuming_candidate(
     assert runner.monitor()['entry_status']['reason']=='HOLD_LIVE_AI_CAPACITY'
 
 
+def test_zero_estimate_successful_probe_allows_the_next_analysis(tmp_path):
+    runner,_,_,_=prepare(tmp_path)
+    calls=[]
+    runner.llm.analysis_capacity=lambda **kw:dict(parallel_candidates=0,free_slots=0,paid_slots=0,
+        reason='quota_cooldown_or_in_flight')
+    def probe(**kw):
+        calls.append('probe')
+        return dict(admitted='groq-1',probed=True)
+    runner.llm.probe_free_capacity=probe
+    runner.candidate_queue().refresh([candidate()])
+    hold=EvaluationResult(action=GraphAction.HOLD,hold_reason='wait',metadata={'provider_called':True})
+    runner._evaluate=lambda *a,**kw:calls.append('analysis') or hold
+    assert runner.cycle()['reason']=='HOLD_LIVE_MODEL'
+    assert calls==['probe','analysis']
+    assert runner.store.get('analysis_capacity')['probe_admitted'] is True
+    # The proved route is used once. The next scan does not probe or analyze again.
+    assert runner.cycle()['reason']=='HOLD_LIVE_AI_CAPACITY'
+    assert calls==['probe','analysis']
+
+
+def test_zero_estimate_failed_probes_stay_on_hold_and_are_not_every_cycle(tmp_path):
+    runner,_,_,_=prepare(tmp_path)
+    probes=[]
+    runner.llm.analysis_capacity=lambda **kw:dict(parallel_candidates=0,free_slots=0,paid_slots=0)
+    runner.llm.probe_free_capacity=lambda **kw:probes.append('probe') or dict(admitted=None,probed=True)
+    runner.candidate_queue().refresh([candidate()])
+    runner._evaluate=lambda *a,**kw:probes.append('analysis')
+    assert runner.cycle()['reason']=='HOLD_LIVE_AI_CAPACITY'
+    assert runner.cycle()['reason']=='HOLD_LIVE_AI_CAPACITY'
+    assert probes==['probe']
+    assert runner.store.get('candidate_queue')[0]['last_considered_at']==0
+    runner.capacity_probe_gap_seconds=0
+    assert runner.cycle()['reason']=='HOLD_LIVE_AI_CAPACITY'
+    assert runner.cycle()['reason']=='HOLD_LIVE_AI_CAPACITY'
+    assert probes==['probe','probe','probe']
+    assert runner.cycle()['reason']=='HOLD_LIVE_AI_CAPACITY'
+    assert probes==['probe','probe','probe']
+
+
 def _runner3_decision(runner, signal, kind, *, higher_break=None, margin_share='omit'):
     plan = dict(leverage=5, risk_per_trade_pct=.006)
     if margin_share != 'omit':

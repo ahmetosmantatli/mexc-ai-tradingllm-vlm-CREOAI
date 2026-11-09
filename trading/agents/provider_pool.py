@@ -4,6 +4,7 @@ A second API key does not imply a second provider quota. Configure distinct
 quota groups only for genuinely separate projects/organizations. Local token
 estimates and provider-specific daily windows are safeguards, not live quota telemetry.
 All routes receive identical context/images. Valid HOLD never triggers fallback.
+A local free-route estimate of zero is not proof those routes are exhausted.
 """
 from dataclasses import dataclass, field
 from datetime import datetime,timedelta
@@ -73,6 +74,9 @@ class ProviderPool:
         self._external_signature = None
         self._external_expires = 0
         self._sleep = time.sleep
+        self._probe_system = 'Return JSON only. No trading actions.'
+        self._probe_user = 'Return exactly {"action":"hold"}.'
+        self._probe_tokens = 256
         seen = set()
         from trading.agents.quota_routes import parse_routes
         routes=parse_routes(getattr(settings,'ai_free_model_routes','[]'))
@@ -226,46 +230,63 @@ class ProviderPool:
         if hasattr(slot.router,'retry_at'):return slot.router.retry_at()
         return slot.router.store.get(slot.provider+':retry_at:'+model,0)
 
+    def _admitted_probe(self):
+        state=self.store.get('pool:capacity_probe') or {}
+        if state.get('used') or not state.get('label') or float(state.get('until') or 0)<=time.time():
+            return None
+        return state.get('label')
+
+    def _consume_probe_locked(self, label):
+        state=self.store.get('pool:capacity_probe') or {}
+        if state.get('label')!=label or state.get('used'):
+            return
+        state['used']=True
+        self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',('pool:capacity_probe',json.dumps(state)))
+
     def _reserve(self, candidates, system, user, max_tokens, images):
         """Choose and lease one group atomically; never hold DB locks during HTTP."""
         now=time.time()
         with self.store.lock,self.store.db:
             self.store.db.execute('BEGIN IMMEDIATE')
+            admit=self._admitted_probe()
             choices=[]
             for slot in candidates:
                 if not self._supports(slot,images):continue
-                if hasattr(slot.router,'capacity_available') and not slot.router.capacity_available():continue
+                probe=slot.label==admit
+                if not probe and hasattr(slot.router,'capacity_available') and not slot.router.capacity_available():continue
                 if hasattr(slot.router,'request_fits'):
                     slot.router.decision_schema=self.decision_schema
                     if not slot.router.request_fits(system,user,max_tokens,images):continue
                 key=self._quota_key(slot,images)
-                if self._cooldown(slot,images)>now:
+                if not probe and self._cooldown(slot,images)>now:
                     continue
                 state=self.store.get(key,dict(rows=[],last_used=0,lease=None))
                 rows=[row for row in state['rows'] if now-row['at']<86400]
                 recent=[row for row in rows if 0<=now-row['at']<60]
                 daily=self._daily_rows(slot,rows,now)
                 lease=state.get('lease')
-                if state.get('retry_at',0)>now:
+                if not probe and state.get('retry_at',0)>now:
                     continue
                 if lease and lease['until']>now:
                     continue
                 tokens=self._estimate(slot,system,user,max_tokens,images)
-                if blocked(state.get('provider_reported',{}),tokens,now):continue
+                if not probe and blocked(state.get('provider_reported',{}),tokens,now):continue
                 rpm,tpm,rpd,tpd=self._limits(slot,images)
                 minute_tokens=sum(row['tokens'] for row in recent)
                 daily_tokens=sum(row['tokens'] for row in daily)
-                if ((rpm and len(recent)+1>rpm) or (tpm and minute_tokens+tokens>tpm)
+                if not probe and ((rpm and len(recent)+1>rpm) or (tpm and minute_tokens+tokens>tpm)
                         or (rpd and len(daily)+1>rpd) or (tpd and daily_tokens+tokens>tpd)):
                     continue
                 utilization=max((len(recent)/rpm if rpm else 0),
                     minute_tokens/tpm if tpm else 0,len(daily)/rpd if rpd else 0,
                     daily_tokens/tpd if tpd else 0)
-                priority=int(slot.provider!=getattr(self,'_preferred_provider','groq'))
+                priority=-1 if probe else int(slot.provider!=getattr(self,'_preferred_provider','groq'))
                 choices.append((priority,utilization,state.get('last_used',0),slot.label,slot,key,state,rows,tokens))
             if not choices:
                 return None
             _,_,_,_,slot,key,state,rows,tokens=min(choices,key=lambda row:row[:4])
+            if slot.label==admit:
+                self._consume_probe_locked(slot.label)
             lease_id=uuid4().hex
             state.update(rows=rows+[dict(id=lease_id,at=now,tokens=tokens)],last_used=now,
                 lease=dict(id=lease_id,until=now+self.settings.ai_provider_timeout_seconds+15))
@@ -325,6 +346,120 @@ class ProviderPool:
                 max_in_flight=1,in_flight=(paid.get('lease') or {}).get('until',0)>now,
                 cooldown_seconds=max(0,paid.get('retry_at',0)-now)))
 
+    def _probe_lease(self, slot, images):
+        now=time.time()
+        key=self._quota_key(slot, images)
+        with self.store.lock, self.store.db:
+            self.store.db.execute('BEGIN IMMEDIATE')
+            state=self.store.get(key, dict(rows=[], lease=None))
+            if not isinstance(state, dict):
+                state=dict(rows=[], lease=None)
+            state.setdefault('rows', [])
+            lease=state.get('lease') or {}
+            if lease.get('until', 0)>now:
+                return None
+            lease_id=uuid4().hex
+            state['lease']=dict(id=lease_id, until=now+23)
+            self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(key, json.dumps(state)))
+            return key, lease_id
+
+    def _send_capacity_probe(self, slot, images):
+        """One short generation on this free route. Paid Claude is not in the call."""
+        router=slot.router
+        store=getattr(router, 'store', None)
+        cooldown_key=slot.provider+':retry_at:'+self._model(slot, images)
+        prior=store.get(cooldown_key, 0) if store is not None else 0
+        prior_external=None
+        if store is not None:
+            store.put(cooldown_key, 0)
+            if hasattr(router, 'prefix'):
+                prior_external=store.get(router.prefix+'retry_at', 0)
+                store.put(router.prefix+'retry_at', 0)
+        saved=(getattr(router, 'response_validator', None), getattr(router, 'decision_schema', None), getattr(router, 'deadline', None))
+        router.response_validator=lambda payload: None if isinstance(payload, dict) else (_ for _ in ()).throw(ValueError('probe'))
+        router.decision_schema=dict(type='object', properties={'action': {'type': 'string'}}, required=['action'])
+        router.deadline=time.time()+8
+        router._probe_vision=bool(images)
+        answered=False
+        try:
+            result=router.complete_json(system=self._probe_system, user=self._probe_user,
+                max_tokens=self._probe_tokens, images=None, capacity_probe=True)
+            answered=isinstance(result, dict)
+            return answered
+        finally:
+            router.response_validator, router.decision_schema, router.deadline=saved
+            router._probe_vision=False
+            if hasattr(router, 'gemini'):
+                router.gemini._probe_vision=False
+            if store is not None and not answered:
+                store.put(cooldown_key, max(store.get(cooldown_key, 0), prior or 0))
+                if hasattr(router, 'prefix'):
+                    store.put(router.prefix+'retry_at', max(store.get(router.prefix+'retry_at', 0), prior_external or 0))
+
+    def _clear_stale_capacity(self, slot, images):
+        key=self._quota_key(slot, images)
+        state=self.store.get(key)
+        if isinstance(state, dict):
+            state['retry_at']=0
+            state['provider_reported']={}
+            self.store.put(key, state)
+        router=slot.router
+        store=getattr(router, 'store', None)
+        if store is None:
+            return
+        for flag in (False, bool(images)):
+            store.put(slot.provider+':retry_at:'+self._model(slot, flag), 0)
+        if hasattr(router, 'prefix'):
+            window=time.time()+max(self.settings.decision_ttl_seconds, self.settings.ai_provider_timeout_seconds+15)
+            store.put(router.prefix+'retry_at', 0)
+            store.put(router.prefix+'probe_admit_until', window)
+
+    def probe_free_capacity(self, *, images=False):
+        """Ask one free route whether it answers. Never calls paid Claude.
+
+        A JSON answer, including a valid BEKLE, admits that route for the next
+        analysis and does not try another route. The caller spaces and caps probes.
+        """
+        self._reload_external()
+        if not self._allowed():
+            return dict(admitted=None, skipped=True)
+        now=time.time()
+        state=self.store.get('pool:capacity_probe') or {}
+        if state.get('label') and not state.get('used') and float(state.get('until') or 0)>now:
+            return dict(admitted=state['label'], probed=False)
+        slots=[slot for slot in self._slots if self._supports(slot, images)]
+        if not slots:
+            return dict(admitted=None, skipped=True)
+        cursor=int(state.get('cursor') or 0) % len(slots)
+        chosen=None
+        leased=None
+        for offset in range(len(slots)):
+            slot=slots[(cursor+offset) % len(slots)]
+            leased=self._probe_lease(slot, images)
+            if leased is None:
+                continue
+            chosen=slot
+            cursor=(cursor+offset+1) % len(slots)
+            break
+        if chosen is None:
+            return dict(admitted=None, skipped=True)
+        answered=False
+        try:
+            answered=bool(self._send_capacity_probe(chosen, images))
+        finally:
+            key, lease_id=leased
+            attempts=(getattr(chosen.router, 'last_trace', None) or {}).get('attempts') or []
+            attempt=attempts[-1] if attempts else {}
+            cooldown=self._cooldown(chosen, images) if attempt.get('http_status')==429 else 0
+            self._release(key, lease_id, attempt, cooldown)
+        saved=dict(cursor=cursor, label=None, used=True, until=0)
+        if answered:
+            self._clear_stale_capacity(chosen, images)
+            saved.update(label=chosen.label, used=False,
+                until=now+max(self.settings.decision_ttl_seconds, self.settings.ai_provider_timeout_seconds+15))
+        self.store.put('pool:capacity_probe', saved)
+        return dict(admitted=chosen.label if answered else None, probed=True)
+
     def analysis_capacity(self,*,prompt_bytes=18000,max_tokens=1100,images=False,ceiling=8):
         """Advisory current slots, not a quota guarantee; _reserve remains atomic authority.
 
@@ -332,7 +467,7 @@ class ProviderPool:
         two credentials for the same quota group twice or invent extra paid slots.
         """
         self._reload_external()
-        now=time.time();free=0;details=[];seen=set()
+        now=time.time();free=0;details=[];seen=set();admit=self._admitted_probe()
         for slot in self._slots:
             if not self._supports(slot,images):continue
             key=self._quota_key(slot,images)
@@ -350,12 +485,13 @@ class ProviderPool:
             external_ok=not hasattr(slot.router,'capacity_available') or slot.router.capacity_available()
             if external_ok and hasattr(slot.router,'request_fits'):
                 external_ok=slot.router.request_fits('','x'*min(200000,max(0,int(prompt_bytes))+5000),max_tokens,[None]*3 if images else None)
-            allowed=(external_ok and not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now)
+            opened=slot.label==admit and not busy
+            allowed=opened or (external_ok and not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now)
                 and (not rpm or len(minute)<rpm) and (not tpm or sum(row['tokens'] for row in minute)+estimate<=tpm)
                 and (not rpd or len(day)<rpd) and (not tpd or sum(row['tokens'] for row in day)+estimate<=tpd))
             free+=int(allowed)
             details.append(dict(provider=slot.provider,quota_group=slot.group[:12],estimated_request_tokens=estimate,
-                available=allowed,reason='available' if allowed else 'in_flight' if busy else 'cooldown' if cooling else 'quota_or_request_size'))
+                available=allowed,reason='probe_admitted' if opened else 'available' if allowed else 'in_flight' if busy else 'cooldown' if cooling else 'quota_or_request_size'))
         paid=self.store.get(self._paid_guard_key(),{})
         paid_available=bool(self.settings.ai_claude_fallback_enabled and self.claude.available
             and (self._paid_budget is None or self._paid_budget.can_spend())

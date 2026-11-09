@@ -66,7 +66,14 @@ class ExternalClient:
                     neuron_budget=self.settings.cloudflare_daily_neuron_budget,
                     local_estimate=True)
 
+    def _probe_window(self):
+        return self.store.get(self.prefix + 'probe_admit_until', 0) > time.time()
+
     def capacity_available(self):
+        # A short capacity probe, or the one analysis it unlocked, is not blocked
+        # by the same local counter the probe is checking.
+        if getattr(self, '_capacity_probe', False) or getattr(self, '_probe_admit', False) or self._probe_window():
+            return self.provider != 'cloudflare' or bool(self.settings.cloudflare_free_plan_confirmed)
         if self.retry_at() > time.time():
             return False
         if self.provider == 'cloudflare':
@@ -76,12 +83,12 @@ class ExternalClient:
         return not (cached.get('reset_at', 0) > time.time() and cached.get('quota', {}).get('remaining') == 0)
 
     def request_fits(self, system, user, max_tokens, images):
-        completion=min(self.route.max_output,max(max_tokens,self.settings.external_max_completion_tokens))
+        completion=min(self.route.max_output, max_tokens if getattr(self,'_capacity_probe',False) else max(max_tokens,self.settings.external_max_completion_tokens))
         schema_bytes=len(json.dumps(self.decision_schema or {}).encode())
         text_bound=len((system+user).encode())+schema_bytes+2048
         if text_bound+completion>self.route.context_length:return False
         if images and not self.route.vision:return False
-        if self.provider=='cloudflare':
+        if self.provider=='cloudflare' and not (getattr(self,'_capacity_probe',False) or getattr(self,'_probe_admit',False) or self._probe_window()):
             bound=self.route.context_length if images else text_bound
             neurons=(bound*self.route.neuron_input+completion*self.route.neuron_output)/1e6
             return self.accounting()['neurons_reserved_or_estimated']+neurons<=self.settings.cloudflare_daily_neuron_budget
@@ -96,7 +103,7 @@ class ExternalClient:
             quota = openrouter_key(self.client, self.settings.openrouter_api_key, timeout=self._timeout())
             cached = dict(observed_at=now, reset_at=utc_reset(now), quota=quota)
             self.store.put(self.prefix + 'key', cached)
-        if cached['quota']['remaining'] <= 0:
+        if cached['quota']['remaining'] <= 0 and not (getattr(self,'_capacity_probe',False) or getattr(self,'_probe_admit',False)):
             self.store.put(self.prefix + 'retry_at', cached['reset_at'])
             raise ValueError('external_daily_quota')
         catalog = self.store.get(self.prefix + 'catalog', {})
@@ -150,10 +157,15 @@ class ExternalClient:
         if self.on_trace:
             self.on_trace(copy.deepcopy(self.last_trace))
 
-    def complete_json(self, *, system, user, max_tokens=800, images=None):
+    def complete_json(self, *, system, user, max_tokens=800, images=None, capacity_probe=False):
         started = time.time()
         # Metadata + generation share one bounded operation, not three full timeouts.
         self._request_deadline=started+self.settings.ai_provider_timeout_seconds
+        self._capacity_probe=bool(capacity_probe)
+        self._probe_admit=False
+        if not capacity_probe and self._probe_window():
+            self._probe_admit=True
+            self.store.put(self.prefix+'probe_admit_until', 0)
         a = dict(provider=self.provider, model=self.route.model, status='requesting', phase='admission',
                  generation_requests=0, count_requests=0)
         neuron_id = None
@@ -164,7 +176,7 @@ class ExternalClient:
                 raise ValueError('external_capacity')
             if images and not self.route.vision:
                 raise ValueError('external_vision_unsupported')
-            completion = min(self.route.max_output, max(max_tokens, self.settings.external_max_completion_tokens))
+            completion = min(self.route.max_output, max_tokens if capacity_probe else max(max_tokens, self.settings.external_max_completion_tokens))
             if not self.request_fits(system,user,max_tokens,images):
                 raise ValueError('external_context_or_neuron_budget')
             content = [{'type': 'text', 'text': user}]
@@ -194,7 +206,10 @@ class ExternalClient:
             if not self._allowed():
                 raise ValueError('stopped')
             if self.provider == 'cloudflare':
-                neuron_id, estimate = self._reserve_neurons(system, user, completion, images)
+                if capacity_probe or self._probe_admit:
+                    neuron_id, estimate = None, 0
+                else:
+                    neuron_id, estimate = self._reserve_neurons(system, user, completion, images)
                 a['neuron_reserved_estimate'] = estimate
             else:
                 # Pool serializes the account bucket. Failed generations count too.
@@ -276,5 +291,7 @@ class ExternalClient:
                 self.store.put(self.provider + ':retry_at:' + self.route.model, time.time() + 30)
             return None
         finally:
+            self._capacity_probe=False
+            self._probe_admit=False
             a['latency_ms'] = round((time.time() - started) * 1000)
             self._emit(a)
