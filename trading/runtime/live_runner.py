@@ -31,6 +31,11 @@ from trading.runtime.live_account import LiveAccountReconciler,observe_risk_refe
 
 
 class LiveRunner:
+    # A stuck local zero is not a reason to stay silent for the whole wait.
+    # Three probes, at least one scan apart, then the hold stands.
+    capacity_probe_cap=3
+    capacity_probe_gap_seconds=180
+
     def __init__(self,settings,*,store,account_id,binding_id,private,public,llm,
                  external_control=None,executor=None,**unused):
         self.cfg,self.store,self.account_id,self.binding_id=settings,store,account_id,binding_id
@@ -691,6 +696,37 @@ class LiveRunner:
             return finish('LIVE_PROTECTED')
         return finish('HOLD_LIVE_'+str(state.get('status','UNKNOWN')).upper(), notify=False)
 
+    def _capacity_probe(self, images, prompt_bytes, ceiling):
+        probe=getattr(self.llm,'probe_free_capacity',None)
+        if not callable(probe):
+            return False
+        now=time.time()
+        queued=self.store.get('candidate_queue',[]) or []
+        if not any((row.get('expires_at') or 0)>now for row in queued):
+            return False
+        state=self.store.get('live_capacity_probe') or {}
+        attempts=int(state.get('attempts') or 0)
+        if attempts>=self.capacity_probe_cap or now-float(state.get('last_at') or 0)<self.capacity_probe_gap_seconds:
+            return False
+        try:
+            outcome=probe(images=images)
+        except sqlite3.Error:
+            raise
+        except Exception:
+            outcome=None
+        if isinstance(outcome, dict) and outcome.get('skipped'):
+            return False
+        admitted=bool(isinstance(outcome, dict) and outcome.get('admitted'))
+        self.store.put('live_capacity_probe', dict(
+            attempts=0 if admitted else attempts+1, last_at=now,
+            admitted=outcome.get('admitted') if admitted else None))
+        if admitted and callable(getattr(self.llm,'analysis_capacity',None)):
+            capacity=self.llm.analysis_capacity(prompt_bytes=prompt_bytes,
+                max_tokens=1100 if self.cfg.live_price_plan_enabled else 700,
+                images=images, ceiling=ceiling)
+            self.store.put('analysis_capacity', dict(capacity, probe_admitted=True))
+        return admitted
+
     def cycle(self):
         if not self._cycle_lock.acquire(blocking=False):
             return self.status('LIVE_ANALYSIS_BUSY')
@@ -727,16 +763,23 @@ class LiveRunner:
             waiting = set() if htf_zone_entries else {
                 row['symbol'] for row in watch_snapshot(self.store) if row['status']=='watching'}
 
-            count=min(8,getattr(self.cfg,'ai_parallel_candidates',1)) if callable(getattr(self.llm,'fork',None)) else 1
+            ceiling=min(8,getattr(self.cfg,'ai_parallel_candidates',1)) if callable(getattr(self.llm,'fork',None)) else 1
+            count=ceiling
             if self.cfg.ai_dynamic_parallel_enabled and callable(getattr(self.llm,'analysis_capacity',None)):
                 history=self.store.get('analysis_history',[])[-10:]
                 prompt_bytes=max([18000]+[row.get('prompt_bytes',0) for row in history])
+                images=control.get('version',self.cfg.analysis_version)=='vlm'
                 capacity=self.llm.analysis_capacity(prompt_bytes=prompt_bytes,
                     max_tokens=1100 if self.cfg.live_price_plan_enabled else 700,
-                    images=control.get('version',self.cfg.analysis_version)=='vlm',ceiling=count)
+                    images=images,ceiling=ceiling)
                 self.store.put('analysis_capacity',capacity)
                 count=capacity['parallel_candidates']
-                if count<=0:return self.status('HOLD_LIVE_AI_CAPACITY')
+                if count<=0 and self._capacity_probe(images, prompt_bytes, ceiling):
+                    count=1
+                elif count<=0:
+                    return self.status('HOLD_LIVE_AI_CAPACITY')
+                elif self.store.get('live_capacity_probe'):
+                    self.store.put('live_capacity_probe',{})
             if control.get('runner_id')=='runner3':
                 self._queue_reached_limits()
             queue=self.candidate_queue()

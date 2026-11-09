@@ -37,8 +37,8 @@ class GeminiClient:
     def _cooldown(self, key, seconds=60):
         self.store.put(key,time.time()+seconds)
 
-    def complete_json(self, *, system, user, max_tokens=800, images=None, request_timeout=None):
-        model=self.settings.gemini_vision_model if images else self.settings.gemini_text_model
+    def complete_json(self, *, system, user, max_tokens=800, images=None, request_timeout=None, capacity_probe=False):
+        model=self.settings.gemini_vision_model if images or (capacity_probe and getattr(self,'_probe_vision',False)) else self.settings.gemini_text_model
         key='gemini:retry_at:'+model
         started=time.monotonic()
         attempt=dict(provider='gemini',model=model,status='preparing',phase='prepare',
@@ -53,7 +53,7 @@ class GeminiClient:
             if not self.available:
                 self.last_status='missing_key'
                 return None
-            if time.time()<self.store.get(key,0):
+            if not capacity_probe and time.time()<self.store.get(key,0):
                 self.last_status='cooldown_skipped'
                 attempt['error_category']='rate_limit_cooldown'
                 return None
@@ -61,9 +61,10 @@ class GeminiClient:
             for path in images or []:
                 content.append({'type':'image_url','image_url':{'url':
                     'data:image/png;base64,'+base64.b64encode(Path(path).read_bytes()).decode('ascii')}})
+            completion=max_tokens if capacity_probe else max(self.settings.gemini_max_completion_tokens,max_tokens)
             payload=dict(model=model,messages=[{'role':'system','content':system},
                 {'role':'user','content':content}],response_format={'type':'json_object'},
-                max_tokens=max(self.settings.gemini_max_completion_tokens,max_tokens))
+                max_tokens=completion)
             if not self.can_call():
                 self.last_status='stopped'
                 return None
@@ -75,7 +76,7 @@ class GeminiClient:
                 for path in images or []:
                     parts.append({'inlineData':{'mimeType':'image/png','data':base64.b64encode(Path(path).read_bytes()).decode('ascii')}})
                 payload=dict(systemInstruction={'parts':[{'text':system}]},contents=[{'role':'user','parts':parts}],
-                    generationConfig={'maxOutputTokens':max(self.settings.gemini_max_completion_tokens,max_tokens),
+                    generationConfig={'maxOutputTokens':completion,
                                       'thinkingConfig':{'thinkingLevel':'minimal'}})
                 endpoint='https://generativelanguage.googleapis.com/v1beta/models/'+model+':generateContent'
                 headers={'x-goog-api-key':self.settings.gemini_api_key}

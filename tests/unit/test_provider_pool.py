@@ -536,3 +536,63 @@ def test_opportunistic_vision_probe_is_one_free_attempt_without_paid_fallback(tm
     assert len(calls)==1
     assert p.last_trace['attempts'][0]['generation_requests']==1
     assert calls[0].extensions['timeout']['read']<=8
+
+
+def _exhaust(pool, store):
+    now=time.time()
+    for slot in pool._slots:
+        store.put(pool._quota_key(slot, False), dict(
+            rows=[dict(id='spent', at=now, tokens=10, usage_known=True)], retry_at=now+3600))
+
+
+def test_zero_estimate_probe_uses_the_route_that_answers_and_hold_does_not_fall_back(tmp_path):
+    from trading.evaluation.service import ModelDecision
+    calls=[]
+    hold=dict(action='hold', signal_id=None, rationale='Geçerli bekleme kararı.',
+              invalidation='Kurulum bozulursa bekleme biter.', watch_note='')
+
+    def transport(request):
+        calls.append(request)
+        body=json.loads(request.content)
+        user=body['messages'][1]['content']
+        text=user if isinstance(user, str) else user[0]['text']
+        if 'Return exactly' in text:
+            assert body['max_completion_tokens']<=256
+            assert len(request.content)<2000
+            return response('hold')
+        return httpx.Response(200, json=dict(choices=[dict(message=dict(content=json.dumps(hold)))],
+            usage=dict(prompt_tokens=10, completion_tokens=5)))
+
+    p, store=pool(tmp_path, settings(groq_api_key_2='private-groq-key-2', groq_quota_group_2='separate',
+        groq_rpd=1, anthropic_api_key='paid', ai_claude_fallback_enabled=True), transport)
+    p.claude.complete_json=lambda **kw: pytest.fail('paid claude stays off')
+    _exhaust(p, store)
+    assert p.analysis_capacity(prompt_bytes=100)['free_slots']==0
+    probed=p.probe_free_capacity()
+    assert probed['admitted']=='groq-1' and len(calls)==1
+    assert calls[0].headers['authorization']=='Bearer private-groq-key-1'
+    assert p.analysis_capacity(prompt_bytes=100)['free_slots']==1
+    p.response_validator=ModelDecision.model_validate
+    child=p.fork()
+    child.claude.complete_json=lambda **kw: pytest.fail('paid claude stays off')
+    assert child.complete_json(system='s', user='market context')['action']=='hold'
+    assert len(calls)==2
+    assert calls[1].headers['authorization']=='Bearer private-groq-key-1'
+    assert child.last_credential_id=='groq-1'
+
+
+def test_failed_capacity_probe_does_not_admit_or_call_paid_claude(tmp_path):
+    calls=[]
+    def transport(request):
+        calls.append(request.headers['authorization'])
+        return httpx.Response(503, json={'error': {'message': 'down'}})
+
+    p, store=pool(tmp_path, settings(groq_api_key_2='private-groq-key-2', groq_quota_group_2='separate',
+        groq_rpd=1, anthropic_api_key='paid', ai_claude_fallback_enabled=True), transport)
+    p.claude.complete_json=lambda **kw: pytest.fail('paid claude stays off')
+    _exhaust(p, store)
+    assert p.probe_free_capacity()['admitted'] is None
+    assert calls==['Bearer private-groq-key-1']
+    assert p.analysis_capacity(prompt_bytes=100)['free_slots']==0
+    assert p.probe_free_capacity()['admitted'] is None
+    assert calls==['Bearer private-groq-key-1', 'Bearer private-groq-key-2']
