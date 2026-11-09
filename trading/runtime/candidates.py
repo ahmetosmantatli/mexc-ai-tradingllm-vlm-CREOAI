@@ -47,11 +47,24 @@ class CandidateQueue:
             self.store.put('candidate_queue',rows)
             eligible=[r for r in rows if r.get('lease_until',0)<=now and r['signal']['symbol'] not in open_symbols and r['signal'].get('features',{}).get('dedup_key') not in seen]
             if htf_zone_entries is not None:
-                eligible = [r for r in eligible if r['signal']['features'].get('watch_review')
-                            or bool(r['signal']['features'].get('htf_zone_seed')) == htf_zone_entries]
+                def _kept(row):
+                    features=row['signal'].get('features') or {}
+                    return bool(features.get('watch_review') or features.get('local_limit_review')
+                                or bool(features.get('htf_zone_seed')) == htf_zone_entries)
+                eligible=[row for row in eligible if _kept(row)]
             if not eligible:
                 return None
-            row=min(eligible,key=lambda r:(not bool(r['signal'].get('features',{}).get('watch_review')),r['last_considered_at'],r['first_seen'],-r['signal']['confidence'],r['key']))
+            def _rank(row):
+                if not htf_zone_entries:
+                    return 0.
+                try:
+                    return float((row['signal'].get('features') or {}).get('capital_rank') or 0)
+                except (TypeError, ValueError):
+                    return 0.
+            row=min(eligible,key=lambda r:(
+                not bool((r['signal'].get('features') or {}).get('watch_review')
+                         or (r['signal'].get('features') or {}).get('local_limit_review')),
+                -_rank(r), r['last_considered_at'], r['first_seen'], -r['signal']['confidence'], r['key']))
             # Reserve consideration before slow provider work; concurrent scans
             # preserve this timestamp, so a refreshed top signal cannot starve peers.
             row['last_considered_at']=now

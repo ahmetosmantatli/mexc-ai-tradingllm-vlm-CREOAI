@@ -65,7 +65,8 @@ COMMON_POLICY=(
     'Prefer HOLD while the thesis remains valid; ordinary noise alone is not a reason to tighten. '
     'Choose review timeframe appropriate to the entry structure. Consider elapsed bars, new confirmed structure, '
     'volatility, distance to liquidity/target and R, rather than fixed profit percentages. '
-    'A move_stop must tighten the current stop, never widen risk; supply stop_reference {timeframe,open_time,field} '
+    'A move_stop must tighten the current stop and must never widen it past the initial invalidation; '
+    'supply stop_reference {timeframe,open_time,field} '
     'from observed recent_ohlcv UTC-open seconds, low for LONG/high for SHORT. Stop beyond that wick by at most '
     'one recent average true range and on the safe side of current executable AND fair price. '
     'reduce uses close_fraction of CURRENT remaining contracts (0<f<1), close uses 1. '
@@ -301,6 +302,9 @@ class LivePositionManager:
                     raise ValueError('management stop buffer invalid')
                 if not (stop<decision.stop_price<min(quote.bid1,quote.raw['fairPrice']) if long else stop>decision.stop_price>max(quote.ask1,quote.raw['fairPrice'])):
                     raise ValueError('management stop must tighten')
+                initial = proposal['stop_loss']['price']
+                if long and decision.stop_price < initial or not long and decision.stop_price > initial:
+                    raise ValueError('management stop widened past invalidation')
             if decision.action=='move_target':
                 if not position_card['target_extension_available']:
                     raise ValueError('management target extension unavailable')

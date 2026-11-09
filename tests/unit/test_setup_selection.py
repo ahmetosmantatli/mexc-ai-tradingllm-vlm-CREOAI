@@ -172,7 +172,10 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
         last_trace={'attempts':[{'generation_requests':1,'status':'success'}]}
         def complete_json(self,**kw):
             data=json.loads(kw['user']);assert data['candidate']['side']=='short'
-            assert bool(kw['images']) == (runner_id=='runner3')
+            if runner_id=='runner3' and kw.get('images'):
+                assert data['account']['text_model_decision']['action']=='trade'
+            else:
+                assert not kw.get('images')
             family='pullback' if runner_id=='runner3' else 'trend_continuation'
             option=next(o for o in data['account']['setup_selection']['options'] if o['family']==family and o['state']=='ready')
             return dict(action='trade',signal_id=data['candidate']['signal_id'],setup_id=option['setup_id'],
@@ -216,8 +219,8 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
         assert row['proposal']['metadata']['decision_ai']['review_mode']=='vlm'
 
 
-@pytest.mark.parametrize('probe_result', ['valid', 'invalid', 'unavailable'])
-def test_runner3_text_mode_prefers_valid_vision_and_keeps_single_decision(tmp_path, monkeypatch, probe_result):
+@pytest.mark.parametrize('vlm_result', ['valid', 'invalid'])
+def test_runner3_text_decides_first_and_valid_vision_replaces_it(tmp_path, monkeypatch, vlm_result):
     from .test_structure_setups import htf_zone_context
 
     market = htf_zone_context('4h','15m')
@@ -231,30 +234,32 @@ def test_runner3_text_mode_prefers_valid_vision_and_keeps_single_decision(tmp_pa
         budget = None
         last_status = 'success'
         last_provider = 'mock'
-        last_model = 'vision-model'
+        last_model = 'text-model'
         last_trace = {}
         deadline = None
 
         def __init__(self):
             self.calls = []
 
-        def complete_vision_probe(self, **request):
-            self.calls.append(request)
-            self.last_trace = {'attempts':[{'generation_requests':int(probe_result != 'unavailable'),
-                                           'status':'quota_skipped' if probe_result == 'unavailable' else 'success'}]}
-            if probe_result == 'unavailable':
-                return None
-            return {'action':'hold', 'rationale':'Bekleme kararı.'} if probe_result == 'invalid' else self.hold()
-
         def complete_json(self, **request):
             self.calls.append(request)
-            self.last_model = 'text-model'
             self.last_trace = {'attempts':[{'generation_requests':1,'status':'success'}]}
-            return self.hold()
+            if request.get('images'):
+                self.last_model = 'vision-model'
+                if vlm_result == 'invalid':
+                    return {'action':'hold', 'rationale':'Bekleme kararı.'}
+                return self.vision()
+            self.last_model = 'text-model'
+            return self.text()
 
         @staticmethod
-        def hold():
-            return dict(action='hold',signal_id=None,rationale='Alt zaman dilimi teyidi bekleniyor.',
+        def text():
+            return dict(action='hold',signal_id=None,rationale='Metin modeli sayısal kurulumu bekletiyor.',
+                        invalidation='Bölge geçersiz olursa takip biter.',watch_note='')
+
+        @staticmethod
+        def vision():
+            return dict(action='hold',signal_id=None,rationale='Grafik modeli aynı kurulumu ayrıca bekletiyor.',
                         invalidation='Bölge geçersiz olursa takip biter.',watch_note='')
 
     model = Model()
@@ -269,20 +274,17 @@ def test_runner3_text_mode_prefers_valid_vision_and_keeps_single_decision(tmp_pa
         live_account_context=dict(mode='LIVE',currency='USDT',runner_id='runner3',current_equity=11.58,available_usdt=11.58),
         live_positions={})
     assert result.hold_reason == 'hold'
-    assert model.calls[0]['images'] and json.loads(model.calls[0]['user'])['version']=='vlm'
-    expected='vlm' if probe_result=='valid' else 'text'
+    assert model.calls[0].get('images') is None and json.loads(model.calls[0]['user'])['version']=='text'
+    assert 'text_model_decision' not in json.loads(model.calls[0]['user'])['account']
+    vision_packet = json.loads(model.calls[1]['user'])
+    assert model.calls[1]['images'] and vision_packet['version']=='vlm'
+    assert vision_packet['account']['text_model_decision']['rationale'].startswith('Metin modeli')
+    expected = 'vlm' if vlm_result == 'valid' else 'text'
     assert result.metadata['decision_ai']['review_mode']==expected
+    assert result.metadata['rationale'].startswith('Grafik modeli' if expected=='vlm' else 'Metin modeli')
     trace=store.get('analysis_trace')
     assert trace['decision_mode']==expected
-    assert [attempt['review_mode'] for attempt in trace['attempts']]==(['vlm'] if expected=='vlm' else ['vlm','text'])
-    if expected=='text':
-        assert len(model.calls)==2 and model.calls[1]['images'] is None
-        vision, text=(json.loads(call['user']) for call in model.calls)
-        vision.pop('version')
-        text.pop('version')
-        assert vision==text
-    else:
-        assert len(model.calls)==1
+    assert [attempt['review_mode'] for attempt in trace['attempts']]==['text','vlm']
 
 
 @pytest.mark.parametrize('invalid_trigger',[False, True])

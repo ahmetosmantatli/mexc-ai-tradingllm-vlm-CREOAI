@@ -214,6 +214,7 @@ class MarketScanner:
     def _htf_candidates(self,symbol,ticker,fee_free):
         from trading.analysis.market import build_bundle
         from trading.quant.structure_setups import SECONDS, build_htf_zone_setups
+        from trading.runtime.runner3_policy import evidence_grade
 
         bundle=build_bundle(self.client,symbol,include_hourly=True)
         market=bundle.to_context(ict=True,htf_history=True)
@@ -225,6 +226,7 @@ class MarketScanner:
                 continue
             frame=setup['trigger_timeframe']
             closed_at=setup['source_closed_at']
+            grade=evidence_grade(setup)
             signals.append(CandidateSignal(symbol=symbol,side=setup['side'],strategy=StrategyName.STRUCTURE_SETUP,
                 entry_price=setup['entry_reference'],stop_loss_price=setup['stop_loss_price'],
                 take_profit_price=setup['take_profit_price'],confidence=.75,
@@ -232,6 +234,9 @@ class MarketScanner:
                 rationale=f"{setup['context_timeframe']} bölgesi ve {frame} kapanış teyidi.",
                 features=dict(structure_seed=True,setup_family=setup['family'],setup_id=setup['setup_id'],
                     htf_zone_seed=True,seed_timeframe=frame,observed_spread_bps=ticker.spread_bps,
+                    capital_rank=float(setup['reward_risk'])*(1.25 if grade=='strong' else 1),
+                    evidence_grade=grade,evidence_kind=setup['evidence'].get('kind'),
+                    reward_risk=setup['reward_risk'],
                     source_open_at=closed_at-SECONDS[frame],source_closed_at=closed_at)))
         now=market['observed_at']
         touched=any(setup['state']=='watch' and setup['evidence'].get('touch_at') for setup in options)

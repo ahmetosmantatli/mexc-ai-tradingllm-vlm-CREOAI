@@ -38,6 +38,44 @@ def pool(tmp_path,cfg=None,transport=None):
     return ProviderPool(cfg,Budget(store,cfg),store,client),store
 
 
+def test_provider_error_tries_the_next_free_route_and_a_valid_hold_does_not(tmp_path):
+    from trading.evaluation.service import ModelDecision
+
+    hold = dict(action='hold', signal_id=None, rationale='Geçerli bekleme kararı.',
+                invalidation='Kurulum bozulursa bekleme biter.', watch_note='')
+
+    def payload(body):
+        return httpx.Response(200, json=dict(choices=[dict(message=dict(content=json.dumps(body)))],
+                                              usage=dict(prompt_tokens=10, completion_tokens=5)))
+
+    calls = []
+
+    def transport(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(500, json={'error': {'message': 'down'}})
+        return payload(hold)
+
+    failed, _store = pool(tmp_path / 'error', settings(groq_api_key_2='private-groq-key-2'), transport)
+    failed.response_validator = ModelDecision.model_validate
+    failed.claude.complete_json = lambda **kwargs: pytest.fail('the next free route answered')
+    assert failed.complete_json(system='s', user='u')['action'] == 'hold'
+    assert len(calls) == 2 and failed.last_credential_id == 'groq-2'
+
+    calls.clear()
+
+    def hold_only(request):
+        calls.append(request)
+        return payload(hold)
+
+    held, _store = pool(tmp_path / 'hold', settings(
+        groq_api_key_2='private-groq-key-2', anthropic_api_key='paid', ai_claude_fallback_enabled=True), hold_only)
+    held.response_validator = ModelDecision.model_validate
+    held.claude.complete_json = lambda **kwargs: pytest.fail('valid BEKLE must not start fallback')
+    assert held.complete_json(system='s', user='u')['action'] == 'hold'
+    assert len(calls) == 1 and held.last_credential_id == 'groq-1'
+
+
 def test_valid_hold_never_uses_other_key_or_paid_fallback_and_records_no_secrets(tmp_path):
     calls=[]
     p,store=pool(tmp_path,settings(groq_api_key_2='private-groq-key-2',groq_quota_group_2='separate-project',anthropic_api_key='private-paid-key',ai_claude_fallback_enabled=True),

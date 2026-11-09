@@ -254,6 +254,14 @@ def economic_review_key(account,positions):
     risk settings and objective policy changes do.
     """
     stable={key:value for key,value in account.items() if key not in ('equity','operating_context')}
+    allocation=stable.get('capital_allocation')
+    if isinstance(allocation, dict):
+        # Floating equity and pnl must not schedule another review by themselves.
+        stable['capital_allocation']={key:value for key,value in allocation.items()
+                                      if key not in ('equity_usdt','available_usdt')}
+        stable['capital_allocation']['open_positions']=[
+            {key:value for key,value in row.items() if key!='unrealized_pnl'}
+            for row in allocation.get('open_positions') or [] if isinstance(row, dict)]
     selection=stable.get('setup_selection')
     if isinstance(selection,dict):
         stable['setup_selection']={**selection,'options':[{key:row.get(key) for key in ('setup_id','family','side','state')} for row in selection.get('options',[])]}

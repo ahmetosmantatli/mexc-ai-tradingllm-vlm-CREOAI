@@ -150,9 +150,17 @@ class LiveRunner:
             metadata=proposal.get('metadata',{})
             levels=intent.get('current_protection') or {}
             stop,target=levels.get('stop',proposal.get('stop_loss',{}).get('price')),levels.get('target',proposal.get('take_profit_price'))
-            result[row['symbol']]=dict(row,symbol=row['symbol'],side='long' if row['side']==1 else 'short',
-                entry=row['entry'],leverage=row['leverage'],unrealized=row['unrealized'],
-                stop=stop,target=target,
+            side_name='long' if row['side']==1 else 'short'
+            entry=row.get('entry')
+            remaining=None
+            if all(isinstance(value,(int,float)) and not isinstance(value,bool) for value in (entry,stop,target)):
+                span=abs(entry-stop)
+                room=(target-entry) if side_name=='long' else (entry-target)
+                remaining=dict(to_target_price=room, to_target_r=(room/span) if span else None)
+            thesis=proposal.get('rationale') or (metadata.get('price_plan') or {}).get('reason') or ''
+            result[row['symbol']]=dict(row,symbol=row['symbol'],side=side_name,
+                entry=entry,leverage=row['leverage'],unrealized=row['unrealized'],
+                stop=stop,target=target,thesis=str(thesis)[:500],remaining_room=remaining,
                 risk=proposal.get('max_loss_if_stopped'),notional=proposal.get('notional'),
                 initial_stop=proposal.get('stop_loss',{}).get('price'),decision_ai=metadata.get('decision_ai',{}),
                 strategy=metadata.get('strategy'),analysis_version=metadata.get('analysis_version'))
@@ -239,6 +247,92 @@ class LiveRunner:
     def _watch_candidates(self):
         from trading.runtime.live_watch import LiveWatchReviewer
         return LiveWatchReviewer(self).collect()
+
+    def _queued_confirmed_plans(self):
+        plans=[]
+        for row in self.store.get('candidate_queue', []):
+            signal=row.get('signal') or {}
+            features=signal.get('features') or {}
+            if not features.get('htf_zone_seed') or features.get('local_limit_review'):
+                continue
+            plans.append(dict(symbol=signal.get('symbol'), side=signal.get('side'),
+                setup_id=features.get('setup_id'), timeframe=features.get('seed_timeframe'),
+                capital_rank=features.get('capital_rank'), reward_risk=features.get('reward_risk'),
+                grade=features.get('evidence_grade'), evidence_kind=features.get('evidence_kind'),
+                rationale=signal.get('rationale')))
+        return runner3_policy.rank_confirmed_plans(plans)
+
+    def _queue_reached_limits(self):
+        from datetime import datetime, timezone
+        from trading.evaluation.local_limits import claim_reached
+        from trading.models.domain import Side
+        from trading.quant.signals import CandidateSignal, StrategyName
+        due=claim_reached(self.store, lambda symbol: self.quote(symbol).last_price)
+        if not due:
+            return
+        now=time.time()
+        signals=[]
+        for row in due:
+            price=row['trigger_price']
+            long=row['side']=='long'
+            signals.append(CandidateSignal(
+                symbol=row['symbol'], side=Side(row['side']), strategy=StrategyName.STRUCTURE_SETUP,
+                entry_price=price,
+                stop_loss_price=price*(0.98 if long else 1.02),
+                take_profit_price=price*(1.02 if long else 0.98),
+                confidence=1.,
+                rationale='Yerel limit fiyatına gelindi. Teyit olmadan emir yok. '+str(row.get('rationale') or ''),
+                created_at=datetime.now(timezone.utc),
+                features=dict(local_limit_review=True, htf_zone_seed=True, structure_seed=True,
+                    seed_timeframe=row.get('trigger_timeframe') or '15m',
+                    source_open_at=now-60, source_closed_at=now-1,
+                    capital_rank=row.get('cost_adjusted_r') or 0,
+                    dedup_key='local-limit:'+row['id'], setup_id=row.get('setup_id'))))
+        self.candidate_queue().refresh(signals, refreshed_symbols=set())
+
+    def _rotation_allowed(self, symbol, snapshot, result, control):
+        """A market close needs an invalidated thesis and no free margin for the new plan."""
+        if not result.metadata.get('thesis_invalidated'):
+            return False
+        position=self._positions(snapshot).get(symbol)
+        if not position:
+            return False
+        try:
+            price=self.quote(symbol).last_price
+        except Exception:
+            return False
+        if not runner3_policy.thesis_invalidated(position, price):
+            return False
+        setup=result.metadata.get('setup_selection') or {}
+        grade='standard'
+        if setup.get('evidence'):
+            try:
+                grade=runner3_policy.evidence_grade(setup)
+            except (KeyError, TypeError):
+                grade='standard'
+        horizon=setup.get('horizon') if setup.get('horizon') in ('scalp', 'intraday', 'swing') else 'intraday'
+        try:
+            allocation=runner3_policy.margin_policy(snapshot['balance']['equity'], self._capital(snapshot, control),
+                snapshot['balance']['available'], grade, horizon)
+        except ValueError:
+            return False
+        return allocation['max_entry_cost_usdt']<=0
+
+    def _release_confirmed(self, symbol):
+        """Close one open trade with the existing writer. True only after the exchange confirms."""
+        try:
+            state=self.request_close(symbol)
+        except Exception:
+            return False
+        if state.get('status')!='closed' and state.get('intent_id') and callable(getattr(self.executor,'reconcile',None)):
+            try:
+                state=self.executor.reconcile(state['intent_id'])
+            except Exception:
+                return False
+        if state.get('status')!='closed':
+            return False
+        snapshot=self._refresh()
+        return not any(row.get('symbol')==symbol for row in snapshot.get('positions', []))
 
     def scan_market(self):
         if not self._scan_lock.acquire(blocking=False):
@@ -327,9 +421,21 @@ class LiveRunner:
                 minimum_stop_liquidation_buffer_fraction=self.cfg.liquidation_buffer_pct,
                 fee_rate=self.cfg.paper_fee_rate,slippage_bps=self.cfg.paper_slippage_bps,
                 note='Maximum is an upper bound, not a target. Use a validated grounded price plan only when price planning is enabled, otherwise keep quant levels. Preserve loss budget and liquidation buffer; choose lower leverage or HOLD when incompatible.')
+            live_positions=self._positions(snapshot)
+            if control.get('runner_id')=='runner3':
+                briefs=[]
+                for row in live_positions.values():
+                    brief=runner3_policy.position_brief(row)
+                    try:
+                        brief['mark']=self.quote(row['symbol']).last_price
+                    except Exception:
+                        brief['mark']=None
+                    briefs.append(brief)
+                live_context['open_position_briefs']=briefs
+                live_context['queued_confirmed_plans']=self._queued_confirmed_plans()
             return evaluator.evaluate_candidates([candidate],equity=capital,risk_per_trade_pct=self._risk_fraction(control),
                 target_leverage=self._leverage_cap(control,exchange_cap),risk_profile=self.cfg.risk_profile.value,
-                live_account_context=live_context,live_positions=self._positions(snapshot))
+                live_account_context=live_context,live_positions=live_positions)
         finally:
             if child is not self.llm and callable(getattr(child,'close',None)):
                 child.close()
@@ -354,23 +460,35 @@ class LiveRunner:
             runner3_policy.validate_evidence(setup,MarketPricePlan.model_validate(result.metadata['price_plan']))
         if result.metadata.get('price_plan') is not None:
             if not self.cfg.live_price_plan_enabled:raise ValueError('live model price planning disabled')
+            fresh_quote=ticker.ask1 if candidate.side.value=='long' else ticker.bid1
+            drift_cap=.005
+            if runner_id=='runner3':
+                raw_plan=result.metadata['price_plan']
+                planned=raw_plan.entry_price if hasattr(raw_plan,'entry_price') else raw_plan['entry_price']
+                planned_stop=raw_plan.stop_loss_price if hasattr(raw_plan,'stop_loss_price') else raw_plan['stop_loss_price']
+                drift_cap=abs(planned-planned_stop)/planned
             planning_candidate=apply_market_price_plan(candidate,result.metadata['price_plan'],result.metadata.get('price_evidence') or {},
-                price_step=rules.price_step,current_price=ticker.ask1 if candidate.side.value=='long' else ticker.bid1,now=time.time())
+                price_step=rules.price_step,current_price=fresh_quote,now=time.time(),max_entry_drift=drift_cap)
         proposal=apply_decision_sizing(planning_candidate,result.metadata.get('sizing_plan'),self._capital(snapshot,control),
             self._risk_fraction(control),self._leverage_cap(control,exchange_cap),exchange_cap)
-        drift_limit = min(planning_candidate.stop_distance_pct / 2, .005)
-        if abs(ticker.last_price / planning_candidate.entry_price - 1) > drift_limit:
-            raise EntryPriceDrift('live entry price drift', stage='planning', planned=planning_candidate.entry_price,
-                                  observed=ticker.last_price, tolerance=drift_limit)
+        if runner_id!='runner3':
+            drift_limit = min(planning_candidate.stop_distance_pct / 2, .005)
+            if abs(ticker.last_price / planning_candidate.entry_price - 1) > drift_limit:
+                raise EntryPriceDrift('live entry price drift', stage='planning', planned=planning_candidate.entry_price,
+                                      observed=ticker.last_price, tolerance=drift_limit)
         entry=ticker.ask1 if candidate.side.value=='long' else ticker.bid1
         slip=self.cfg.paper_slippage_bps/10000;fee=self.cfg.paper_fee_rate
+        planned_entry=planning_candidate.entry_price
         if runner_id == 'runner3':
             fee = getattr(self.executor, 'fee', fee)
             slip = getattr(self.executor, 'slip', slip)
             gross_target, expected_net, unit_loss = runner3_policy.ioc_target_economics(
                 side=candidate.side.value, entry=entry, stop=proposal.stop_loss.price,
                 target=proposal.take_profit_price, fee=fee, slippage=slip)
-            loss_fraction = unit_loss / entry
+            _, _, planned_unit = runner3_policy.ioc_target_economics(
+                side=candidate.side.value, entry=planned_entry, stop=proposal.stop_loss.price,
+                target=proposal.take_profit_price, fee=fee, slippage=slip)
+            loss_fraction = planned_unit / planned_entry
         else:
             worst_entry=entry*(1+slip if candidate.side.value=='long' else 1-slip)
             stop=proposal.stop_loss.price*(1-slip if candidate.side.value=='long' else 1+slip)
@@ -398,20 +516,43 @@ class LiveRunner:
             risk_adjustment = dict(macro_trend=setup['macro_trend'], model_risk_fraction=model_fraction,
                 effective_risk_fraction=effective, risk_ceiling=ceiling,
                 risk_boost_applied=effective > model_fraction, small_account_policy=target_risk is not None)
-        limits=dict(model_stop_budget=proposal.notional,stop_budget_with_costs=proposal.max_loss_if_stopped/loss_fraction,
-                    available_margin=snapshot['balance']['available']/margin_rate*.95)
+        limits=dict(model_stop_budget=proposal.notional,stop_budget_with_costs=proposal.max_loss_if_stopped/loss_fraction)
+        if runner_id!='runner3':
+            limits['available_margin']=snapshot['balance']['available']/margin_rate*.95
         if runner_id=='runner3':
             runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
             allocation=runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
                 snapshot['balance']['available'],grade,setup['horizon'])
-            limits['runner3_margin_policy']=allocation['max_entry_cost_usdt']/margin_rate
-            if limits['runner3_margin_policy']<=0:
+            free_margin=snapshot['balance']['available']-allocation['reserve_usdt']
+            if free_margin<=0:
                 raise ValueError('runner3_margin_reserve')
+        _,notional=rules.size_order(min(limits.values()),planned_entry if runner_id=='runner3' else entry,1 if runner_id=='runner3' else proposal.leverage)
+        proposal.notional=notional
+        if runner_id=='runner3':
+            quantity=notional/planned_entry
+            plan=result.metadata['price_plan']
+            reference=plan.stop_reference if hasattr(plan,'stop_reference') else plan['stop_reference']
+            extreme=runner3_policy.confirming_extreme(reference,result.metadata.get('price_evidence') or {})
+            if not runner3_policy.drift_respects_choch_risk(
+                    side=candidate.side.value,fresh_entry=entry,stop=proposal.stop_loss.price,
+                    target=proposal.take_profit_price,choch_extreme=extreme,quantity=quantity,
+                    risk_budget=proposal.max_loss_if_stopped,fee=fee,slippage=slip):
+                raise EntryPriceDrift('live entry price drift',stage='planning',planned=planned_entry,
+                                      observed=entry,tolerance=abs(entry/planned_entry-1))
+            proposal.notional=quantity*entry
+            proposal.entry_price=entry
+            leverage,margin,sized=runner3_policy.leverage_for_choch_loss(
+                notional=proposal.notional,entry=entry,stop=proposal.stop_loss.price,free_margin=free_margin,
+                equity=snapshot['balance']['equity'],max_leverage=min(self._leverage_cap(control,exchange_cap),exchange_cap),
+                maintenance=max(rules.maintenance,private_risk['maintenance_rate'],private_leverage['maintenance_rate']),
+                initial_rate=private_risk['initial_rate'],fee=fee,liquidation_buffer=self.cfg.liquidation_buffer_pct)
+            if sized<proposal.notional-1e-8:
+                _,proposal.notional=rules.size_order(sized,entry,leverage)
+            proposal.leverage=leverage
             proposal.metadata['runner3_allocation']=dict(allocation,limiting_factor=min(limits,key=limits.get),
+                free_margin_usdt=free_margin,initial_margin_usdt=margin,chosen_leverage=leverage,
                 setup_id=setup['setup_id'],evidence_expires_at=setup['evidence'].get('expires_at'),
                 calibrated_probability=None,expected_target_net_r=expected_net/unit_loss,**risk_adjustment)
-        _,notional=rules.size_order(min(limits.values()),entry,proposal.leverage)
-        proposal.notional=notional
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)
         proposal.metadata.update(price_plan=result.metadata.get('price_plan'),price_source='model' if result.metadata.get('price_plan') else 'quant',
             runner_id=runner_id,
@@ -482,6 +623,16 @@ class LiveRunner:
         if selected.side!=candidate.side and not result.metadata.get('setup_selection'):
             return finish('HOLD_LIVE_UNVALIDATED_MODEL')
         proposal=self._final_proposal(selected,result,snapshot,control)
+        release=result.metadata.get('release_symbol')
+        if release and not self._rotation_allowed(release, snapshot, result, control):
+            release=None
+        if release:
+            if not self._release_confirmed(release):
+                return finish('HOLD_LIVE_CLOSE_UNCONFIRMED')
+            snapshot=self._refresh([candidate.symbol])
+            if snapshot['balance']['available']<=0:
+                return finish('HOLD_LIVE_NO_FUNDS')
+            proposal=self._final_proposal(selected,result,snapshot,control)
         # Execution performs its own fresh account/risk/quote and grant checks.
         self.executor.allowed_capital = (
             None if control.get('allocation_mode') in ('full','all','entire')
@@ -508,11 +659,16 @@ class LiveRunner:
                 and latest['revision']==card['revision'] and latest.get('last_action')=='trade'
                 and time.time()-started<=self.cfg.decision_ttl_seconds)
         self.executor.can_execute=current
+        pending=result.metadata.get('pending_vlm')
+        if pending is not None:
+            pending.arm_send()
         try:
             state=self.executor.execute(intent['intent_id'])
         finally:
             self.executor.can_execute=original
         if state.get('status')=='protected':
+            from trading.evaluation.local_limits import consume_symbol
+            consume_symbol(self.store, candidate.symbol)
             with self.lock:
                 self.store.put('live_seen',(self.store.get('live_seen',[])+[candidate.features['dedup_key']])[-2000:])
                 coordinator.terminate(candidate.symbol,'position_opened',expected_revision=card['revision'])
@@ -541,7 +697,11 @@ class LiveRunner:
             if callable(getattr(self.executor,'entry_ready',None)) and not self.executor.entry_ready():
                 return self.status('HOLD_LIVE_START_REQUIRED')
             snapshot=self._refresh()
-            if snapshot['balance']['equity']<=0 or snapshot['balance']['available']<=0:
+            equity=snapshot['balance']['equity']
+            available=snapshot['balance']['available']
+            # Margin already in positions is not an empty book. Runner 3 can ask
+            # which open trade to close. A resting local limit never reserves cash.
+            if equity<=0 or (available<=0 and not (control.get('runner_id')=='runner3' and snapshot.get('positions'))):
                 return self.status('HOLD_LIVE_NO_FUNDS')
             risk=observe_risk_reference(self.store,self.binding_id,snapshot['balance']['equity'])
             preset = self.risk.preset
@@ -567,6 +727,8 @@ class LiveRunner:
                 self.store.put('analysis_capacity',capacity)
                 count=capacity['parallel_candidates']
                 if count<=0:return self.status('HOLD_LIVE_AI_CAPACITY')
+            if control.get('runner_id')=='runner3':
+                self._queue_reached_limits()
             queue=self.candidate_queue()
             for _ in range(count):
                 candidate=queue.next(open_symbols=set(self._positions(snapshot))|waiting|{c.symbol for c in selected},
@@ -579,29 +741,46 @@ class LiveRunner:
                 return self.status('HOLD_LIVE_NO_CANDIDATE')
             snapshot=self._refresh([candidate.symbol for candidate in selected])
             outcomes=[]
+            finished=[]
             with ThreadPoolExecutor(max_workers=len(selected),thread_name_prefix='live-analysis') as pool:
                 jobs={pool.submit(self._evaluate,candidate,snapshot,control):candidate for candidate in selected}
                 for future in as_completed(jobs):
                     candidate=jobs[future]
-                    result=None
                     try:
-                        result=future.result()
-                        if result.metadata.get('provider_called') is not False:
-                            queue.evaluated(candidate)
-                        if getattr(result, 'hold_reason', None) == 'decision_expired' and result.metadata.get('analysis_trace_id'):
-                            self._record_entry_rejection(candidate, result.metadata['analysis_trace_id'],
-                                                         'HOLD_LIVE_DECISION_EXPIRED')
-                        outcomes.append(self._apply(candidate,result,control))
+                        finished.append((candidate, future.result(), None))
                     except sqlite3.Error:
                         raise
                     except Exception as exc:
-                        from trading.runtime.execution_diagnostics import safe_execution_error
-                        details=safe_execution_error(exc)
-                        reason='HOLD_LIVE_EXECUTION_'+details['code']
-                        self.store.put('live_candidate_error:'+candidate.symbol,dict(at=time.time(),**details))
-                        if result is not None and result.action.value=='trade':
-                            self._record_entry_rejection(candidate,result.metadata.get('analysis_trace_id'),reason,details)
-                        outcomes.append(self.status(reason))
+                        finished.append((candidate, None, exc))
+            if control.get('runner_id')=='runner3':
+                finished.sort(key=lambda item: (
+                    -float(item[0].features.get('capital_rank') or 0),
+                    item[0].symbol))
+            for candidate, result, exc in finished:
+                if exc is not None:
+                    from trading.runtime.execution_diagnostics import safe_execution_error
+                    details=safe_execution_error(exc)
+                    reason='HOLD_LIVE_EXECUTION_'+details['code']
+                    self.store.put('live_candidate_error:'+candidate.symbol,dict(at=time.time(),**details))
+                    outcomes.append(self.status(reason))
+                    continue
+                try:
+                    if result.metadata.get('provider_called') is not False:
+                        queue.evaluated(candidate)
+                    if getattr(result, 'hold_reason', None) == 'decision_expired' and result.metadata.get('analysis_trace_id'):
+                        self._record_entry_rejection(candidate, result.metadata['analysis_trace_id'],
+                                                     'HOLD_LIVE_DECISION_EXPIRED')
+                    outcomes.append(self._apply(candidate,result,control))
+                except sqlite3.Error:
+                    raise
+                except Exception as exc:
+                    from trading.runtime.execution_diagnostics import safe_execution_error
+                    details=safe_execution_error(exc)
+                    reason='HOLD_LIVE_EXECUTION_'+details['code']
+                    self.store.put('live_candidate_error:'+candidate.symbol,dict(at=time.time(),**details))
+                    if result is not None and result.action.value=='trade':
+                        self._record_entry_rejection(candidate,result.metadata.get('analysis_trace_id'),reason,details)
+                    outcomes.append(self.status(reason))
             return next((row for row in outcomes if row['reason']=='LIVE_PROTECTED'),outcomes[-1])
         except sqlite3.Error:
             raise
