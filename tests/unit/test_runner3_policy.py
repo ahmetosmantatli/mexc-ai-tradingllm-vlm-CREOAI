@@ -5,7 +5,7 @@ from trading.quant.structure_setups import build_structure_setups
 from .test_structure_setups import context,view
 
 
-def test_small_equity_margin_target_is_35_percent_strong_and_20_percent_standard():
+def test_small_equity_silent_fallback_is_35_percent_and_standard_stays_20_percent():
     strong=margin_policy(11,11,11,'strong','intraday')
     standard=margin_policy(11,11,11,'standard','intraday')
     assert strong['margin_fraction']==.35
@@ -254,3 +254,67 @@ def test_price_drift_diagnostics_capture_stage_and_signed_move():
     assert detail['code'] == 'ENTRY_PRICE_DRIFT'
     assert detail['price_drift'] == pytest.approx(dict(
         stage='planning', planned=100., observed=99.6, deviation=-.004, tolerance=.003))
+
+
+def test_text_model_share_replaces_the_guclu_fallback_and_invalid_does_not_grow():
+    from trading.runtime.runner3_policy import apply_guclu_margin_share, margin_policy
+
+    strong = margin_policy(50, 40, 50, 'strong', 'swing')
+    chosen = apply_guclu_margin_share(strong, equity=50, available=50, raw_share=.22)
+    assert chosen['margin_fraction'] == pytest.approx(.22)
+    assert chosen['target_margin_usdt'] == pytest.approx(11)
+    assert chosen['margin_share_source'] == 'model'
+    assert chosen['max_entry_cost_usdt'] == pytest.approx(11)
+    for raw in (None, 'high', True, 0, 1.2, float('nan'), float('inf')):
+        fallback = apply_guclu_margin_share(strong, equity=50, available=50, raw_share=raw)
+        assert fallback['margin_fraction'] == .35
+        assert fallback['target_margin_usdt'] == pytest.approx(17.5)
+        assert fallback['margin_share_source'] == 'fallback_35'
+    standard = apply_guclu_margin_share(
+        margin_policy(50, 50, 50, 'standard', 'intraday'), equity=50, available=50, raw_share=.5)
+    assert standard['margin_fraction'] == .20
+    assert standard['target_margin_usdt'] == pytest.approx(10)
+    assert 'margin_share_source' not in standard
+    large = apply_guclu_margin_share(
+        margin_policy(150, 150, 150, 'strong', 'intraday'), equity=150, available=150, raw_share=.5)
+    assert large['margin_fraction'] == .20
+    assert large['target_margin_usdt'] == pytest.approx(30)
+
+
+def test_guclu_packet_carries_the_label_evidence_and_account_goal():
+    from trading.runtime.runner3_policy import GUCLU_MARGIN_INSTRUCTION, guclu_margin_request
+
+    sweep = dict(evidence=dict(kind='sweep_mss_fvg_retest'), reward_risk=1.1,
+                 macro_trend='bearish', side='long', context_timeframe='4h', horizon='swing')
+    closed = dict(evidence=dict(kind='htf_zone_choch', context_last_break=dict(direction='bearish')),
+                  reward_risk=2.4, macro_trend='bearish', side='short', context_timeframe='1h', horizon='intraday')
+    standard = dict(evidence=dict(kind='htf_zone_mss'), reward_risk=3,
+                    macro_trend='bullish', side='long', context_timeframe='4h', horizon='swing')
+    positions = [dict(symbol='ETH_USDT', side='short')]
+    packet = guclu_margin_request(sweep, equity=11.5, free_margin=8.2, open_positions=positions, loss_ceiling_usdt=0.34)
+    assert packet['label'] == 'Güçlü'
+    assert packet['evidence'] == 'sweep+MSS+FVG retest'
+    assert packet['free_margin_usdt'] == 8.2
+    assert packet['equity_usdt'] == 11.5
+    assert packet['open_positions'] == positions
+    assert packet['open_positions'] is not positions
+    assert packet['choch_loss_ceiling_usdt'] == 0.34
+    assert packet['account_goal'] == 'grow the cash'
+    assert packet['time_horizon'] == '4h swing'
+    intraday = guclu_margin_request(closed, equity=40, free_margin=20, open_positions=[], loss_ceiling_usdt=0.4)
+    assert intraday['evidence'] == 'with-trend closed break and at least 2R'
+    assert intraday['time_horizon'] == '1h intraday'
+    assert guclu_margin_request(standard, equity=40, free_margin=20, open_positions=[], loss_ceiling_usdt=0.4) is None
+    assert '20%' in GUCLU_MARGIN_INSTRUCTION
+    assert '35%' in GUCLU_MARGIN_INSTRUCTION
+    assert 'Güçlü is not a fixed percent' in GUCLU_MARGIN_INSTRUCTION
+    assert '35% for Güçlü' not in GUCLU_MARGIN_INSTRUCTION
+
+
+def test_text_share_wins_over_a_later_sizing_plan():
+    from trading.runtime.runner3_policy import chosen_margin_share
+
+    assert chosen_margin_share({'guclu_margin_share': None, 'sizing_plan': {'margin_share': .9}}) is None
+    assert chosen_margin_share({'guclu_margin_share': .22, 'sizing_plan': {'margin_share': .9}}) == .22
+    assert chosen_margin_share({'sizing_plan': {'margin_share': .22}}) == .22
+    assert chosen_margin_share({'sizing_plan': {}}) is None

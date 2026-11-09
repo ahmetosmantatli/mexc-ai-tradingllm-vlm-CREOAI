@@ -10,6 +10,18 @@ MIN_NET_TARGET_R = 1.25
 MAX_COST_SHARE = .30
 SMALL_ACCOUNT_EQUITY_USDT = 100.
 MIN_OPEN_MARGIN_USDT = 1.
+GUCLU_MARGIN_FALLBACK = .35
+GUCLU_MARGIN_INSTRUCTION = (
+    'Under 100 USDT Standart margin stays 20% of equity. Güçlü is not a fixed percent. '
+    'When a setup carries guclu_margin_choice, that label, its evidence, free margin, equity, open positions, the CHoCH loss ceiling, and the account goal are for you, the text model. '
+    'The goal is to grow the cash over that setup horizon: 4h swing or 1h intraday. '
+    'Choose sizing_plan.margin_share as the fraction of equity for that Güçlü plan while equity is under 100 USDT. It must sit inside the CHoCH loss ceiling. '
+    'You cannot widen or tighten the CHoCH stop to make the position bigger. '
+    'Final size is the tightest of your share, the CHoCH loss ceiling, and free margin. '
+    'If margin_share is missing or invalid the engine uses 35% of equity and does not invent a larger share. '
+    'At or above 100 USDT the engine keeps its profile margin target. '
+    'You do not place the order. One writer does. '
+)
 
 
 def uses_fixed_position_limit(runner_id, equity):
@@ -37,6 +49,90 @@ def evidence_grade(setup):
     strong = kind == 'sweep_mss_fvg_retest' or (
         closed_break and payoff >= 2 and with_higher_timeframe)
     return 'strong' if strong else 'standard'
+
+
+def strong_evidence_label(setup):
+    """The evidence phrase sent with a Güçlü label. Standart has no phrase."""
+    try:
+        if evidence_grade(setup) != 'strong':
+            return None
+        kind = setup['evidence']['kind']
+    except (KeyError, TypeError):
+        return None
+    if kind == 'sweep_mss_fvg_retest':
+        return 'sweep+MSS+FVG retest'
+    return 'with-trend closed break and at least 2R'
+
+
+def setup_time_horizon(setup):
+    """4h swing or 1h intraday, from the lane the setup already belongs to."""
+    context = setup.get('context_timeframe')
+    horizon = setup.get('horizon')
+    if context == '4h' or (context is None and horizon == 'swing'):
+        return '4h swing'
+    if context == '1h' or (context is None and horizon == 'intraday'):
+        return '1h intraday'
+    if horizon == 'swing':
+        return '4h swing'
+    if horizon == 'intraday':
+        return '1h intraday'
+    return None
+
+
+def guclu_margin_request(setup, *, equity, free_margin, open_positions, loss_ceiling_usdt):
+    """Facts the text model needs before it chooses a Güçlü margin share."""
+    evidence = strong_evidence_label(setup)
+    if evidence is None:
+        return None
+    return dict(
+        label='Güçlü', evidence=evidence, free_margin_usdt=free_margin, equity_usdt=equity,
+        open_positions=list(open_positions or []), choch_loss_ceiling_usdt=loss_ceiling_usdt,
+        account_goal='grow the cash', time_horizon=setup_time_horizon(setup))
+
+
+def resolve_guclu_margin_share(value):
+    """Usable fraction of equity, or exactly 35%. Never a larger invented share."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return GUCLU_MARGIN_FALLBACK, 'fallback_35'
+    value = float(value)
+    if not isfinite(value) or not 0 < value <= 1:
+        return GUCLU_MARGIN_FALLBACK, 'fallback_35'
+    return value, 'model'
+
+
+def chosen_margin_share(metadata):
+    """Text-model share when the key is present, including an explicit silence.
+
+    A later chart decision can carry its own sizing plan. That plan does not
+    replace a share the text model already gave or withheld.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    if 'guclu_margin_share' in metadata:
+        return metadata.get('guclu_margin_share')
+    plan = metadata.get('sizing_plan')
+    if isinstance(plan, dict):
+        return plan.get('margin_share')
+    return getattr(plan, 'margin_share', None)
+
+
+def apply_guclu_margin_share(allocation, *, equity, available, raw_share):
+    """Use the text model's Güçlü share under 100 USDT.
+
+    Standart stays 20% of equity. At or above 100 the profile target stays.
+    Silence or an unusable share falls back to 35% of equity.
+    """
+    if allocation.get('grade') != 'strong':
+        return allocation
+    if isinstance(equity, bool) or not isinstance(equity, (int, float)) or not 0 < equity < SMALL_ACCOUNT_EQUITY_USDT:
+        return allocation
+    fraction, source = resolve_guclu_margin_share(raw_share)
+    target = equity * fraction
+    updated = dict(allocation)
+    updated.update(
+        margin_fraction=fraction, target_margin_usdt=target, margin_share_source=source,
+        max_entry_cost_usdt=max(0., min(target, available - allocation['reserve_usdt'])))
+    return updated
 
 
 def validate_evidence(setup, plan, now=None):
@@ -69,8 +165,9 @@ def margin_policy(equity, capital, available, grade, horizon):
         raise ValueError('runner3_invalid_margin_context')
     small_account = 0 < equity < SMALL_ACCOUNT_EQUITY_USDT
     if small_account:
-        # Share of equity. Güçlü is the larger share; Standart stays smaller.
-        fraction = .35 if grade == 'strong' else .20
+        # Standart is 20% of equity. 35% is only the silent Güçlü fallback.
+        # The text model's share replaces it before an order is sized.
+        fraction = GUCLU_MARGIN_FALLBACK if grade == 'strong' else .20
         target = equity * fraction
     else:
         fraction = .20 if grade == 'strong' else .10
@@ -128,8 +225,9 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
     """Lowest leverage that posts the tightest of the loss budget, margin target, and free margin.
 
     ``notional`` is the CHoCH stop-loss budget. It is a ceiling, not a reason to
-    move the stop. ``margin_target`` is the evidence share of equity. The size
-    cannot exceed either of those or free margin. Leverage is only raised far
+    move the stop. ``margin_target`` is the margin cap: Standart's 20% of equity,
+    the text model's Güçlü share, or the 35% fallback. The size cannot exceed
+    that cap, the loss budget, or free margin. Leverage is only raised far
     enough to post the loss-sized notional inside that margin cap. It is not
     10x and it is not the exchange maximum. A share under 1 USDT is rejected
     while equity is under 100.

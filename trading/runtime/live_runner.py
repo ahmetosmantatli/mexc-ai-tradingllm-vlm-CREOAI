@@ -521,8 +521,11 @@ class LiveRunner:
             limits['available_margin']=snapshot['balance']['available']/margin_rate*.95
         if runner_id=='runner3':
             runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
-            allocation=runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
-                snapshot['balance']['available'],grade,setup['horizon'])
+            allocation=runner3_policy.apply_guclu_margin_share(
+                runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
+                    snapshot['balance']['available'],grade,setup['horizon']),
+                equity=snapshot['balance']['equity'], available=snapshot['balance']['available'],
+                raw_share=runner3_policy.chosen_margin_share(result.metadata))
             free_margin=snapshot['balance']['available']-allocation['reserve_usdt']
             if free_margin<=0:
                 raise ValueError('runner3_margin_reserve')
