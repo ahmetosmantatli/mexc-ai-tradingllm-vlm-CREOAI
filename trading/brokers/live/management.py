@@ -4,7 +4,7 @@ No cancel/replace gap: price changes modify the identified native pair in place.
 Partial exits retain protection and resize the same-price pair after a verified
 reduce fill. Unknown POST outcomes are read back, never blindly submitted twice.
 """
-from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
+from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS, management_runner
 import copy
 from decimal import Decimal, ROUND_DOWN
 from time import time
@@ -89,8 +89,13 @@ class PositionManagementMixin:
             if any(event['decision_id']==decision_id for event in row.get('management_events',[])):
                 return row
             action=decision['action']
+            opening_runner=(row['proposal'].get('metadata') or {}).get('runner_id','baseline-v1')
+            selected_runner=self.control_provider().get('runner_id') if callable(getattr(self,'_current_grant',None)) else None
+            active_runner=management_runner(opening_runner,selected_runner)
+            if decision.get('management_runner_id',active_runner)!=active_runner:
+                self._management_error('management_runner_changed')
             if action=='move_target':
-                if (row['proposal'].get('metadata') or {}).get('runner_id') not in STRUCTURAL_IOC_RUNNERS:
+                if active_runner not in STRUCTURAL_IOC_RUNNERS:
                     self._management_error('management_target_runner2_required')
                 if row.get('target_extensions',0)>=1:
                     self._management_error('management_target_extension_limit')
@@ -115,7 +120,7 @@ class PositionManagementMixin:
             rules=self.public.get_contract_rules(row['proposal']['symbol'])
             pending=dict(decision_id=decision_id,action=action,reason=decision['reason'],ai=decision.get('ai',{}),
                 at=time(),before_contracts=self.remaining_contracts(row),old_stop=stop,target=target,
-                management_runner_id=decision.get('management_runner_id'),
+                management_runner_id=active_runner,
                 external_id='mg-'+uuid4().hex[:24],write_attempted=True)
             if action in ('move_stop','move_target'):
                 new=self._number(decision['stop_price' if action=='move_stop' else 'target_price'])

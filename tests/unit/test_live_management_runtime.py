@@ -93,11 +93,11 @@ def test_ai_partial_then_next_review_has_remaining_size_and_confirmed_action(tmp
     assert runner.monitor()['positions']['BTC_USDT']['remaining_contracts']==500
 
 
-def test_runner2_near_target_uses_stored_owner_after_switch_and_is_deduplicated(tmp_path,monkeypatch):
+def test_runner2_near_target_keeps_opening_analysis_variant_and_is_deduplicated(tmp_path,monkeypatch):
     runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
     row['proposal']['metadata'].update(runner_id='runner2',analysis_version='text')
     executor._save(row)
-    control.update(runner_id='baseline-v1',version='vlm')
+    control.update(runner_id='runner2',version='vlm')
     for view in market['timeframes']:
         view['closed_at']=int(time())-1
     runner.manage_positions()
@@ -304,3 +304,47 @@ def test_runner3_manages_protected_runner2_after_start_without_rewriting_entry(t
     allow_next(runner,row)
     runner.manage_positions()
     assert len(llm.calls)==2
+
+
+@pytest.mark.parametrize('opening,selected',[
+    ('baseline-v1','runner2'),('baseline-v1','runner3'),
+    ('runner2','baseline-v1'),('runner3','baseline-v1'),('runner3','runner2'),
+])
+def test_selected_runner_manages_existing_position_across_switches(tmp_path,monkeypatch,opening,selected):
+    runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
+    row['proposal']['metadata'].update(runner_id=opening,analysis_version='text')
+    executor._save(row)
+    original=deepcopy(row['proposal'])
+    control.update(runner_id=opening)
+    runner.manage_positions()
+    assert llm.calls[-1][0]['position']['management_runner_id']==opening
+
+    allow_next(runner,row)
+    control.update(runner_id=selected,updated_at=2)
+    executor.grant_start('7',2)
+    runner.manage_positions()
+    data,request=llm.calls[-1]
+    assert len(llm.calls)==2
+    assert data['position']['opening_runner_id']==opening
+    assert data['position']['management_runner_id']==selected
+    assert ('also supports action move_target' in request['system'])==(selected!='baseline-v1')
+    assert executor.state(row['intent_id'])['proposal']==original
+    assert not private.modifies and not private.closes and len(private.submits)==1
+
+
+def test_target_extension_follows_current_runner_even_for_legacy_opening(tmp_path,monkeypatch):
+    from trading.brokers.live.execution import LiveExecutionError
+
+    _,private,executor,control,_,_,row=prepare(tmp_path,monkeypatch)
+    control.update(runner_id='runner2',updated_at=2)
+    executor.grant_start('7',2)
+    data=dict(action='move_target',reason='Kapanmış yapı hedef uzatmasını destekliyor.',
+              management_runner_id='runner2',target_price=105.)
+    updated=executor.manage_position(row['intent_id'],data,expected_revision=0,decision_id='extend',guard=lambda:True)
+    assert updated['current_protection']==dict(stop=98.,target=105.)
+    assert updated['management_events'][-1]['management_runner_id']=='runner2'
+    control.update(runner_id='baseline-v1',updated_at=3)
+    executor.grant_start('7',3)
+    with pytest.raises(LiveExecutionError,match='management_runner_changed'):
+        executor.manage_position(row['intent_id'],data,expected_revision=1,decision_id='stale',guard=lambda:True)
+    assert len(private.modifies)==1
