@@ -5,6 +5,8 @@ AutomaticLiveExecutor and an existing explicit start grant. Monitoring remains
 available while new entries are paused. Every final proposal uses freshly read
 exchange equity; account versions share this runner's one canonical store.
 """
+from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
+from trading.runtime import runner3_policy
 import copy
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from dataclasses import replace
@@ -16,7 +18,7 @@ import threading
 import time
 
 from trading.config import RiskProfile
-from trading.evaluation.price_plan import apply_market_price_plan
+from trading.evaluation.price_plan import MarketPricePlan,apply_market_price_plan
 from trading.evaluation.planning import apply_decision_sizing,PlanSizingError
 from trading.evaluation.service import ContextEvaluator,finalize_trace
 from trading.evaluation.watch import WatchCoordinator,watch_snapshot,TIMEFRAMES
@@ -176,6 +178,14 @@ class LiveRunner:
             objective=dict(enabled=True,kind='live_research_objective_only',guaranteed=False,
                 must_not_increase_risk=True,target_usdt=target,deadline=deadline,
                 remaining_seconds=max(0,deadline-now),remaining_usdt=max(0,target-balance['equity']))
+        runner3_context={}
+        if control.get('runner_id')=='runner3':
+            runner3_context['daily_objective']=runner3_policy.daily_objective(closed,
+                self.cfg.live_runner3_daily_net_target_usdt,now)
+            intents_by_position={str(row['position_id']):row for row in self._intents() if row.get('position_id')}
+            risks=[intents_by_position.get(str(row['position_id']),{}).get('planned_loss')
+                   for row in snapshot.get('positions',[])]
+            runner3_context['open_stop_risk_usdt']=sum(risks) if all(risk is not None for risk in risks) else None
         return dict(mode='LIVE',currency='USDT',source='MEXC authenticated futures endpoints',
             accounting_scope='managed_closed_records_only; wallet transfers and unmanaged trade outcomes are not reconstructed',
             equity=balance['equity'],current_equity=balance['equity'],available=balance['available'],
@@ -188,7 +198,7 @@ class LiveRunner:
             funding_total_usdt=sum(row['funding_signed'] for row in closed) if all('funding_signed' in row for row in closed) else None,
             closed_trade_count=len(closed),close_reason_counts=counts,recent_closed=recent,objective=objective,
             observed_at=snapshot['observed_at'],generation=snapshot['generation'],
-            risk_limits=snapshot['risk_limits'],leverage=snapshot['leverage'])
+            risk_limits=snapshot['risk_limits'],leverage=snapshot['leverage'],**runner3_context)
 
     def monitor(self):
         if not self._monitor_lock.acquire(blocking=False):
@@ -232,9 +242,10 @@ class LiveRunner:
         try:
             if not self._enabled():
                 return None
-            runner2=self._control().get('runner_id')=='runner2'
+            runner_id=self._control().get('runner_id')
+            runner2=runner_id in STRUCTURAL_IOC_RUNNERS
             scan=MarketScanner(self.public,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,
-                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True,structure_setups_enabled=self.cfg.live_structure_setups_enabled and self.cfg.live_price_plan_enabled, multihorizon=runner2).scan()
+                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True,structure_setups_enabled=self.cfg.live_structure_setups_enabled and self.cfg.live_price_plan_enabled, multihorizon=runner2,strict_ict=runner_id=='runner3').scan()
             errors=dict(scan.errors)
             quant_count=len(scan.candidates)
             try:
@@ -314,8 +325,11 @@ class LiveRunner:
         ticker=self.quote(candidate.symbol)
         runner_id=control.get('runner_id','baseline-v1')
         planning_candidate=candidate
-        if runner_id=='runner2' and result.metadata.get('price_plan') is None:
-            raise ValueError('Runner 2 requires a candle-grounded price plan')
+        if runner_id in STRUCTURAL_IOC_RUNNERS and result.metadata.get('price_plan') is None:
+            raise ValueError('Structural IOC runner requires a candle-grounded price plan')
+        setup=result.metadata.get('setup_selection')
+        if runner_id=='runner3':
+            runner3_policy.validate_evidence(setup,MarketPricePlan.model_validate(result.metadata['price_plan']))
         if result.metadata.get('price_plan') is not None:
             if not self.cfg.live_price_plan_enabled:raise ValueError('live model price planning disabled')
             planning_candidate=apply_market_price_plan(candidate,result.metadata['price_plan'],result.metadata.get('price_evidence') or {},
@@ -331,11 +345,23 @@ class LiveRunner:
         loss_fraction=(abs(worst_entry-stop)+fee*(worst_entry+stop))/entry
         if result.metadata.get('price_plan') is not None:
             worst_target=proposal.take_profit_price*(1-slip if candidate.side.value=='long' else 1+slip)
+            gross_target=abs(proposal.take_profit_price-entry)
             expected_net=(worst_target-worst_entry if candidate.side.value=='long' else worst_entry-worst_target)-fee*(worst_entry+worst_target)
             if expected_net<=0:raise ValueError('model target does not cover expected trading costs')
-        max_notional=min(proposal.notional,proposal.max_loss_if_stopped/loss_fraction,
-            snapshot['balance']['available']/(max(1/proposal.leverage,private_risk['initial_rate'])+fee)*.95)
-        _,notional=rules.size_order(max_notional,entry,proposal.leverage)
+        margin_rate=max(1/proposal.leverage,private_risk['initial_rate'])+fee
+        limits=dict(model_stop_budget=proposal.notional,stop_budget_with_costs=proposal.max_loss_if_stopped/loss_fraction,
+                    available_margin=snapshot['balance']['available']/margin_rate*.95)
+        if runner_id=='runner3':
+            runner3_policy.validate_economics(gross_target,expected_net,loss_fraction*entry)
+            allocation=runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
+                snapshot['balance']['available'],runner3_policy.evidence_grade(setup),setup['horizon'])
+            limits['runner3_margin_policy']=allocation['max_entry_cost_usdt']/margin_rate
+            if limits['runner3_margin_policy']<=0:
+                raise ValueError('runner3_margin_reserve')
+            proposal.metadata['runner3_allocation']=dict(allocation,limiting_factor=min(limits,key=limits.get),
+                setup_id=setup['setup_id'],evidence_expires_at=setup['evidence'].get('expires_at'),
+                calibrated_probability=None,expected_target_net_r=expected_net/(loss_fraction*entry))
+        _,notional=rules.size_order(min(limits.values()),entry,proposal.leverage)
         proposal.notional=notional
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)
         proposal.metadata.update(price_plan=result.metadata.get('price_plan'),price_source='model' if result.metadata.get('price_plan') else 'quant',

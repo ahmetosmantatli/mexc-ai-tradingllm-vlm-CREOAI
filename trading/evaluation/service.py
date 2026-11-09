@@ -1,3 +1,5 @@
+from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
+from trading.runtime import runner3_policy
 import copy
 from pathlib import Path
 import time
@@ -157,13 +159,14 @@ class ContextEvaluator:
         live_account=context.pop('live_account_context',None)
         if live_account is not None and (not isinstance(live_account,dict) or live_account.get('mode')!='LIVE' or live_account.get('currency')!='USDT'):
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_live_account_context',metadata={'provider_called':False})
-        runner2=bool(live_account and live_account.get('runner_id')=='runner2')
+        runner2=bool(live_account and live_account.get('runner_id') in STRUCTURAL_IOC_RUNNERS)
+        runner3=bool(live_account and live_account.get('runner_id')=='runner3')
         selection_enabled=bool(live_account is not None and getattr(self.cfg,'live_structure_setups_enabled',False) and getattr(self.cfg,'live_price_plan_enabled',False))
         scope = 'symbol_setups' if selection_enabled else f'{candidate.strategy.value}:{candidate.side.value}'
         if live_account is not None:
             scope=f'{self.cfg.analysis_version}:'+scope
         if runner2:
-            scope='runner2:'+scope
+            scope=live_account['runner_id']+':'+scope
         self.store.put('stage','fetching_multitimeframe_context')
         bundle = build_bundle(self.public, symbol)
         chart_context = bundle.to_context(ict=True) if runner2 else bundle.to_context()
@@ -206,7 +209,15 @@ class ContextEvaluator:
             from trading.quant.structure_setups import build_structure_setups
             frames=('5m','15m','4h') if runner2 else (None,)
             options=[setup for frame in frames for setup in build_structure_setups(chart_context,
-                current_price=candidate.entry_price,price_step=price_rules.price_step,trigger_timeframe=frame)]
+                current_price=candidate.entry_price,price_step=price_rules.price_step,trigger_timeframe=frame,strict_ict=runner3)]
+        if runner3:
+            balance=live_account['current_equity']
+            for option in options:
+                grade=runner3_policy.evidence_grade(option)
+                allocation=runner3_policy.margin_policy(balance,equity,live_account['available_usdt'],
+                    grade,option['horizon'])
+                ceiling=risk_per_trade_pct*(.5 if option['family']=='countertrend_sweep_reclaim' else 1)
+                option['allocation']=dict(allocation,suggested_risk_fraction=ceiling*(.8 if grade=='strong' else .5))
         account['setup_selection']=dict(enabled=selection_enabled,options=options,
             countertrend_max_risk_fraction=risk_per_trade_pct*.5,
             note='Select setup_id and provide a fresh grounded price_plan for TRADE. No hypothesis means no forced trade.')
@@ -245,7 +256,7 @@ class ContextEvaluator:
             why_reconsidered=changes,market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))
         if runner2:
-            trace['strategy_cohort']='runner2-multihorizon-ict-v1'
+            trace['strategy_cohort']=runner3_policy.COHORT if runner3 else 'runner2-multihorizon-ict-v1'
         publish_progress(self.store,trace)
         self.store.put('stage','model_evaluation')
         if hasattr(self.llm,'deadline'):
@@ -270,6 +281,8 @@ class ContextEvaluator:
                 raise ValueError('independent watch trade requires a fresh price plan')
             if decision.action=='trade' and runner2 and decision.price_plan is None:
                 raise ValueError('Runner 2 requires a candle-grounded price plan')
+            if runner3 and decision.action=='trade':
+                runner3_policy.validate_evidence(option,decision.price_plan)
             if decision.price_plan is not None:
                 if not price_planning or decision.action!='trade':
                     raise ValueError('price planning disabled or not trade')
@@ -300,6 +313,11 @@ class ContextEvaluator:
                               'Order block candidates are opposing candles before displacement and may be retested or invalidated. '
                               'Use visible wick references for levels and confirmed structure for invalidation. '
                               'BTC/ETH relative returns and recent_trade_flow are optional context, never an automatic veto. The flow is a bounded exchange trade-side sample; null means unavailable.' if runner2 else '')
+        if runner3:
+            policy+=(' Runner 3 requires the selected READY setup ID and its exact stop_reference. '
+                     'Use allocation as a margin target ceiling, separate from stop risk. '
+                     'Use the suggested risk fraction as a starting point; adjust down for portfolio risk, liquidity, and weak payoff. Choose leverage from current account and price evidence. '
+                     'Do not narrow the structural stop to fit the desired size.')
         payload=self.llm.complete_json(system=policy,user=prompt,max_tokens=1100 if price_planning else 700,
             images=paths if self.cfg.analysis_version=='vlm' else None)
         provider_trace=copy.deepcopy(getattr(self.llm,'last_trace',{}) or {})
@@ -336,6 +354,8 @@ class ContextEvaluator:
         candidate,selection=validate_selection(decision,candidate,options,selection_enabled)
         trace.update(setup_id=decision.setup_id,setup_family=selection['family'] if selection else candidate.features.get('setup_family'),side=candidate.side.value)
         metadata['setup_selection']=copy.deepcopy(selection)
+        if runner3 and selection:
+            trace['evidence_grade']=runner3_policy.evidence_grade(selection)
         if runner2 and decision.price_plan:
             from trading.quant.structure_setups import trade_horizon
             frame=selection['trigger_timeframe'] if selection else decision.price_plan.entry_timeframe

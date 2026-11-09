@@ -61,6 +61,10 @@ def safe_error(response):
 def human_reason(reason):
     """Translate runtime codes without exposing opaque diagnostics in normal chat."""
     known={
+        'HOLD_LIVE_EXECUTION_RUNNER3_NET_TARGET_R':'Maliyet sonrası hedef R, Runner 3 alt sınırının altında.',
+        'HOLD_LIVE_EXECUTION_RUNNER3_COST_SHARE':'Tahmini işlem maliyeti hedef kazancın fazla bölümünü tüketiyor.',
+        'HOLD_LIVE_EXECUTION_RUNNER3_MARGIN_RESERVE':'Kalan teminat, portföy rezervi ve emir maliyeti birlikte sığmadı.',
+        'HOLD_LIVE_EXECUTION_RUNNER3_EVIDENCE_EXPIRED':'Kurulumun giriş süresi doldu; güncel teyit bekleniyor.',
         'HOLD_LIVE_EXECUTION_CONTRACT_QUANTITY_LIMIT':'Önerilen işlem miktarı borsanın kontrat sınırına uymadı; işlem açılmadı.',
         'HOLD_LIVE_EXECUTION_ENTRY_PRICE_DRIFT':'Analiz sonrasında fiyat değişti; işlem açılmadı.',
         'HOLD_LIVE_EXECUTION_LIQUIDATION_BUFFER':'Kaldıraç/stop planı likidasyon mesafesi kontrolünü geçmedi.',

@@ -334,3 +334,16 @@ def test_telegram_halt_review_checks_exchange_and_keeps_manual_start(tmp_path,mo
         assert expected_message in f.controller.messages[-1][0][1]
     finally:
         f.stop()
+
+
+def test_runner3_requires_explicit_enable_structural_setup_and_ioc(tmp_path):
+    f=fleet(tmp_path,live_runner3_enabled=True,live_price_plan_enabled=True,
+            live_position_management_enabled=True,live_structure_setups_enabled=True)
+    try:
+        assert 'runner3' not in f.available_runner_ids('a')
+        f.runners['a'].executor=SimpleNamespace(private=SimpleNamespace(submit_ioc=lambda **kw:None))
+        assert f.available_runner_ids('a')==('baseline-v1','runner3')
+        f.cfg.live_structure_setups_enabled=False
+        assert f.available_runner_ids('a')==('baseline-v1',)
+    finally:
+        f.stop()

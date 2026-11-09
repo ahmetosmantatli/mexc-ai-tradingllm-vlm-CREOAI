@@ -140,7 +140,8 @@ def test_structural_scanner_can_emit_seed_without_legacy_strategy_signal(monkeyp
     assert all(c.strategy==StrategyName.STRUCTURE_SETUP and c.features['requires_full_context'] for c in result.candidates)
 
 
-def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_path,monkeypatch):
+@pytest.mark.parametrize('runner_id',['baseline-v1','runner3'])
+def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_path,monkeypatch,runner_id):
     from time import time
     from trading.runtime.live_runner import LiveRunner
     from trading.brokers.live.automatic import AutomaticLiveExecutor,AutomaticLivePolicy
@@ -150,7 +151,10 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
     from .test_live_pipeline import QuotePublic
     market=context();market['symbol']='BTC_USDT'
     micro=view(market,'5m');micro['features']['breaks']=[dict(direction='bullish',at=micro['recent_ohlcv'][-1][0],level=100.)]
-    monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='native-choice',to_context=lambda:deepcopy(market)))
+    if runner_id=='runner3':
+        micro['recent_ohlcv'][2][2]=115.
+        micro['features']['swings'][0]['price']=115.
+    monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='native-choice',to_context=lambda **kw:deepcopy(market)))
     monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
     class Model:
         budget=None
@@ -169,7 +173,17 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
         live_structure_setups_enabled=True,live_price_plan_enabled=True,live_allowed_accounts=('ahmet',),
         risk_profile='balanced',risk_per_trade_pct=.01,default_target_leverage=5,kill_switch_path=str(tmp_path/'STOP'),analysis_chart_dir=str(tmp_path/'charts'))
     store=RuntimeStore(str(tmp_path/'runtime.sqlite3'));private,public=Client(),QuotePublic()
-    control=dict(enabled=True,stopped=False,updated_at=1,version='text',risk_profile='balanced',risk_per_trade_pct=.01,max_leverage=5,max_positions=2,allocation_mode='full')
+    if runner_id=='runner3':
+        private.assets=[dict(currency='USDT',equity=11.,availableBalance=11.,positionMargin=0.,unrealized=0.)]
+        def submit_ioc(*,limit_price,**kwargs):
+            private.submit_market(entry_price=limit_price,**kwargs)
+            private.order_row['orderType']=3
+            private.stops=[dict(positionId=11,positionType=1,orderId=22,errorCode=0,state=1,isFinished=0,
+                lossTrend=2,profitTrend=2,stopLossType=0,takeProfitType=0,stopLossReverse=2,takeProfitReverse=2,
+                profitLossVolType='SAME',vol=kwargs['contracts'],
+                stopLossPrice=kwargs['stop_loss'],takeProfitPrice=kwargs['take_profit'])]
+        private.submit_ioc=submit_ioc
+    control=dict(runner_id=runner_id,enabled=True,stopped=False,updated_at=1,version='text',risk_profile='balanced',risk_per_trade_pct=.01,max_leverage=5,max_positions=2,allocation_mode='full')
     executor=AutomaticLiveExecutor(AutomaticLivePolicy(True,('ahmet',),('7',),2),LiveExecutionGates(True,'live',('7',),True),
         store,private,public,RiskEngine(settings=cfg),control_provider=lambda:dict(control),account_id='ahmet',binding_id='binding')
     runner=LiveRunner(cfg,store=store,account_id='ahmet',binding_id='binding',private=private,public=public,llm=Model(),external_control=lambda:dict(control),executor=executor)
@@ -180,3 +194,8 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
     assert status['reason']=='LIVE_PROTECTED',(status,store.get('analysis_trace'),store.get('live_candidate_error:BTC_USDT'))
     assert len(private.submits)==1 and private.order_row['side']==1
     assert private.stops[0]['stopLossPrice']<100<private.stops[0]['takeProfitPrice']
+    if runner_id=='runner3':
+        row=executor.intents()[0]
+        assert row['entry_submitted_type']==3
+        assert row['proposal']['metadata']['runner3_allocation']['equity_usdt']==11
+        assert row['proposal']['metadata']['strategy_cohort']=='runner3-evidence-allocation-v1'

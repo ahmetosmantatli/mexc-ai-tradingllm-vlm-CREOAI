@@ -6,6 +6,8 @@ not fills. Ambiguous writes are reconciled by the original external ID, never
 blindly retried. Native protection must be read back before an exposure is
 reported protected. This module does not guarantee exchange execution or PnL.
 """
+from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
+from trading.runtime import runner3_policy
 from dataclasses import dataclass
 from decimal import Decimal
 import copy
@@ -174,7 +176,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
         if sl is None or tp is None or not (sl<entry<tp if proposal.side.value=='long' else tp<entry<sl):
             raise LiveExecutionError('native_stop_and_target_required')
         contracts,notional=rules.size_order(proposal.notional,entry,proposal.leverage)
-        ioc=proposal.metadata.get('runner_id')=='runner2'
+        ioc=proposal.metadata.get('runner_id') in STRUCTURAL_IOC_RUNNERS
         if ioc:
             if not callable(getattr(self.private,'submit_ioc',None)):
                 raise LiveExecutionError('ioc_adapter_unavailable')
@@ -201,12 +203,25 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             expected_generation=snapshot['generation'],position_mode=mode,managed_position_ids=managed_positions,managed_order_ids=managed_orders)
         if not readiness.ready:raise LiveExecutionError('private_preflight_rejected',reason_codes=readiness.reasons)
         available=readiness.available
+        if proposal.metadata.get('runner_id')=='runner3':
+            policy=proposal.metadata.get('runner3_allocation') or {}
+            expires=policy.get('evidence_expires_at')
+            if expires is not None and expires<=time():
+                raise LiveExecutionError('runner3_evidence_expired')
+            cap=runner3_policy.margin_policy(readiness.equity,readiness.allowed_capital,
+                available,policy.get('grade'),policy.get('horizon'))
+            if readiness.planned_margin+notional*self.fee>cap['max_entry_cost_usdt']+1e-8:
+                raise LiveExecutionError('runner3_margin_reserve')
         if abs(notional-proposal.notional)>max(1e-8,entry*rules.size*rules.step):raise LiveExecutionError('approved_notional_changed')
         worst_entry=entry if ioc else entry*(1+self.slip if proposal.side.value=='long' else 1-self.slip)
         worst_stop=sl*(1-self.slip if proposal.side.value=='long' else 1+self.slip)
         quantity=contracts*rules.size
         planned_loss=abs(worst_entry-worst_stop)*quantity+self.fee*quantity*(worst_entry+worst_stop)
         if planned_loss>proposal.max_loss_if_stopped+1e-8:raise LiveExecutionError('fees_slippage_exceed_approved_risk')
+        if proposal.metadata.get('runner_id')=='runner3':
+            target=tp*(1-self.slip if proposal.side.value=='long' else 1+self.slip)
+            net=(target-worst_entry if proposal.side.value=='long' else worst_entry-target)-self.fee*(target+worst_entry)
+            runner3_policy.validate_economics(abs(tp-entry),net,planned_loss/quantity)
         if notional/proposal.leverage+notional*self.fee>available:raise LiveExecutionError('insufficient_available_margin')
         side=1 if proposal.side.value=='long' else 2
         private_maintenance=max(row['maintenance_rate'] for group in ('risk_limits','leverage')

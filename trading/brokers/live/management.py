@@ -4,6 +4,7 @@ No cancel/replace gap: price changes modify the identified native pair in place.
 Partial exits retain protection and resize the same-price pair after a verified
 reduce fill. Unknown POST outcomes are read back, never blindly submitted twice.
 """
+from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
 import copy
 from decimal import Decimal, ROUND_DOWN
 from time import time
@@ -89,7 +90,7 @@ class PositionManagementMixin:
                 return row
             action=decision['action']
             if action=='move_target':
-                if (row['proposal'].get('metadata') or {}).get('runner_id')!='runner2':
+                if (row['proposal'].get('metadata') or {}).get('runner_id') not in STRUCTURAL_IOC_RUNNERS:
                     self._management_error('management_target_runner2_required')
                 if row.get('target_extensions',0)>=1:
                     self._management_error('management_target_extension_limit')

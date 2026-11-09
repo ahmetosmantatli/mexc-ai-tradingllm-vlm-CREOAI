@@ -1,5 +1,12 @@
 """Closed-set execution diagnostics. Never persist arbitrary exception text."""
 CODES={
+    'runner3_net_target_r_too_low':'RUNNER3_NET_TARGET_R',
+    'runner3_cost_share_too_high':'RUNNER3_COST_SHARE',
+    'runner3_margin_reserve':'RUNNER3_MARGIN_RESERVE',
+    'runner3_evidence_expired':'RUNNER3_EVIDENCE_EXPIRED',
+    'runner3_stop_reference_mismatch':'RUNNER3_STOP_REFERENCE',
+    'runner3_structural_stop_too_tight':'RUNNER3_STRUCTURAL_STOP',
+
     'live entry price drift':'ENTRY_PRICE_DRIFT',
     'contract quantity outside exchange limits':'CONTRACT_QUANTITY_LIMIT',
     'position exceeds supported base risk tier':'CONTRACT_RISK_TIER',

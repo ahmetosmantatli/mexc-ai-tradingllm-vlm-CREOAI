@@ -60,9 +60,13 @@ def performance(traces,intents):
     result=[]
     for (runner,cohort,variant),(reviews,rows) in sorted(groups.items()):
         horizons=defaultdict(list)
+        grades=defaultdict(list)
         for row in rows:
             metadata=row.get('proposal',{}).get('metadata') or {}
             horizons[(metadata.get('trade_horizon') or {}).get('style') or 'unknown'].append(row)
+            grade=(metadata.get('runner3_allocation') or {}).get('grade')
+            if grade:
+                grades[grade].append(row)
         attempts=[a for t in reviews for a in t.get('attempts',[]) if a.get('generation_requests',0)]
         provider_calls=sum(a['generation_requests'] for a in attempts)
         tokens=[(a.get('input_tokens'),a.get('output_tokens')) for a in attempts]
@@ -77,7 +81,8 @@ def performance(traces,intents):
             token_samples=len(known_tokens),mean_tokens=mean(known_tokens),
             cost_samples=len(costs),known_estimated_ai_cost_usd=sum(costs) if costs else None,
             mean_generation_latency_ms=mean([a['latency_ms'] for a in attempts if _number(a.get('latency_ms'))]),
-            **fills(rows),by_opening_horizon={h:fills(batch) for h,batch in sorted(horizons.items())}))
+            **fills(rows),by_opening_horizon={h:fills(batch) for h,batch in sorted(horizons.items())},
+            by_evidence_grade={grade:fills(batch) for grade,batch in sorted(grades.items())}))
     return result
 
 

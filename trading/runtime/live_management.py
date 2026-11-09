@@ -1,4 +1,5 @@
 """Event-driven AI reviews of owned positions, independent of entry scanning."""
+from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
 import copy
 import json
 import math
@@ -133,7 +134,7 @@ class LivePositionManager:
         proposal=intent['proposal'];symbol=proposal['symbol']
         metadata=proposal.get('metadata') or {}
         runner_id=metadata.get('runner_id','baseline-v1')
-        runner2=runner_id=='runner2'
+        runner2=runner_id in STRUCTURAL_IOC_RUNNERS
         variant=metadata.get('analysis_version') if 'runner_id' in metadata else None
         variant=variant if variant in ('text','vlm') else control.get('version',r.cfg.analysis_version)
         stop,target=r.executor.protection_levels(intent)
@@ -216,7 +217,7 @@ class LivePositionManager:
             market['benchmarks']=benchmark_context(r.public,market)
             market['recent_trade_flow']=trade_flow_context(r.public,symbol)
         prompt=json.dumps(dict(task='manage_existing_position',event=event,position=position_card,
-            account=r._live_context(snapshot,control),market=compact_market(market),
+            account=r._live_context(snapshot,{**control,'runner_id':runner_id}),market=compact_market(market),
             current_quote=dict(bid=quote.bid1,ask=quote.ask1,fair=quote.raw['fairPrice']),price_step=rules.price_step),
             ensure_ascii=False,separators=(',',':'),allow_nan=False)
         llm=r.management_llm()

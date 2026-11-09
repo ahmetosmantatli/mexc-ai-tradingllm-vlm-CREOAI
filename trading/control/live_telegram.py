@@ -7,7 +7,7 @@ from trading.agents.telemetry import human_reason
 
 
 BASELINE_RUNNER_ID = 'baseline-v1'
-RUNNER_LABELS = {BASELINE_RUNNER_ID: 'Runner 1', 'runner2': 'Runner 2'}
+RUNNER_LABELS = {BASELINE_RUNNER_ID: 'Runner 1', 'runner2': 'Runner 2', 'runner3': 'Runner 3'}
 
 
 def number(value, digits=4):
@@ -94,6 +94,8 @@ class LiveTelegramController(TelegramController):
         text+=f'Yeni işlem runner’ı: {RUNNER_LABELS[selected]}\n'
         if not state.get('version_chosen'):return text+'Analizi seç: görselsiz veya VLM.'
         if not state.get('profile_chosen'):return text+'Trader profilini seç. Profil sınırları model önerilerinde uygulanır.'
+        if selected=='runner3':
+            text+='Runner 3 teminat hedefini güncel özkaynak ve yapı kalitesine göre hesaplar. 100 USDT altında giriş açık kalabilir.\n'
         mode=next((v for v in TRADER_MODES.values() if v['risk_profile']==state['risk_profile']),{})
         leverage_mode=snapshot.get('leverage_mode','profile')
         risk_policy=snapshot.get('entry_risk_policy') or {}

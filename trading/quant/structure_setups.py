@@ -89,7 +89,7 @@ def _atr(rows):
                for i, r in enumerate(rows) if i) / (len(rows) - 1)
 
 
-def build_structure_setups(market_context, *, current_price, price_step=0, trigger_timeframe=None):
+def build_structure_setups(market_context, *, current_price, price_step=0, trigger_timeframe=None, strict_ict=False):
     """Return grounded READY/WATCH alternatives with stable IDs and price refs.
 
     READY means the specified closed-bar pattern occurred, never authorization to
@@ -176,6 +176,33 @@ def build_structure_setups(market_context, *, current_price, price_step=0, trigg
 
     # Countertrend: actual wick sweep AND same closed candle reclaim, never a
     # stretched SMA/ROC alone. Both bullish and bearish mirrors are evaluated.
+    if strict_ict:
+        features=micro['features']
+        for shift in features.get('structure_shifts',[]):
+            direction=shift['direction']
+            if shift['kind']!='mss' or direction==macro or not 0<latest[0]-shift['at']<=6*SECONDS[micro_tf]:
+                continue
+            long=direction=='bullish'
+            sweep=next((event for event in reversed(features.get('sweeps',[]))
+                        if event['direction']==('low_sweep' if long else 'high_sweep')
+                        and 0<shift['at']-event['at']<=3*SECONDS[micro_tf]),None)
+            if sweep is None:
+                continue
+            for zone in features.get('fvgs',[]):
+                if zone['at']!=shift['at'] or zone['direction']!=direction:
+                    continue
+                edge=zone['lower'] if long else zone['upper']
+                if any((bar[3]<=edge if long else bar[2]>=edge)
+                       for bar in micro['rows'] if bar[0]>shift['at']):
+                    continue
+                if not (latest[3]<=zone['upper']<latest[4] if long else latest[2]>=zone['lower']>latest[4]):
+                    continue
+                add('countertrend_sweep_reclaim','long' if long else 'short',
+                    _reference(micro,micro_tf,sweep['at'],'low' if long else 'high'),
+                    dict(kind='sweep_mss_fvg_retest',timeframe=micro_tf,sweep=sweep,shift=shift,zone=zone,
+                         trigger_at=latest[0],expires_at=micro['closed_at']+SECONDS[micro_tf]))
+        return hypotheses
+
     for tf in ((micro_tf,) if trigger_timeframe else ('5m', '15m')):
         view = views.get(tf)
         if not view:

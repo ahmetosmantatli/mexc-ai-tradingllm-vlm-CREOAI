@@ -67,6 +67,7 @@ class MarketScanner:
     bulk_tickers: bool = False
     structure_setups_enabled: bool = False
     multihorizon: bool = False
+    strict_ict: bool = False
 
     def scan(self, symbols: Sequence[str] | None = None) -> ScanResult:
         started=time.monotonic()
@@ -187,16 +188,19 @@ class MarketScanner:
         )
 
     def _structure_candidates(self,symbol,ticker,rows,timeframe,fee_free):
-        from trading.analysis.market import TIMEFRAMES, closed_candles, structure_features
+        from trading.analysis.market import TIMEFRAMES, closed_candles, ict_features, structure_features
         from trading.quant.structure_setups import build_structure_setups
 
         _,seconds=TIMEFRAMES[timeframe]
         observed=time.time()
         closed=closed_candles(rows,seconds,observed)
+        features=structure_features(closed)
+        if self.strict_ict:
+            features.update(ict_features(closed,features))
         market=dict(symbol=symbol,observed_at=observed,timeframes=[dict(
-            timeframe=timeframe,features=structure_features(closed),recent_ohlcv=[c.row() for c in closed[-12:]])])
+            timeframe=timeframe,features=features,recent_ohlcv=[c.row() for c in closed[-12:]])])
         options=build_structure_setups(market,current_price=float(ticker.last_price),
-            trigger_timeframe=timeframe if self.multihorizon else None)
+            trigger_timeframe=timeframe if self.multihorizon else None,strict_ict=self.strict_ict)
         return [CandidateSignal(symbol=symbol,side=setup['side'],strategy=StrategyName.STRUCTURE_SETUP,
             entry_price=float(ticker.last_price),stop_loss_price=setup['stop_loss_price'],
             take_profit_price=setup['take_profit_price'],confidence=.65,

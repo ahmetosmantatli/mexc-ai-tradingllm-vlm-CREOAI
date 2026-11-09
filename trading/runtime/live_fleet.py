@@ -3,6 +3,7 @@
 Construction is gated; tests inject clients/runners and never contact an exchange.
 Entry permission and ongoing reconciliation deliberately have separate schedules.
 """
+from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import copy
@@ -98,11 +99,14 @@ class LiveFleet:
     def available_runner_ids(self, ident):
         executor=getattr(self.runners.get(ident),'executor',None)
         adapter=getattr(executor,'private',None)
-        if (ident in self.allowed and self.cfg.live_runner2_enabled
-                and self.cfg.live_price_plan_enabled and self.cfg.live_position_management_enabled
-                and callable(getattr(adapter,'submit_ioc',None))):
-            return ('baseline-v1','runner2')
-        return ('baseline-v1',)
+        if (ident not in self.allowed or not self.cfg.live_price_plan_enabled
+                or not self.cfg.live_position_management_enabled
+                or not callable(getattr(adapter,'submit_ioc',None))):
+            return ('baseline-v1',)
+        return ('baseline-v1',) + tuple(runner for runner,enabled in (
+            ('runner2',self.cfg.live_runner2_enabled),
+            ('runner3',self.cfg.live_runner3_enabled and self.cfg.live_structure_setups_enabled),
+        ) if enabled)
 
     def entry_control(self, ident):
         control=dict(self.controller.control(ident))
@@ -392,8 +396,8 @@ class LiveFleet:
         proposal=row.get('proposal') or {}
         metadata=proposal.get('metadata') or {}
         text=f"CANLI | {ident} | {proposal.get('symbol','?')}\n{labels[state]}\n"
-        if metadata.get('runner_id')=='runner2':
-            text+='Runner: 2 · Fiyat sınırlı IOC\n'
+        if metadata.get('runner_id') in STRUCTURAL_IOC_RUNNERS:
+            text+=f"Runner: {metadata['runner_id'][-1]} · Fiyat sınırlı IOC\n"
             horizon=row.get('trade_horizon') or metadata.get('trade_horizon') or {}
             labels_by_horizon={'scalp':'Kısa vade','intraday':'Gün içi','swing':'Swing'}
             if horizon.get('style') in labels_by_horizon:
@@ -419,6 +423,13 @@ class LiveFleet:
                 if target_r is not None:
                     text+=(f"TP net tahmini: {metrics['estimated_target_net_usdt']:+.4f} USDT "
                            f"({target_r:+.2f}R, ücret ve kayma varsayımıyla)\n")
+            allocation=metadata.get('runner3_allocation')
+            if allocation:
+                factor={'model_stop_budget':'modelin stop bütçesi','stop_budget_with_costs':'maliyet dahil stop bütçesi',
+                        'available_margin':'boş marjin','runner3_margin_policy':'teminat politikası'}[allocation['limiting_factor']]
+                quality='Güçlü' if allocation['grade']=='strong' else 'Standart'
+                text+=f"Teminat hedefi: {allocation['target_margin_usdt']:.4f} USDT | Boyutu sınırlayan: {factor}\n"
+                text+=f"Kanıt kalitesi: {quality} | Kalibre olasılık: ölçülmedi\n"
             entry_timeframe=(metadata.get('price_plan') or {}).get('entry_timeframe')
             if entry_timeframe in ('5m','15m','4h'):
                 text+=f"Giriş zaman dilimi: {entry_timeframe}\n"
