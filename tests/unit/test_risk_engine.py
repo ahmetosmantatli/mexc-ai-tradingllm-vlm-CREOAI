@@ -82,6 +82,19 @@ def test_risk_rejects_missing_stop_via_engine_path() -> None:
     assert "MISSING_STOP_LOSS" in decision.reason_codes
 
 
+def test_peak_drawdown_does_not_reject_while_daily_loss_still_does() -> None:
+    engine = RiskEngine(
+        settings=Settings(_env_file=None),
+        preset=get_preset(RiskProfile.AGGRESSIVE_GROWTH),
+    )
+    opened = engine.evaluate(_proposal(), _context(drawdown_pct=0.90))
+    assert opened.accepted
+    assert opened.reason_codes == ["OK"]
+    halted = engine.evaluate(_proposal(), _context(drawdown_pct=0.90, daily_loss_pct=0.055))
+    assert "DAILY_LOSS_HALT" in halted.reason_codes
+    assert "MAX_DRAWDOWN_KILL" not in halted.reason_codes
+
+
 def test_accept_reasonable_ag_proposal() -> None:
     engine = RiskEngine(
         settings=Settings(_env_file=None),

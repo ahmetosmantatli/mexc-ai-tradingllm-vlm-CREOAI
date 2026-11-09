@@ -312,10 +312,12 @@ class LiveAccountReconciler:
 
 
 def observe_risk_reference(store,binding_id,equity,*,now=None):
-    """Persist risk peaks on every account observation, including while paused.
+    """Persist daily and weekly equity baselines, including while entries are paused.
 
     Calendar day/week are UTC and explicit. Deposits/withdrawals are not inferred
     from market PnL; these are equity circuit breakers, not a return calculation.
+    A prior equity high is not a latch: drop-from-peak must not block a later entry,
+    so any stored peak is removed on the next observation.
     """
     from datetime import datetime,timezone
     now=time() if now is None else now
@@ -325,16 +327,18 @@ def observe_risk_reference(store,binding_id,equity,*,now=None):
     iso=stamp.isocalendar();week=f'{iso.year}-{iso.week}'
     key='live:risk_reference:'+binding_id
     with store.lock:
-        state=store.get(key,dict(initial=equity,peak=equity,day=day,day_start=equity,week=week,week_start=equity))
+        state=store.get(key,dict(initial=equity,day=day,day_start=equity,week=week,week_start=equity))
         if state.get('day')!=day:state.update(day=day,day_start=equity)
         if state.get('week')!=week:state.update(week=week,week_start=equity)
         if state.get('initial',0)<=0 and equity>0:state['initial']=equity
         if state.get('day_start',0)<=0 and equity>0:state['day_start']=equity
         if state.get('week_start',0)<=0 and equity>0:state['week_start']=equity
-        state['peak']=max(state.get('peak',0),equity)
+        state.pop('peak',None)
+        state.pop('drawdown_pct',None)
         state['observed_at']=now
         store.put(key,state)
     state=dict(state)
-    for field,basis in [('daily_loss_pct','day_start'),('weekly_loss_pct','week_start'),('drawdown_pct','peak')]:
+    for field,basis in [('daily_loss_pct','day_start'),('weekly_loss_pct','week_start')]:
         state[field]=max(0,1-equity/state[basis]) if state.get(basis,0)>0 else 0
+    state['drawdown_pct']=0.0
     return state

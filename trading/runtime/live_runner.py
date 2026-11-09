@@ -545,7 +545,7 @@ class LiveRunner:
                 return self.status('HOLD_LIVE_NO_FUNDS')
             risk=observe_risk_reference(self.store,self.binding_id,snapshot['balance']['equity'])
             preset = self.risk.preset
-            limits = {'daily_loss_pct': preset.daily_loss_halt_pct, 'drawdown_pct': preset.max_drawdown_kill_pct}
+            limits = {'daily_loss_pct': preset.daily_loss_halt_pct}
             if preset.weekly_loss_halt_enabled:
                 limits['weekly_loss_pct'] = preset.weekly_loss_halt_pct
             risk_blocks = {key: dict(observed=risk[key], limit=limit) for key, limit in limits.items() if risk[key] >= limit}
@@ -677,8 +677,7 @@ class LiveRunner:
             runner_id=self.runner_id,
             entry_risk_policy=dict(profile=self.risk.preset.profile.value,daily_loss_limit_pct=self.risk.preset.daily_loss_halt_pct,
                 weekly_loss_limit_enabled=self.risk.preset.weekly_loss_halt_enabled,
-                weekly_loss_limit_pct=self.risk.preset.weekly_loss_halt_pct,
-                drawdown_limit_pct=self.risk.preset.max_drawdown_kill_pct),
+                weekly_loss_limit_pct=self.risk.preset.weekly_loss_halt_pct),
             ai_status=getattr(self.llm,'last_status','not_called'),live_halt=self.store.get('live:halt'),is_simulated=False)
         with self.lock:
             events=self.store.get('live_events',[])
