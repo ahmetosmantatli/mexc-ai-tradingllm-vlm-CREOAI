@@ -11,7 +11,7 @@ import httpx
 
 from trading.exchange.mexc_public import MexcPublicClient, TickerSnapshot, PublicMarketError
 from trading.exchange.public_governor import PublicDataDeferred
-from trading.quant.signals import CandidateSignal
+from trading.quant.signals import CandidateSignal, StrategyName
 from trading.quant.strategies import (
     DEFAULT_STRATEGIES,
     Strategy,
@@ -66,6 +66,7 @@ class MarketScanner:
     rotation_store: object | None = None
     bulk_tickers: bool = False
     structure_setups_enabled: bool = False
+    multihorizon: bool = False
 
     def scan(self, symbols: Sequence[str] | None = None) -> ScanResult:
         started=time.monotonic()
@@ -128,18 +129,7 @@ class MarketScanner:
                     fee_free_pair=sym in fee_free or bool(ticker.fee_free),quote_volume_24h=ticker.quote_volume_24h)
                 produced=run_strategies(ctx,self.strategies)
                 if self.structure_setups_enabled:
-                    from trading.analysis.market import closed_candles,structure_features
-                    from trading.quant.structure_setups import build_structure_setups
-                    from trading.quant.signals import CandidateSignal,StrategyName
-                    observed=time.time()
-                    confirmed=closed_candles(candles,900,observed)
-                    market=dict(symbol=sym,observed_at=observed,timeframes=[dict(timeframe='15m',features=structure_features(confirmed),recent_ohlcv=[c.row() for c in confirmed[-12:]])])
-                    for setup in build_structure_setups(market,current_price=ctx.last_price):
-                        if setup['state']!='ready':continue
-                        produced.append(CandidateSignal(symbol=sym,side=setup['side'],strategy=StrategyName.STRUCTURE_SETUP,
-                            entry_price=ctx.last_price,stop_loss_price=setup['stop_loss_price'],take_profit_price=setup['take_profit_price'],
-                            confidence=.65,fee_free_pair=ctx.fee_free_pair,rationale='Kapanmış 15dk yapısal ön eleme; 4s/5dk teyidi henüz değerlendirilmedi.',
-                            features=dict(structure_seed=True,setup_family=setup['family'],setup_id=setup['setup_id'],requires_full_context=True)))
+                    produced.extend(self._structure_candidates(sym,ticker,candles,'15m',fee_free))
                 for candidate in produced:
                     candidate.features['observed_spread_bps']=ticker.spread_bps
                     if candles:
@@ -154,10 +144,33 @@ class MarketScanner:
                     else 'DATA_FORMAT' if isinstance(exc,(ValueError,TypeError,KeyError,IndexError)) else type(exc).__name__)
                 return sym,passed,[],'SYMBOL_DATA_ERROR',category
 
+        def inspect_horizons(symbol):
+            sym,passed,produced,reason,error=inspect(symbol)
+            horizon_errors={}
+            if passed and self.multihorizon and self.structure_setups_enabled:
+                from trading.analysis.market import TIMEFRAMES
+                ticker=tickers[sym] if tickers is not None else None
+                for tf in ('5m','4h'):
+                    interval,_=TIMEFRAMES[tf]
+                    try:
+                        if ticker is None:
+                            ticker=self.client.get_ticker(sym)
+                        payload=self.client.get_klines(sym,interval=interval,limit=self.kline_limit)
+                        if payload.get('symbol')!=sym or payload.get('interval')!=interval:
+                            raise ValueError('unexpected horizon candle identity')
+                        produced.extend(self._structure_candidates(sym,ticker,payload['candles'],tf,fee_free))
+                    except sqlite3.Error:
+                        raise
+                    except Exception as exc:
+                        horizon_errors[f'{sym}:{tf}']=('MEXC_CODE_'+str(exc.public_error_code)
+                            if isinstance(exc,PublicMarketError) else type(exc).__name__)
+            return sym,passed,produced,reason,error,horizon_errors
+
         # httpx clients may be shared between threads. Metadata calls above have
         # initialized the dedicated scan client's connection pool before workers.
         with ThreadPoolExecutor(max_workers=max(1,min(self.max_workers,4)),thread_name_prefix='market-scan') as pool:
-            for sym,passed,produced,reason,error in pool.map(inspect,universe):
+            for sym,passed,produced,reason,error,horizon_errors in pool.map(inspect_horizons,universe):
+                errors.update(horizon_errors)
                 kept+=int(passed)
                 candidates.extend(produced)
                 if reason:
@@ -172,6 +185,28 @@ class MarketScanner:
             filtered_out=filtered_out,
             candidates=candidates, errors=errors, duration_seconds=time.monotonic()-started,
         )
+
+    def _structure_candidates(self,symbol,ticker,rows,timeframe,fee_free):
+        from trading.analysis.market import TIMEFRAMES, closed_candles, structure_features
+        from trading.quant.structure_setups import build_structure_setups
+
+        _,seconds=TIMEFRAMES[timeframe]
+        observed=time.time()
+        closed=closed_candles(rows,seconds,observed)
+        market=dict(symbol=symbol,observed_at=observed,timeframes=[dict(
+            timeframe=timeframe,features=structure_features(closed),recent_ohlcv=[c.row() for c in closed[-12:]])])
+        options=build_structure_setups(market,current_price=float(ticker.last_price),
+            trigger_timeframe=timeframe if self.multihorizon else None)
+        return [CandidateSignal(symbol=symbol,side=setup['side'],strategy=StrategyName.STRUCTURE_SETUP,
+            entry_price=float(ticker.last_price),stop_loss_price=setup['stop_loss_price'],
+            take_profit_price=setup['take_profit_price'],confidence=.65,
+            fee_free_pair=symbol in fee_free or bool(ticker.fee_free),
+            rationale=f'Kapanmış {timeframe} yapısal ön eleme; tam piyasa bağlamı ayrıca değerlendirilecek.',
+            features=dict(structure_seed=True,setup_family=setup['family'],setup_id=setup['setup_id'],
+                requires_full_context=True,observed_spread_bps=ticker.spread_bps,
+                source_open_at=closed[-1].timestamp,source_closed_at=closed[-1].timestamp+seconds,
+                **({'seed_timeframe':timeframe} if self.multihorizon else {})))
+            for setup in options if setup['state']=='ready']
 
     def scan_to_dicts(self, symbols: Sequence[str] | None = None) -> dict[str, Any]:
         result = self.scan(symbols)

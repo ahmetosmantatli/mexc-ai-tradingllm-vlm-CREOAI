@@ -136,6 +136,8 @@ class PositionManagementMixin:
                 if not (new>target if long else 0<new<target):
                     self._management_error('management_target_must_extend')
                 pending.update(stop=stop,old_target=target,target=new,protection_id=target_pair_id)
+                if decision.get('trade_horizon'):
+                    pending['trade_horizon']=decision['trade_horizon']
             elif action in ('reduce','close'):
                 before=pending['before_contracts']
                 fraction=self._number(decision['close_fraction'])
@@ -208,6 +210,8 @@ class PositionManagementMixin:
                     row['current_protection']=expected['current_protection']
                     if action=='move_target':
                         row['target_extensions']=row.get('target_extensions',0)+1
+                        if pending.get('trade_horizon'):
+                            row['trade_horizon']=pending['trade_horizon']
                         return self._management_complete(row,'confirmed',new_target=pending['target'])
                     return self._management_complete(row,'confirmed',new_stop=pending['stop'])
                 if position is not None and time()-pending['at']>=self.max_age and row.get('allow_emergency_close'):

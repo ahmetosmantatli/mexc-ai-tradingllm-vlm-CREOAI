@@ -5,7 +5,9 @@ from trading.quant.signals import CandidateSignal
 
 
 def candidate_key(candidate):
-    return f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}'
+    key = f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}'
+    timeframe = candidate.features.get('seed_timeframe')
+    return f'{key}:{timeframe}' if timeframe else key
 
 
 class CandidateQueue:
@@ -23,11 +25,12 @@ class CandidateQueue:
                 key=candidate_key(candidate)
                 old=previous.get(key,{})
                 closed_at=candidate.features.get('source_closed_at',now)
-                if closed_at>now or now-closed_at>1200:
+                max_age = 14400 if candidate.features.get('seed_timeframe') == '4h' else 1200
+                if closed_at>now or now-closed_at>max_age:
                     continue
                 current[key]=dict(key=key,signal=candidate.model_dump(mode='json'),
                     first_seen=old.get('first_seen',now),refreshed_at=now,
-                    expires_at=min(now+self.ttl,closed_at+1200),
+                    expires_at=min(now+self.ttl,closed_at+max_age),
                     last_considered_at=old.get('last_considered_at',0),
                     last_evaluated_at=old.get('last_evaluated_at',0),
                     lease_until=old.get('lease_until',0))

@@ -45,7 +45,7 @@ def prepare(tmp_path,monkeypatch):
     llm=Model();llm.stamp=int(time())-1000
     rows=[[llm.stamp-900,100,104,98.5,100,10],[llm.stamp,100,103,99.1,100,10]]
     market=dict(timeframes=[dict(timeframe=tf,closed_at=int(time())-1000,features={},recent_ohlcv=deepcopy(rows)) for tf in ('4h','15m','5m')])
-    monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(to_context=lambda:deepcopy(market),fingerprint='evidence'))
+    monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(to_context=lambda **kw:deepcopy(market),fingerprint='evidence'))
     monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[SimpleNamespace(path=tmp_path/'chart.png')])
     runner=LiveRunner(cfg,store=store,account_id='ahmet',binding_id='binding-1',private=private,public=public,llm=llm,
         executor=executor,external_control=lambda:dict(control))
@@ -126,15 +126,20 @@ def test_runner2_near_target_uses_stored_owner_after_switch_and_is_deduplicated(
     assert len(llm.calls)==initial+1
 
 
-def test_runner2_near_target_ai_extension_reaches_native_readback(tmp_path,monkeypatch):
+@pytest.mark.parametrize('promote',[False,True])
+def test_runner2_near_target_ai_extension_reaches_native_readback(tmp_path,monkeypatch,promote):
     runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
     row['proposal']['metadata'].update(runner_id='runner2',analysis_version='text')
+    if promote:
+        row['proposal']['metadata']['trade_horizon']=dict(style='scalp',review_timeframe='5m',review_due_at=time()+100)
     executor._save(row)
     target=row['proposal']['take_profit_price']
     stamp=int(time())-1800
     for view in market['timeframes']:
         view['closed_at']=int(time())-1
         view['recent_ohlcv']=[[stamp,100.,target+2.,99.,target-.1,10.]]
+    if promote:
+        market['timeframes'][1]['features']=dict(trend='bullish',breaks=[dict(direction='bullish',at=stamp)])
     # Bootstrap the sampled ATR, then independently trigger proximity.
     runner.manage_positions()
     original=runner.public.get_ticker
@@ -160,6 +165,9 @@ def test_runner2_near_target_ai_extension_reaches_native_readback(tmp_path,monke
     assert updated.get('current_protection',{}).get('target')==target+2., (runner.store.get('management_status'),updated)
     assert updated['current_protection']['stop']==row['proposal']['stop_loss']['price']
     assert updated['target_extensions']==1
+    if promote:
+        assert updated['trade_horizon']['style']=='intraday'
+        assert updated['trade_horizon']['review_due_at']>row['proposal']['metadata']['trade_horizon']['review_due_at']
     assert updated['management_events'][-1]['status']=='confirmed'
 
 

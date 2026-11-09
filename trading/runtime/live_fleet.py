@@ -341,6 +341,10 @@ class LiveFleet:
         text=f"CANLI | {ident} | {proposal.get('symbol','?')}\n{labels[state]}\n"
         if metadata.get('runner_id')=='runner2':
             text+='Runner: 2 · Fiyat sınırlı IOC\n'
+            horizon=row.get('trade_horizon') or metadata.get('trade_horizon') or {}
+            labels_by_horizon={'scalp':'Kısa vade','intraday':'Gün içi','swing':'Swing'}
+            if horizon.get('style') in labels_by_horizon:
+                text+=f"İşlem ufku: {labels_by_horizon[horizon['style']]} | İnceleme: {horizon['review_timeframe']}\n"
         if state=='entry_rejected':
             rejection=row.get('entry_rejection') or {}
             stages={'submit_market':'Emir gönderimi','submit_ioc':'Fiyat sınırlı IOC emir gönderimi','order_reconciliation':'Emir sonucu kontrolü'}

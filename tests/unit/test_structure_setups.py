@@ -127,3 +127,66 @@ def test_missing_15m_is_not_labeled_full_context():
     ctx['timeframes']=[v for v in ctx['timeframes'] if v['timeframe']!='15m']
     plans=build_structure_setups(ctx,current_price=101.)
     assert plans and all(p['requires_full_context'] for p in plans)
+
+
+@pytest.mark.parametrize('timeframe,horizon',[('5m','scalp'),('15m','intraday'),('4h','swing')])
+def test_runner2_horizon_has_own_trigger_and_references(timeframe,horizon):
+    ctx=context()
+    selected=view(ctx,timeframe)
+    # Use only this source. The other horizons cannot create its seed.
+    selected['recent_ohlcv'][2][2]=112.
+    selected['features']['swings'][0]['price']=112.
+    selected['features']['breaks']=[dict(direction='bullish',at=selected['recent_ohlcv'][-1][0],level=100.)]
+    ctx['timeframes']=[selected]
+    plan=next(p for p in build_structure_setups(ctx,current_price=101.,trigger_timeframe=timeframe) if p['state']=='ready')
+    assert plan['horizon']==horizon
+    assert plan['stop_reference']['timeframe']==plan['target_reference']['timeframe']==timeframe
+
+
+def test_ict_shift_and_order_block_are_tied_to_closed_evidence():
+    from trading.analysis.market import Candle, ict_features
+
+    bars=[Candle(300*(i+1),100,102,98,101,1) for i in range(8)]
+    bars[5]=Candle(1800,101,102,97,100,1)
+    bars[6]=Candle(2100,100,109,99,108,1)
+    bars[7]=Candle(2400,104,105,95,96,1)
+    evidence=dict(breaks=[dict(at=1500,direction='bearish'),dict(at=2100,direction='bullish')],
+                  sweeps=[dict(at=1800,direction='low_sweep')])
+    result=ict_features(bars,evidence)
+    assert result['structure_shifts'][0]['kind']=='mss'
+    assert result['order_block_candidates'][0]['open_time']==1800
+    assert result['order_block_candidates'][0]['status']=='invalidated'
+    assert ict_features(bars,dict(evidence,sweeps=[]))['structure_shifts'][0]['kind']=='choch'
+
+
+def test_trade_flow_rejects_stale_or_unknown_direction(monkeypatch):
+    from types import SimpleNamespace
+    from trading.analysis.market import trade_flow_context
+
+    monkeypatch.setattr('trading.analysis.market.time',lambda:100.)
+    trades=[dict(T=1,t=99000,v=8),dict(T=2,t=98000,v=2),
+            dict(T=1,t=39000,v=100),dict(T=2,t=99500,v=100,M=1)]
+    client=SimpleNamespace(get_recent_trades=lambda symbol:trades)
+    sample=trade_flow_context(client,'TEST_USDT')
+    assert sample['trade_count']==2 and sample['imbalance']==.6 and sample['sample_is_complete'] is False
+    trades.append(dict(T=3,t=99900,v=10))
+    assert trade_flow_context(client,'TEST_USDT') is None
+
+
+def test_benchmark_only_uses_aligned_closed_bars():
+    from types import SimpleNamespace
+    from trading.analysis.market import benchmark_context
+
+    ctx=context()
+    fifteen=view(ctx,'15m')
+    ctx['timeframes']=[fifteen]
+    rows=[[NOW-900*(35-i),98.,102.,96.,98.,1.] for i in range(35)]
+
+    def klines(symbol,interval,limit):
+        data=rows if symbol=='BTC_USDT' else rows[:-1]
+        return dict(symbol=symbol,interval=interval,candles=data)
+
+    results=benchmark_context(SimpleNamespace(get_klines=klines),ctx)
+    assert results['BTC_USDT']['15m']['closed_at']==NOW
+    assert results['BTC_USDT']['15m']['relative_return_6_bars']==pytest.approx(101/98-1)
+    assert results['ETH_USDT']['15m'] is None

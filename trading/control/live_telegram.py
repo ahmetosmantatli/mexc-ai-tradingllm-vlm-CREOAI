@@ -206,8 +206,20 @@ class LiveTelegramController(TelegramController):
         rows=(self.snapshot_provider(account_id) or {}).get('closed',[])
         text='LIVE · Borsada doğrulanan kapanışlar\n'
         if not rows:return text+'Henüz doğrulanmış kapanış kaydı yok.'
-        for row in rows[-12:]:
-            text+=f"{row.get('symbol','?')} | Net: {number(row.get('net_pnl',row.get('realised')))} USDT\n"
+        labels={'scalp':'Kısa vade','intraday':'Gün içi','swing':'Swing'}
+        for row in sorted(rows,key=lambda row:row.get('closed_at') or 0)[-12:]:
+            proposal=row.get('proposal') or {}
+            metadata=proposal.get('metadata') or {}
+            opening=(metadata.get('trade_horizon') or {}).get('style')
+            current=(row.get('trade_horizon') or {}).get('style')
+            horizon=labels.get(opening)
+            if current in labels and current!=opening:
+                horizon=f'{horizon} → {labels[current]}'
+            risk=(row.get('entry_metrics') or {}).get('initial_stop_risk_usdt')
+            net=row.get('net_pnl',row.get('realised'))
+            result=f' | {net/risk:+.2f}R' if row.get('realized_complete') and isinstance(net,(float,int)) and isinstance(risk,(float,int)) and risk>0 else ''
+            text+=f"{proposal.get('symbol',row.get('symbol','?'))} | Net: {number(net)} USDT{result}"
+            text+=f" | {horizon}\n" if horizon else "\n"
         return text+'Eksik ücret/funding bilgisi sıfır kabul edilmez.'
 
     def _command(self,account_id,command):

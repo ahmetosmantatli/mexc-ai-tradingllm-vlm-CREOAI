@@ -232,8 +232,9 @@ class LiveRunner:
         try:
             if not self._enabled():
                 return None
+            runner2=self._control().get('runner_id')=='runner2'
             scan=MarketScanner(self.public,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,
-                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True,structure_setups_enabled=self.cfg.live_structure_setups_enabled and self.cfg.live_price_plan_enabled).scan()
+                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True,structure_setups_enabled=self.cfg.live_structure_setups_enabled and self.cfg.live_price_plan_enabled, multihorizon=runner2).scan()
             errors=dict(scan.errors)
             quant_count=len(scan.candidates)
             try:
@@ -246,9 +247,14 @@ class LiveRunner:
             for candidate in scan.candidates:
                 closed=candidate.features.get('source_closed_at')
                 opened=candidate.features.get('source_open_at')
-                if candidate.confidence<.65 or not isinstance(closed,(int,float)) or opened is None or not 0<=time.time()-closed<=1200:
+                max_age=14400 if candidate.features.get('seed_timeframe')=='4h' else 1200
+                if candidate.confidence<.65 or not isinstance(closed,(int,float)) or opened is None or not 0<=time.time()-closed<=max_age:
                     continue
-                key=hashlib.sha256(f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}:{int(float(opened))}:{candidate.features.get("review_event_key","")}'.encode()).hexdigest()
+                seed=candidate.features.get('seed_timeframe')
+                identity=f'{candidate.symbol}:{candidate.strategy.value}:{candidate.side.value}:{int(float(opened))}:{candidate.features.get("review_event_key","")}'
+                if seed:
+                    identity+=f':{seed}'
+                key=hashlib.sha256(identity.encode()).hexdigest()
                 candidate.features['dedup_key']=key
                 eligible.append(candidate)
             if not self._enabled():
@@ -336,6 +342,7 @@ class LiveRunner:
             runner_id=runner_id,
             setup_family=(result.metadata.get('setup_selection') or {}).get('family',candidate.features.get('setup_family')),
             setup_id=(result.metadata.get('setup_selection') or {}).get('setup_id'),
+            trade_horizon=result.metadata.get('trade_horizon'),
             contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
             decision_ai=result.metadata.get('decision_ai',{}),account_generation=snapshot['generation'])
         return proposal

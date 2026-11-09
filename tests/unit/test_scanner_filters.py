@@ -105,3 +105,33 @@ def test_scan_records_safe_http_category_not_response_body():
     result=MarketScanner(client).scan()
     assert result.errors=={'BTC_USDT':'HTTP_429'}
     assert 'PRIVATE' not in str(result)
+
+
+def test_runner2_swing_scan_does_not_need_a_15m_signal(monkeypatch):
+    from types import SimpleNamespace
+
+    now=1440000
+    monkeypatch.setattr('trading.quant.scanner.time.time',lambda:now)
+    ticker=TickerSnapshot(symbol='BTC_USDT',last_price=101,bid1=100.99,ask1=101.01,quote_volume_24h=10_000_000)
+    calls=[]
+
+    def klines(symbol,interval,limit):
+        calls.append(interval)
+        seconds={'Hour4':14400,'Min5':300,'Min15':900}[interval]
+        rows=[[now-seconds*(35-i),98.,99.,96.,98.,1.] for i in range(35)]
+        if interval=='Min15':
+            rows=[]
+        if interval=='Hour4':
+            rows[-11][2]=112.
+            rows[-7][2]=100.
+            rows[-4][3]=94.
+            rows[-1][1:5]=[99.,102.,98.,101.]
+        return dict(symbol=symbol,interval=interval,candles=rows)
+
+    client=SimpleNamespace(list_contract_symbols=lambda:['BTC_USDT'],list_fee_free_candidates=lambda:[],
+        get_all_tickers=lambda:[ticker],get_klines=klines)
+    scanner=MarketScanner(client,strategies=(),bulk_tickers=True,structure_setups_enabled=True,multihorizon=True)
+    scan=scanner.scan()
+    assert set(calls)=={'Min5','Min15','Hour4'}
+    assert [c.features.get('seed_timeframe') for c in scan.candidates]==['4h']
+    assert scan.candidates[0].features['source_closed_at']==now

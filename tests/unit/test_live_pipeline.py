@@ -209,7 +209,7 @@ def test_ai_selected_wick_stop_and_target_reach_native_exchange_protection(tmp_p
     runner=LiveRunner(cfg,store=store,account_id='ahmet',binding_id='binding-1',private=private,public=public,llm=llm,
         external_control=lambda:dict(control),executor=executor)
     monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='bars',
-        to_context=lambda:{'timeframes':[dict(timeframe='15m',recent_ohlcv=deepcopy(rows))]}))
+        to_context=lambda **kw:{'timeframes':[dict(timeframe='15m',recent_ohlcv=deepcopy(rows))]}))
     monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
     executor.grant_start('7',1)
     signal=candidate()

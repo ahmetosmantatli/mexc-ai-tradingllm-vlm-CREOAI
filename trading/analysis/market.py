@@ -10,8 +10,11 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 from math import isfinite
+from statistics import median
 import re
 from time import time
+
+import httpx
 
 TIMEFRAMES = {'4h': ('Hour4', 14400), '15m': ('Min15', 900), '5m': ('Min5', 300)}
 FEATURE_VERSION = 'pa-closed-v1'
@@ -114,6 +117,41 @@ def structure_features(candles, *, swing_radius=2):
                 caveat='FVGs are historical formations, not asserted unfilled zones; patterns are not calibrated trade probabilities.')
 
 
+def ict_features(candles, features):
+    """Operational ICT labels from closed candles, without trade-flow inference."""
+    by_time={c.timestamp:i for i,c in enumerate(candles)}
+    previous=None
+    shifts=[]
+    blocks=[]
+    for br in features['breaks']:
+        direction=br['direction']
+        index=by_time[br['at']]
+        candle=candles[index]
+        bullish=direction=='bullish'
+        choch=previous is not None and previous!=direction
+        previous=direction
+        bodies=[abs(bar.close-bar.open) for bar in candles[max(0,index-10):index]]
+        displacement=(len(bodies)>=5 and abs(candle.close-candle.open)>1.5*median(bodies)
+                      and (candle.close>candle.open if bullish else candle.close<candle.open))
+        if choch:
+            recent={bar.timestamp for bar in candles[max(0,index-3):index]}
+            swept=any(sweep['at'] in recent and sweep['direction']==('low_sweep' if bullish else 'high_sweep')
+                      for sweep in features['sweeps'])
+            shifts.append(dict(br,kind='mss' if swept and displacement else 'choch'))
+        if not displacement:
+            continue
+        block=next((bar for bar in reversed(candles[max(0,index-3):index])
+                    if (bar.close<bar.open if bullish else bar.close>bar.open)),None)
+        if block is None:
+            continue
+        later=candles[index+1:]
+        invalid=any(bar.close<block.low if bullish else bar.close>block.high for bar in later)
+        touched=any(bar.low<=block.high and bar.high>=block.low for bar in later)
+        blocks.append(dict(direction=direction,open_time=block.timestamp,confirmed_by=br['at'],
+            low=block.low,high=block.high,status='invalidated' if invalid else 'retested' if touched else 'untested'))
+    return dict(structure_shifts=shifts[-4:],order_block_candidates=blocks[-4:])
+
+
 @dataclass(frozen=True)
 class TimeframeView:
     label: str
@@ -130,9 +168,10 @@ class TimeframeView:
         material = json.dumps([c.row() for c in self.candles], separators=(',', ':'), allow_nan=False)
         return sha256(material.encode()).hexdigest()
 
-    def to_context(self):
+    def to_context(self, *, ict=False):
+        features={**self.features, **ict_features(self.candles,self.features)} if ict else self.features
         return dict(timeframe=self.label, closed_at=self.closed_at, history_bars=len(self.candles),
-                    fingerprint=self.fingerprint, features=self.features,
+                    fingerprint=self.fingerprint, features=features,
                     recent_ohlcv=[c.row() for c in self.candles[-12:]])
 
 
@@ -148,11 +187,76 @@ class AnalysisBundle:
     def fingerprint(self):
         return sha256((self.symbol+':'+':'.join(v.fingerprint for v in self.views)).encode()).hexdigest()
 
-    def to_context(self):
+    def to_context(self, *, ict=False):
         return dict(symbol=self.symbol, exchange=self.exchange, instrument=self.instrument,
                     observed_at=self.observed_at, fingerprint=self.fingerprint,
                     feature_version=FEATURE_VERSION,
-                    timeframes=[v.to_context() for v in self.views])
+                    timeframes=[v.to_context(ict=ict) for v in self.views])
+
+
+def trade_flow_context(client, symbol):
+    """Reported trade-side imbalance over a bounded recent sample."""
+    fetch=getattr(client,'get_recent_trades',None)
+    if not callable(fetch):
+        return None
+    try:
+        rows=fetch(symbol)
+        now=time()*1000
+        volume={1:0.,2:0.}
+        timestamps=[]
+        for row in rows:
+            side,stamp,quantity=row['T'],row['t'],float(row['v'])
+            if (type(side) is not int or side not in volume or type(stamp) is not int
+                    or not isfinite(quantity) or quantity<=0 or stamp>now+5000):
+                raise ValueError('invalid trade sample')
+            if stamp>=now-60000 and row.get('M')!=1:
+                volume[side]+=quantity
+                timestamps.append(stamp)
+        if not timestamps:
+            return None
+        total=volume[1]+volume[2]
+        if not isfinite(total):
+            return None
+        return dict(source='MEXC recent trades',sample_is_complete=False,trade_count=len(timestamps),
+            first_at_ms=min(timestamps),last_at_ms=max(timestamps),
+            buy_quantity=volume[1],sell_quantity=volume[2],imbalance=(volume[1]-volume[2])/total)
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError, httpx.HTTPError):
+        return None
+
+
+def benchmark_context(client, market):
+    """Compare returns across identical closed intervals, using shared public caches."""
+    result={}
+    fetch=getattr(client,'get_klines',None)
+    if not callable(fetch):
+        return result
+    observed=market.get('observed_at')
+    for symbol in ('BTC_USDT','ETH_USDT'):
+        if symbol==market.get('symbol'):
+            continue
+        frames={}
+        for view in market.get('timeframes',[]):
+            tf=view['timeframe']
+            interval,seconds=TIMEFRAMES[tf]
+            rows=view.get('recent_ohlcv',[])
+            if len(rows)<7 or observed is None:
+                continue
+            try:
+                payload=fetch(symbol,interval=interval,limit=61)
+                if payload.get('symbol')!=symbol or payload.get('interval')!=interval:
+                    raise ValueError('benchmark identity mismatch')
+                end=rows[-1][0]
+                candles=closed_candles(payload['candles'],seconds,min(observed,end+seconds))
+                if candles[-1].timestamp!=end or candles[-7].timestamp!=rows[-7][0]:
+                    raise ValueError('benchmark bars not aligned')
+                benchmark=candles[-1].close/candles[-7].close-1
+                relative=rows[-1][4]/rows[-7][4]-1-benchmark
+                frames[tf]=dict(closed_at=end+seconds,trend=structure_features(candles)['trend'],
+                    return_6_bars=benchmark,relative_return_6_bars=relative)
+            except (ValueError, KeyError, TypeError, OSError, RuntimeError, httpx.HTTPError):
+                frames[tf]=None
+        result[symbol]=frames
+    return result
 
 
 def build_bundle(client, symbol, *, now=None, limit=120):

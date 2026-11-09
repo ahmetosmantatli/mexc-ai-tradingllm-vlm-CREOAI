@@ -166,8 +166,11 @@ class ContextEvaluator:
             scope='runner2:'+scope
         self.store.put('stage','fetching_multitimeframe_context')
         bundle = build_bundle(self.public, symbol)
-        chart_context = bundle.to_context()
+        chart_context = bundle.to_context(ict=True) if runner2 else bundle.to_context()
         fingerprint = bundle.fingerprint
+        if runner2:
+            from trading.analysis.market import benchmark_context
+            chart_context['benchmarks']=benchmark_context(self.public,chart_context)
         key = f'memory:{symbol}:{scope}'
         legacy = self.store.get('memory:'+symbol, {})
         memory = self.store.get(key)
@@ -201,12 +204,16 @@ class ContextEvaluator:
         options=[]
         if selection_enabled:
             from trading.quant.structure_setups import build_structure_setups
-            options=build_structure_setups(chart_context,current_price=candidate.entry_price,price_step=price_rules.price_step)
+            frames=('5m','15m','4h') if runner2 else (None,)
+            options=[setup for frame in frames for setup in build_structure_setups(chart_context,
+                current_price=candidate.entry_price,price_step=price_rules.price_step,trigger_timeframe=frame)]
         account['setup_selection']=dict(enabled=selection_enabled,options=options,
             countertrend_max_risk_fraction=risk_per_trade_pct*.5,
             note='Select setup_id and provide a fresh grounded price_plan for TRADE. No hypothesis means no forced trade.')
         economic_basis=economic_review_key(account,positions)
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
+        if runner2:
+            economic_basis['benchmarks']=chart_context['benchmarks']
         evaluation_key=digest(dict(policy=POLICY_VERSION,market=fingerprint,scope=scope,economic_basis=economic_basis))
         if memory.get('last_evaluation_key')==evaluation_key:
             self.store.put('stage','unchanged_closed_candles')
@@ -225,6 +232,9 @@ class ContextEvaluator:
             structural=prior_watch.get('reason')=='structure_changed'
             changes.update(reason='watch_structure_changed' if structural else 'watch_triggered',
                 summary='Takip gerekçesine karşı kapanmış yapısal kırılım oluştu; plan yeniden inceleniyor.' if structural else 'Takip koşulu gerçekleşti; eski algoritmadan yeni sinyal beklenmeden plan inceleniyor.')
+        if runner2:
+            from trading.analysis.market import trade_flow_context
+            chart_context['recent_trade_flow']=trade_flow_context(self.public,symbol)
         prompt=build_prompt(candidate,chart_context,memory,positions,account,self.cfg.analysis_version,changes)
         charts=render_bundle(bundle,Path(self.cfg.analysis_chart_dir)/symbol/fingerprint[:16])
         paths=[str(c.path) for c in charts]
@@ -261,6 +271,10 @@ class ContextEvaluator:
             if decision.price_plan is not None:
                 if not price_planning or decision.action!='trade':
                     raise ValueError('price planning disabled or not trade')
+                if option and option.get('horizon')=='swing' and (
+                        decision.price_plan.stop_reference.timeframe!='4h'
+                        or decision.price_plan.target_reference.timeframe!='4h'):
+                    raise ValueError('swing requires 4h stop and target references')
                 apply_market_price_plan(chosen,decision.price_plan,evidence_from_market(chart_context),
                     price_step=price_rules.price_step,current_price=candidate.entry_price,now=time.time())
             if decision.action=='trade' and decision.signal_id!=candidate.signal_id:
@@ -278,7 +292,12 @@ class ContextEvaluator:
         if hasattr(self.llm,'response_validator'):
             self.llm.response_validator=validate
         policy=SYSTEM_POLICY+(' Runner 2 trade requires a grounded price_plan. Use market as the reference entry_type; '
-                              'execution independently enforces a fresh IOC price limit.' if runner2 else '')
+                              'execution independently enforces a fresh IOC price limit. Compare scalp, intraday, and swing as separate theses; '
+                              'a swing uses 4h stop and target candle references even if execution uses a finer entry. '
+                              'CHoCH is an opposite closed swing break; MSS adds recent sweep and displacement. '
+                              'Order block candidates are opposing candles before displacement and may be retested or invalidated. '
+                              'Use visible wick references for levels and confirmed structure for invalidation. '
+                              'BTC/ETH relative returns and recent_trade_flow are optional context, never an automatic veto. The flow is a bounded exchange trade-side sample; null means unavailable.' if runner2 else '')
         payload=self.llm.complete_json(system=policy,user=prompt,max_tokens=1100 if price_planning else 700,
             images=paths if self.cfg.analysis_version=='vlm' else None)
         provider_trace=copy.deepcopy(getattr(self.llm,'last_trace',{}) or {})
@@ -315,6 +334,11 @@ class ContextEvaluator:
         candidate,selection=validate_selection(decision,candidate,options,selection_enabled)
         trace.update(setup_id=decision.setup_id,setup_family=selection['family'] if selection else candidate.features.get('setup_family'),side=candidate.side.value)
         metadata['setup_selection']=copy.deepcopy(selection)
+        if runner2 and decision.price_plan:
+            from trading.quant.structure_setups import trade_horizon
+            frame=selection['trigger_timeframe'] if selection else decision.price_plan.entry_timeframe
+            metadata['trade_horizon']=trade_horizon(frame,time.time())
+            trace['trade_horizon']=metadata['trade_horizon']['style']
         shadow_plan=None
         def reject_coordinated(reason):
             trace.update(status=reason,action='hold',execution_status='not_opened',rationale=decision.rationale)
@@ -372,6 +396,8 @@ class ContextEvaluator:
         # Save dedup against the state our own successful commit created so HOLD
         # cannot invalidate its own cache through a coordinator revision bump.
         economic_basis['account']['canonical_watch']=watch_review_key(current_watch)
+        if runner2:
+            economic_basis['benchmarks']=chart_context['benchmarks']
         evaluation_key=digest(dict(policy=POLICY_VERSION,market=fingerprint,scope=scope,economic_basis=economic_basis))
         trace.update(status='completed',action=decision.action,rationale=decision.rationale,
             invalidation=decision.invalidation,watch_note=decision.watch_note,

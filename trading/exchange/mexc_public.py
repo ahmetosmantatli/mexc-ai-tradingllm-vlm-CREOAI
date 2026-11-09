@@ -259,6 +259,15 @@ class MexcPublicClient:
             "source": "http",
         }
 
+    def get_recent_trades(self, symbol: str) -> list[dict]:
+        if self.use_fixtures:
+            return []
+        payload = self._json("GET", f"/api/v1/contract/deals/{symbol.upper()}", params={"limit": 100})
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("invalid recent trade response")
+        return rows
+
     def get_depth(self, symbol: str, limit: int = 20) -> dict[str, Any]:
         sym = symbol.upper()
         if self.use_fixtures:

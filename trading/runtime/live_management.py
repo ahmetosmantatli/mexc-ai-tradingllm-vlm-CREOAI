@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from trading.evaluation.context import compact_market, digest
 from trading.evaluation.price_plan import CandleReference, evidence_from_market, _reference
 from trading.runtime.usage import archive_trace
+from trading.quant.structure_setups import trade_horizon
 
 TIMEFRAME_SECONDS={'5m':300,'15m':900,'4h':14400}
 
@@ -75,7 +76,10 @@ RUNNER2_POLICY=COMMON_POLICY+(
     ' Runner 2 also supports action move_target once, on a near-target event before the native target touches. '
     'Keep the stop unchanged. Supply target_price and target_reference only for move_target, both null otherwise. '
     'Target must extend in the profitable direction and anchor to a supplied closed high for long or low for short. '
-    'Explain why confirmed continuation supports the extension; otherwise hold, reduce, or close.'
+    'Explain why confirmed continuation supports the extension; otherwise hold, reduce, or close. '
+    'To promote an existing horizon, propose move_target with a higher review_timeframe and target reference in that timeframe. '
+    'Promotion requires a recent directional break on that timeframe; the native stop stays unchanged. '
+    'A horizon_due event asks for review, never automatic closing. CHoCH/MSS and candidate order blocks are closed-candle evidence.'
 )
 
 
@@ -144,7 +148,10 @@ class LivePositionManager:
             near_target=(card.get('last_near_target')!=target and
                          distance<=min(.25*initial_risk,.5*card.get('review_atr',0)))
         entry_timeframe=(metadata.get('price_plan') or {}).get('entry_timeframe')
-        timeframe=card.get('review_timeframe') or entry_timeframe or '15m'
+        horizon=(intent.get('trade_horizon') or metadata.get('trade_horizon')) if runner2 else None
+        timeframe=(horizon or {}).get('review_timeframe') or card.get('review_timeframe') or entry_timeframe or '15m'
+        due_at=(horizon or {}).get('review_due_at')
+        horizon_due=due_at is not None and now>=due_at and card.get('last_horizon_due')!=due_at
         milestone=min(100,max(0,int(math.floor(card.get('mfe_r',0)))))
         previous=card.get('last_event') or {}
         retry=card.get('provider_retry') or {}
@@ -153,11 +160,14 @@ class LivePositionManager:
                    and retry.get('at',0)<=now<retry.get('expires_at',0))
         # No reason to download three histories again before either trigger can change.
         if (previous.get('timeframe')==timeframe and previous.get('favorable_r_milestone')==milestone
-                and now<previous.get('closed_at',0)+TIMEFRAME_SECONDS[timeframe] and not retry_due and not near_target):return
-        bundle=build_bundle(r.public,symbol);market=bundle.to_context()
+                and now<previous.get('closed_at',0)+TIMEFRAME_SECONDS[timeframe] and not retry_due and not near_target and not horizon_due):return
+        bundle=build_bundle(r.public,symbol)
+        market=bundle.to_context(ict=True) if runner2 else bundle.to_context()
         view=next((v for v in market['timeframes'] if v['timeframe']==timeframe),None)
         if view is None:raise ValueError('management entry timeframe evidence missing')
         event=dict(timeframe=timeframe,closed_at=view['closed_at'],favorable_r_milestone=milestone)
+        if horizon_due or (retry_due and due_at is not None and previous.get('horizon_due')==due_at):
+            event['horizon_due']=due_at
         if runner2:
             evidence=evidence_from_market(market)
             ref=CandleReference(timeframe=timeframe,open_time=int(evidence[timeframe][-1][0]),field='high')
@@ -177,6 +187,8 @@ class LivePositionManager:
                 current['review_atr']=review_atr
                 if near_target:
                     current['last_near_target']=target
+            if horizon_due:
+                current['last_horizon_due']=due_at
             current.pop('provider_retry',None)
             r.store.put(key,current)
             card=current
@@ -196,8 +208,13 @@ class LivePositionManager:
             previous_decisions=card.get('decisions',[])[-5:],confirmed_actions=intent.get('management_events',[])[-5:],
             management_revision=revision)
         if runner2:
+            position_card['trade_horizon']=horizon
             position_card['target_extension_available']=bool(near_target and not intent.get('target_extensions'))
         quote=r.quote(symbol);rules=r.public.get_contract_rules(symbol)
+        if runner2:
+            from trading.analysis.market import benchmark_context, trade_flow_context
+            market['benchmarks']=benchmark_context(r.public,market)
+            market['recent_trade_flow']=trade_flow_context(r.public,symbol)
         prompt=json.dumps(dict(task='manage_existing_position',event=event,position=position_card,
             account=r._live_context(snapshot,control),market=compact_market(market),
             current_quote=dict(bid=quote.bid1,ask=quote.ask1,fair=quote.raw['fairPrice']),price_step=rules.price_step),
@@ -235,6 +252,16 @@ class LivePositionManager:
                         or not (decision.target_price>target and anchor>target if long else decision.target_price<target and anchor<target)
                         or abs(decision.target_price-anchor)>max(atr,rules.price_step)+rules.price_step*1e-6):
                     raise ValueError('management target requires a grounded extension')
+                if horizon and TIMEFRAME_SECONDS[decision.review_timeframe]>TIMEFRAME_SECONDS[timeframe]:
+                    higher=next((v for v in market['timeframes'] if v['timeframe']==decision.review_timeframe),{})
+                    features=higher.get('features',{})
+                    direction='bullish' if long else 'bearish'
+                    recent=higher.get('recent_ohlcv',[])[-3:]
+                    if (reference.timeframe!=decision.review_timeframe or features.get('trend')!=direction
+                            or not any(br['direction']==direction and br['at'] in {bar[0] for bar in recent}
+                                       for br in features.get('breaks',[]))):
+                        raise ValueError('horizon promotion requires recent higher timeframe continuation')
+
             return decision
         try:
             llm.response_validator=validate
@@ -266,6 +293,9 @@ class LivePositionManager:
             if not self._permitted(control.get('updated_at')) or time.time()-now>r.cfg.decision_ttl_seconds:
                 trace['execution_reason']='management_control_changed_or_expired';return
             data=decision.model_dump();data['ai']=ai
+            if (horizon and decision.action=='move_target'
+                    and TIMEFRAME_SECONDS[decision.review_timeframe]>TIMEFRAME_SECONDS[timeframe]):
+                data['trade_horizon']=trade_horizon(decision.review_timeframe,time.time())
             latest=r.executor.state(intent['intent_id'])
             if latest.get('management_revision',0)!=revision or latest.get('status')!='protected':
                 trace['execution_reason']='management_position_changed';return

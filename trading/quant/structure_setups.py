@@ -11,6 +11,13 @@ from math import isfinite
 VERSION = 'structure-setups-v1'
 FAMILIES = ('trend_continuation', 'pullback', 'countertrend_sweep_reclaim')
 SECONDS = {'5m': 300, '15m': 900, '4h': 14400}
+HORIZONS = {'5m': 'scalp', '15m': 'intraday', '4h': 'swing'}
+REVIEW_BARS = {'5m': 6, '15m': 12, '4h': 12}
+
+
+def trade_horizon(frame, now):
+    return dict(style=HORIZONS[frame], review_timeframe=frame,
+                review_due_at=now+SECONDS[frame]*REVIEW_BARS[frame])
 
 
 def _positive(value):
@@ -82,7 +89,7 @@ def _atr(rows):
                for i, r in enumerate(rows) if i) / (len(rows) - 1)
 
 
-def build_structure_setups(market_context, *, current_price, price_step=0):
+def build_structure_setups(market_context, *, current_price, price_step=0, trigger_timeframe=None):
     """Return grounded READY/WATCH alternatives with stable IDs and price refs.
 
     READY means the specified closed-bar pattern occurred, never authorization to
@@ -94,15 +101,16 @@ def build_structure_setups(market_context, *, current_price, price_step=0):
             or not isinstance(price_step, (int, float)) or not isfinite(price_step) or price_step < 0):
         return []
     views = _views(market_context)
-    if '5m' not in views and '15m' not in views:
+    micro_tf = trigger_timeframe or ('5m' if '5m' in views else '15m')
+    if micro_tf not in views:
         return []
     macro = views.get('4h', {}).get('features', {}).get('trend', 'unknown')
-    micro_tf = '5m' if '5m' in views else '15m'
     micro = views[micro_tf]; latest = micro['rows'][-1]
     bias = macro if macro in ('bullish', 'bearish') else micro['features'].get('trend')
     if bias not in ('bullish', 'bearish'):
         return []
-    targets = {'long': _swings(views, 'high'), 'short': _swings(views, 'low')}
+    target_views = {micro_tf: micro} if trigger_timeframe else views
+    targets = {'long': _swings(target_views, 'high'), 'short': _swings(target_views, 'low')}
     hypotheses = []
 
     def add(family, side, stop_ref, evidence, *, ready=True, trigger=None):
@@ -122,7 +130,7 @@ def build_structure_setups(market_context, *, current_price, price_step=0):
             return
         reference = lambda ref: {k: ref[k] for k in ('timeframe', 'open_time', 'field')}
         material = dict(version=VERSION, symbol=market_context.get('symbol'), family=family, side=side,
-                        source_closed_at=micro['closed_at'], evidence=evidence, stop=stop, target=target,
+                        source_closed_at=micro['closed_at'], **({'horizon': HORIZONS[micro_tf]} if trigger_timeframe else {}), evidence=evidence, stop=stop, target=target,
                         trigger=trigger, state='ready' if ready else 'watch')
         ident = sha256(json.dumps(material, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:24]
         hypotheses.append(dict(setup_id=ident, **material, macro_trend=macro, requires_full_context=any(tf not in views for tf in ('4h','15m','5m')),
@@ -155,19 +163,20 @@ def build_structure_setups(market_context, *, current_price, price_step=0):
 
     # Pullback: retest/reclaim a *previous* 15m break level in macro direction.
     # The 5m trend may oppose 4h during the pullback; universal TF alignment is not required.
-    for br in reversed(views.get('15m', {}).get('features', {}).get('breaks', [])):
+    retest_tf = {'5m':'15m','15m':'4h','4h':'4h'}[micro_tf] if trigger_timeframe else '15m'
+    for br in reversed(views.get(retest_tf, {}).get('features', {}).get('breaks', [])):
         level = br.get('level')
-        if br.get('direction') != bias or not _positive(level) or br.get('at', float('inf')) + 900 > latest[0]:
+        if br.get('direction') != bias or not _positive(level) or br.get('at', float('inf')) + SECONDS[retest_tf] > latest[0]:
             continue
         reclaimed = latest[3] <= level < latest[4] if macro_side=='long' else latest[2] >= level > latest[4]
         if reclaimed:
             ref = _reference(micro, micro_tf, latest[0], field)
-            add('pullback', macro_side, ref, dict(kind='prior_15m_bos_retest_reclaim', entry_timeframe=micro_tf, level=level, break_at=br['at'], reclaim_at=latest[0]))
+            add('pullback', macro_side, ref, dict(kind=f'prior_{retest_tf}_bos_retest_reclaim', entry_timeframe=micro_tf, level=level, break_at=br['at'], reclaim_at=latest[0]))
             break
 
     # Countertrend: actual wick sweep AND same closed candle reclaim, never a
     # stretched SMA/ROC alone. Both bullish and bearish mirrors are evaluated.
-    for tf in ('5m', '15m'):
+    for tf in ((micro_tf,) if trigger_timeframe else ('5m', '15m')):
         view = views.get(tf)
         if not view:
             continue
