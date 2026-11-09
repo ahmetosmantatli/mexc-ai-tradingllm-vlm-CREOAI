@@ -49,13 +49,13 @@ def ready_answer(data, **extra):
     return answer
 
 
-def evaluator(tmp_path, monkeypatch, model, market=None):
+def evaluator(tmp_path, monkeypatch, model, market=None, version='text'):
     market = rebase_market() if market is None else market
     monkeypatch.setattr('trading.analysis.build_bundle', lambda *args, **kwargs:
                         SimpleNamespace(fingerprint='lane', to_context=lambda **kw: deepcopy(market)))
     monkeypatch.setattr('trading.analysis.render_bundle', lambda *args, **kwargs:
                         [SimpleNamespace(path=tmp_path / 'chart.png')])
-    settings = Settings(_env_file=None, analysis_version='text', live_structure_setups_enabled=True,
+    settings = Settings(_env_file=None, analysis_version=version, live_structure_setups_enabled=True,
                         live_price_plan_enabled=True)
     store = RuntimeStore(str(tmp_path / 'state'))
     reviewed = ContextEvaluator(model, store,
@@ -149,6 +149,100 @@ def test_vlm_timeout_keeps_the_text_decision_and_labels_it_text(tmp_path, monkey
     assert limits[-1]['limit_price'] == model.late_limit
     assert limits[-1]['status'] == 'resting'
     assert limits[-1]['decision_mode'] == 'vlm'
+
+
+def hold_answer(rationale):
+    return dict(action='hold', signal_id=None, rationale=rationale,
+                invalidation='Kurulum bozulursa bekleme biter.', watch_note='')
+
+
+def test_silent_or_invalid_vlm_keeps_the_text_decision_without_waiting(tmp_path, monkeypatch):
+    monkeypatch.setattr('trading.evaluation.service.VLM_DECISION_TIMEOUT_SECONDS', 2)
+
+    def text(packet):
+        return ready_answer(packet, rationale='Metin modeli hazır kurulumu şimdi alıyor.')
+
+    def vision(model, packet):
+        model.vision_answer = None if silent else {'action': 'trade', 'rationale': 'bozuk'}
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    for silent in (True, False):
+        model = DecisionModel(text, vision)
+        run, store = evaluator(tmp_path / ('silent' if silent else 'invalid'), monkeypatch, model)
+        started = time.time()
+        result = run()
+        assert time.time() - started < 1
+        assert result.action.value == 'trade'
+        assert result.proposal is not None
+        assert result.metadata['decision_ai']['review_mode'] == 'text'
+        assert result.metadata['rationale'].startswith('Metin modeli')
+        assert store.get('local_entry_limits', []) == []
+        assert store.get('analysis_trace')['decision_mode'] == 'text'
+
+
+def test_text_and_vlm_silence_or_invalid_output_places_no_order(tmp_path, monkeypatch):
+    def text(packet):
+        if boom:
+            raise RuntimeError('provider down')
+        return None if silent else {'action': 'trade'}
+
+    def vision(model, packet):
+        assert packet['account']['text_model_decision']['action'] is None
+        model.vision_answer = None if silent or boom else {'no': 'decision'}
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    for silent, boom in ((True, False), (False, False), (False, True)):
+        model = DecisionModel(text, vision)
+        run, store = evaluator(tmp_path / f'{silent}-{boom}', monkeypatch, model)
+        result = run()
+        assert result.action.value == 'hold'
+        assert result.proposal is None
+        assert result.hold_reason == 'invalid_or_unavailable_model'
+        assert store.get('analysis_trace')['action'] == 'hold'
+        assert store.get('analysis_trace')['execution_status'] == 'not_opened'
+        assert store.get('local_entry_limits', []) == []
+
+
+def test_valid_bekle_places_no_order_and_does_not_chase_another_route(tmp_path, monkeypatch):
+    def text(packet):
+        return hold_answer('Metin modeli bekliyor.') if text_holds else ready_answer(
+            packet, rationale='Metin modeli hazır kurulumu şimdi alıyor.')
+
+    def vision(model, packet):
+        model.vision_answer = hold_answer('Grafik modeli bekliyor.')
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'success'}]}
+
+    for text_holds in (True, False):
+        model = DecisionModel(text, vision)
+        run, _store = evaluator(tmp_path / str(text_holds), monkeypatch, model)
+        result = run()
+        assert result.action.value == 'hold'
+        assert result.proposal is None
+        assert result.hold_reason == 'hold'
+        assert len(model.calls) == 2
+        assert model.calls[1].get('images')
+        assert result.metadata['decision_ai']['review_mode'] == 'vlm'
+
+
+def test_missing_chart_does_not_block_the_text_decision(tmp_path, monkeypatch):
+    def text(packet):
+        return ready_answer(packet, rationale='Metin modeli grafiksiz kurulumu alıyor.')
+
+    def vision(model, packet):
+        raise AssertionError('chart failure must not call VLM')
+
+    model = DecisionModel(text, vision)
+    run, store = evaluator(tmp_path, monkeypatch, model, version='vlm')
+    monkeypatch.setattr('trading.analysis.render_bundle', lambda *args, **kwargs: (_ for _ in ()).throw(OSError('chart')))
+    started = time.time()
+    result = run()
+    assert time.time() - started < 1
+    assert result.action.value == 'trade'
+    assert result.metadata['decision_ai']['review_mode'] == 'text'
+    assert result.metadata['rationale'].startswith('Metin modeli')
+    assert len(model.calls) == 1
+    assert model.calls[0].get('images') is None
+    assert store.get('analysis_trace')['decision_mode'] == 'text'
 
 
 def test_valid_vlm_decision_replaces_the_text_decision(tmp_path, monkeypatch):
@@ -387,6 +481,40 @@ def test_stronger_parallel_plan_is_applied_first(tmp_path):
     assert runner.cycle()['reason'] == 'HOLD_LIVE_MODEL'
     assert order == ['ETH_USDT', 'BTC_USDT']
     assert executor.calls == []
+
+
+def test_late_vlm_after_the_order_does_not_cancel_or_resize_it(tmp_path):
+    from copy import deepcopy
+    from trading.evaluation.pending_vlm import PendingVlm
+    from trading.evaluation.service import ModelDecision
+    from .test_live_runner import candidate, prepare, result
+
+    runner, _, executor, control = prepare(tmp_path)
+    seed = candidate()
+    runner.candidate_queue().refresh([seed])
+    trade = result(runner, seed)
+    pending = PendingVlm(runner.store, fee=0.0006, slippage=0.0005)
+    trade.metadata['pending_vlm'] = pending
+    status = runner._apply(seed, trade, control)
+    assert status['reason'] == 'LIVE_PROTECTED'
+    sent = deepcopy(executor.proposal)
+    late = ModelDecision.model_validate(dict(
+        action='trade', signal_id=seed.signal_id, release_symbol='ETH_USDT', thesis_invalidated=True,
+        limit_price=90, rationale='Geç gelen grafik emri küçültüp diğerini kapatsın.',
+        invalidation='Stop altı.', watch_note='',
+        sizing_plan={'leverage': 20, 'risk_per_trade_pct': .02},
+        price_plan=dict(entry_type='market', entry_price=100, entry_timeframe='15m',
+                        stop_loss_price=98, take_profit_price=106,
+                        stop_reference=dict(timeframe='15m', open_time=1, field='low'),
+                        target_reference=dict(timeframe='15m', open_time=1, field='high'),
+                        reason='Bu plan yalnızca sonraki tetik için yazılır.')))
+    pending.complete(dict(decision=late, symbol='BTC_USDT'))
+    assert [row[0] for row in executor.calls] == ['authorize', 'execute']
+    assert executor.proposal.notional == sent.notional
+    assert executor.proposal.leverage == sent.leverage
+    assert executor.proposal.stop_loss.price == sent.stop_loss.price
+    assert pending.late_action == 'local_plan'
+    assert runner.store.get('local_plan_updates')[-1]['status'] == 'next_trigger'
 
 
 def test_profitable_plan_alone_does_not_close_an_open_trade(tmp_path, monkeypatch):

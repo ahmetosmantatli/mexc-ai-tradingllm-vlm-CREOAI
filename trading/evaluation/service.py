@@ -2,6 +2,7 @@ from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
 from trading.runtime import runner3_policy
 import copy
 from pathlib import Path
+import sqlite3
 import threading
 import time
 from uuid import uuid4
@@ -306,7 +307,8 @@ class ContextEvaluator:
         try:
             charts=render_bundle(bundle,Path(self.cfg.analysis_chart_dir)/symbol/fingerprint[:16])
         except (OSError, ValueError, RuntimeError):
-            if not runner3 or self.cfg.analysis_version != 'text':
+            # A missing chart must not block Runner 3. The text decision stands.
+            if not runner3:
                 raise
             charts=[]
         paths=[str(c.path) for c in charts]
@@ -501,8 +503,19 @@ class ContextEvaluator:
 
         provider_called = False
         pending = None
+
+        def failed_review(mode):
+            return dict(decision=None, called=False,
+                        attempts=[dict(review_mode=mode, status='error', generation_requests=0)],
+                        identity={}, prompt='', raw={})
+
         if runner3 and paths:
-            text_result = run_review('text', deadline_at=deadline)
+            try:
+                text_result = run_review('text', deadline_at=deadline)
+            except sqlite3.Error:
+                raise
+            except Exception:
+                text_result = failed_review('text')
             provider_called = bool(text_result['called'])
             text_decision = text_result['decision'] if time.time() - started <= self.cfg.decision_ttl_seconds else None
             text_attempts = text_result['attempts']
@@ -537,6 +550,7 @@ class ContextEvaluator:
 
             # Text already decided. VLM is asked the same question and has two minutes.
             threading.Thread(target=vlm_work, name='vlm-decision', daemon=True).start()
+            # Cap is the VLM deadline. An empty or invalid answer ends the wait immediately.
             arrived = finished.wait(VLM_DECISION_TIMEOUT_SECONDS)
             vlm_result = pending.take() if arrived else None
             if vlm_result is not None:
@@ -547,26 +561,46 @@ class ContextEvaluator:
                 decision_mode = 'vlm'
                 winning_identity = vlm_result.get('identity') or winning_identity
                 winning_prompt = vlm_result.get('prompt') or winning_prompt
-            elif not arrived and text_decision is not None:
-                pending.close_deadline()
-                if hasattr(vlm_client, 'on_trace'):
-                    vlm_client.on_trace = lambda update: None
+            elif text_decision is not None:
+                # Silence, timeout, or unusable chart output: the text decision stands.
+                if not arrived:
+                    pending.close_deadline()
+                    if hasattr(vlm_client, 'on_trace'):
+                        vlm_client.on_trace = lambda update: None
+                    attempts = list(text_attempts) + [dict(review_mode='vlm', status='timeout', generation_requests=0)]
+                    raw_trace = text_result['raw']
+                else:
+                    review = pending.box.get('value') or {}
+                    pending.close_deadline()
+                    if review.get('attempts'):
+                        attempts = review['attempts']
+                        raw_trace = review.get('raw') or raw_trace
+                        provider_called = provider_called or bool(review.get('called'))
                 decision = text_decision
                 decision_mode = 'text'
-                attempts = list(text_attempts) + [dict(review_mode='vlm', status='timeout', generation_requests=0)]
-                winning_identity = text_result['identity']
-                winning_prompt = text_result['prompt']
-                raw_trace = text_result['raw']
+                winning_identity = text_result['identity'] or winning_identity
+                winning_prompt = text_result['prompt'] or winning_prompt
             else:
                 review = pending.box.get('value') or {}
                 pending.close_deadline()
+                if not arrived and hasattr(vlm_client, 'on_trace'):
+                    vlm_client.on_trace = lambda update: None
                 if review.get('attempts'):
                     attempts = review['attempts']
                     raw_trace = review.get('raw') or raw_trace
                     provider_called = provider_called or bool(review.get('called'))
+                decision = None
+                decision_mode = None
         else:
             mode = 'vlm' if self.cfg.analysis_version == 'vlm' and paths else 'text'
-            single = run_review(mode, deadline_at=deadline)
+            try:
+                single = run_review(mode, deadline_at=deadline)
+            except sqlite3.Error:
+                raise
+            except Exception:
+                if not runner3:
+                    raise
+                single = failed_review(mode)
             provider_called = bool(single['called'])
             decision = single['decision']
             decision_mode = mode if decision is not None else None
