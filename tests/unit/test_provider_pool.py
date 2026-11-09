@@ -97,14 +97,15 @@ def test_duplicate_actual_key_is_not_a_second_route(tmp_path):
     assert len(p._slots)==1
 
 
-def test_same_group_keys_share_minute_and_daily_quota(tmp_path):
+def test_two_api_keys_stay_separate_pools_when_the_group_name_matches(tmp_path):
     cfg=settings(groq_api_key_2='private-groq-key-2',groq_rpm=1)
     calls=[]
-    p,_=pool(tmp_path,cfg,lambda request:(calls.append(request) or response()))
+    p,_=pool(tmp_path,cfg,lambda request:(calls.append(request.headers['authorization']) or response()))
+    assert len({s.group for s in p._slots})==2
+    assert len({p._pool_id(s, False) for s in p._slots})==2
     assert p.complete_json(system='s',user='u')=={'action':'hold'}
-    assert p.fork().complete_json(system='s',user='u') is None
-    assert len(calls)==1
-    assert len({s.group for s in p._slots})==1
+    assert p.fork().complete_json(system='s',user='u')=={'action':'hold'}
+    assert calls==['Bearer private-groq-key-1','Bearer private-groq-key-2']
 
 
 def test_daily_reservations_survive_restart(tmp_path):
@@ -139,12 +140,13 @@ def test_parallel_forks_choose_disjoint_group_leases(tmp_path):
     assert children[0].last_trace is not children[1].last_trace
 
 
-def test_parallel_same_group_is_not_double_leased(tmp_path):
+def test_parallel_keys_run_together_because_they_are_separate_pools(tmp_path):
     entered=threading.Event();release=threading.Event();calls=[]
     def transport(request):
         calls.append(request)
-        entered.set()
-        release.wait(timeout=3)
+        if request.headers['authorization'].endswith('private-groq-key-1'):
+            entered.set()
+            release.wait(timeout=3)
         return response()
     cfg=settings(groq_api_key_2='private-groq-key-2')
     p,_=pool(tmp_path,cfg,transport)
@@ -152,19 +154,29 @@ def test_parallel_same_group_is_not_double_leased(tmp_path):
     with ThreadPoolExecutor(2) as executor:
         running=executor.submit(first.complete_json,system='s',user='u')
         assert entered.wait(timeout=2)
-        assert second.complete_json(system='s',user='u') is None
+        assert second.complete_json(system='s',user='u')=={'action':'hold'}
         release.set()
         assert running.result(timeout=3)=={'action':'hold'}
-    assert len(calls)==1
+    assert len(calls)==2
+    assert {call.headers['authorization'] for call in calls}=={'Bearer private-groq-key-1','Bearer private-groq-key-2'}
 
 
-def test_429_shared_group_cooldown_does_not_use_other_nominal_key(tmp_path):
+def test_429_holds_only_that_key_and_the_other_account_still_answers(tmp_path):
     calls=[]
+    def transport(request):
+        calls.append(request.headers['authorization'])
+        if request.headers['authorization'].endswith('key-1'):
+            return httpx.Response(429,headers={'retry-after':'60'},json=dict(error=dict(message='private-secret')))
+        return response()
     cfg=settings(groq_api_key_2='private-groq-key-2')
-    p,_=pool(tmp_path,cfg,lambda request:(calls.append(request) or httpx.Response(429,headers={'retry-after':'60'},json=dict(error=dict(message='private-secret')))))
-    assert p.complete_json(system='s',user='u') is None
-    assert len(calls)==1
-    assert any(row['cooldown_seconds']>0 for row in p.snapshot()['groups'])
+    p,_=pool(tmp_path,cfg,transport)
+    assert p.complete_json(system='s',user='u')=={'action':'hold'}
+    assert calls==['Bearer private-groq-key-1','Bearer private-groq-key-2']
+    groups=[row for row in p.snapshot()['groups'] if row['model']==p.settings.groq_text_model]
+    cooled=[row for row in groups if row['cooldown_seconds']>0]
+    resting=[row for row in groups if row['cooldown_seconds']==0]
+    assert len(cooled)==1 and len(resting)==1
+    assert cooled[0]['quota_group']!=resting[0]['quota_group']
     assert 'private-secret' not in str(p.last_trace)
 
 
@@ -177,8 +189,9 @@ def test_auth_failure_can_try_another_key_but_consumes_shared_requests(tmp_path)
     assert p.complete_json(system='s',user='u')=={'action':'hold'}
     assert len(calls)==2
     assert p.last_credential_id=='groq-2'
-    snap=next(r for r in p.snapshot()['groups'] if r['model']==p.settings.groq_text_model)
-    assert snap['requests_minute']==2
+    snaps=[r for r in p.snapshot()['groups'] if r['model']==p.settings.groq_text_model]
+    assert sorted(r['requests_minute'] for r in snaps)==[1,1]
+    assert len({r['quota_group'] for r in snaps})==2
 
 
 def test_full_unchanged_context_images_and_schema_reach_paid_once(tmp_path):
@@ -442,15 +455,16 @@ def test_dynamic_capacity_counts_quota_groups_not_credentials_and_includes_singl
         gemini_quota_group_2='separate',anthropic_api_key='paid',ai_claude_fallback_enabled=True)
     p,_=pool(tmp_path,cfg)
     capacity=p.analysis_capacity(prompt_bytes=100,max_tokens=700,ceiling=8)
-    assert capacity['free_slots']==3 # Two Groq keys share ONE organization group.
-    assert capacity['paid_slots']==1 and capacity['parallel_candidates']==4
+    assert capacity['free_slots']==4 # Two Groq keys and two Gemini keys are separate pools.
+    assert capacity['paid_slots']==1 and capacity['parallel_candidates']==5
     assert p.analysis_capacity(prompt_bytes=100,max_tokens=700,ceiling=2)['parallel_candidates']==2
 
 
 def test_capacity_drops_for_busy_cooldown_and_oversize_requests_without_sending_http(tmp_path):
     calls=[];p,store=pool(tmp_path,settings(),lambda request:(calls.append(request) or response()))
     assert p.analysis_capacity(prompt_bytes=100)['parallel_candidates']==1
-    assert p.analysis_capacity(prompt_bytes=100000)['parallel_candidates']==0
+    # An 8K model can take a compact packet, so a large prompt does not zero that route.
+    assert p.analysis_capacity(prompt_bytes=100000)['free_slots']==1
     slot=p._slots[0];key=p._quota_key(slot,False)
     store.put(key,dict(rows=[],lease={'until':time.time()+30}))
     assert p.analysis_capacity(prompt_bytes=100)['parallel_candidates']==0
@@ -493,7 +507,7 @@ def test_busy_but_daily_exhausted_group_does_not_block_configured_paid_fallback(
     paid_response(p.claude)
     assert p.complete_json(system='s',user='u')=={'action':'hold'}
     assert p.last_provider=='anthropic'
-    assert p.last_trace['attempts'][0]['error_category']=='rolling_daily_requests'
+    assert p.last_trace['attempts'][0]['error_category']=='daily-full'
 
 
 def test_oversized_request_skip_reason_and_original_context_are_visible(tmp_path):
@@ -507,7 +521,7 @@ def test_oversized_request_skip_reason_and_original_context_are_visible(tmp_path
     p.claude.complete_json=complete
     context='unchanged-context '*3000
     assert p.complete_json(system='s',user=context)=={'action':'hold'}
-    assert p.last_trace['attempts'][0]['error_category']=='request_too_large'
+    assert p.last_trace['attempts'][0]['error_category']=='does-not-fit'
     assert paid[0]['user']==context # never truncate data to squeeze into free quota
 
 

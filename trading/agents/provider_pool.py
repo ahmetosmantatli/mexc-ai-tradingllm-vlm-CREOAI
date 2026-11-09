@@ -1,10 +1,11 @@
-"""Credential pool with shared quota groups, conservative local reservations.
+"""Credential pool. Each API key is its own account, and each model on that key is its own pool.
 
-A second API key does not imply a second provider quota. Configure distinct
-quota groups only for genuinely separate projects/organizations. Local token
-estimates and provider-specific daily windows are safeguards, not live quota telemetry.
-All routes receive identical context/images. Valid HOLD never triggers fallback.
-A local free-route estimate of zero is not proof those routes are exhausted.
+Quota-group names do not merge two keys. A request has to fit one key's model TPM;
+a second account is the next request, or the same request after the first key's
+window or daily count is full. Local estimates are not live quota telemetry.
+8K TPM models may receive a compact packet. Wider models receive the full packet.
+Valid HOLD never triggers fallback. A local free-route estimate of zero is not
+proof those routes are exhausted, and a does-not-fit skip is not exhaustion.
 """
 from dataclasses import dataclass, field
 from datetime import datetime,timedelta
@@ -20,9 +21,11 @@ from uuid import uuid4
 import httpx
 
 from trading.agents.anthropic_client import AnthropicClient
+from trading.agents.model_limits import COMPACT_TPM, cap_limits, estimate_input_tokens
 from trading.agents.provider_limits import blocked
 from trading.agents.provider_router import ProviderRouter
 from trading.agents.telemetry import is_model_output_failure
+from trading.evaluation.context import COMPACT_SYSTEM, compact_decision_packet
 
 
 class PrefixStore:
@@ -48,6 +51,7 @@ class _Slot:
     modes: tuple = ('text','vlm')
     limits: tuple | None = None
     quota_bucket: str | None = None
+    key_id: str = ''
 
 
 class ProviderPool:
@@ -91,9 +95,9 @@ class ProviderPool:
                 if identity in seen:
                     continue
                 seen.add(identity)
-                main=getattr(settings, provider+'_quota_group', provider+'-main')
-                group=getattr(settings,provider+'_quota_group'+suffix,main) or main
-                group_id=hashlib.sha256((provider+'\0'+group).encode()).hexdigest()
+                key_id=hashlib.sha256(credential.encode()).hexdigest()
+                # The key fingerprint is the pool, not the shared default quota-group name.
+                group_id=hashlib.sha256((provider+'\0'+key_id).encode()).hexdigest()
                 label=provider+'-'+str(number)
                 overrides=dict(groq_api_key='',gemini_api_key='',anthropic_api_key='',
                     ai_primary_provider=provider,ai_vision_primary_provider=provider,
@@ -102,14 +106,14 @@ class ProviderPool:
                 child_settings=settings.model_copy(update=overrides)
                 prefix='pool:route:'+group_id+':'+label+':'
                 router=ProviderRouter(child_settings,None,PrefixStore(store,prefix),self.client)
-                self._slots.append(_Slot(provider,label,group_id,router))
+                self._slots.append(_Slot(provider,label,group_id,router,key_id=key_id))
                 for index,route in enumerate(routes):
                     if route.provider!=provider:continue
                     extra=settings.model_copy(update={**overrides,provider+'_text_model':route.model,provider+'_vision_model':route.model})
                     route_label=label+'-model-'+str(index+1)
                     child=ProviderRouter(extra,None,PrefixStore(store,'pool:route:'+group_id+':'+route_label+':'),self.client)
                     self._slots.append(_Slot(provider,route_label,group_id,child,route.model,tuple(route.modes),
-                        (route.rpm,route.tpm,route.rpd,route.tpd),route.quota_bucket))
+                        (route.rpm,route.tpm,route.rpd,route.tpd),route.quota_bucket,key_id))
         self._reload_external()
 
     def _reload_external(self):
@@ -182,24 +186,80 @@ class ProviderPool:
     def _model(self, slot, images):
         return slot.model or getattr(self.settings, slot.provider+('_vision_model' if images else '_text_model'))
 
+    def _completion(self, slot, max_tokens):
+        return max(max_tokens, getattr(self.settings, slot.provider+'_max_completion_tokens', self.settings.external_max_completion_tokens))
+
     def _estimate(self, slot, system, user, max_tokens, images):
-        completion=max(max_tokens,getattr(self.settings,slot.provider+'_max_completion_tokens',self.settings.external_max_completion_tokens))
-        return math.ceil(len((system+user).encode('utf-8'))/3)+512+2048*len(images or [])+completion
+        return estimate_input_tokens(system, user, images)+self._completion(slot, max_tokens)
+
+    def _pool_id(self, slot, images):
+        bucket=slot.quota_bucket or self._model(slot, images)
+        identity=slot.key_id or slot.group
+        return hashlib.sha256((slot.provider+'\0'+identity+'\0'+bucket).encode()).hexdigest()
+
+    def _group_label(self, slot, images):
+        return self._pool_id(slot, images)[:12]
 
     def _quota_key(self,slot,images):
-        return 'pool:quota:'+slot.group+':'+hashlib.sha256((slot.quota_bucket or self._model(slot,images)).encode()).hexdigest()
+        return 'pool:quota:'+self._pool_id(slot, images)
 
-    def _raw_limits(self,slot):
-        if slot.limits is not None:return slot.limits
-        defaults = (30,8000,1000,200000) if slot.provider=='groq' else (15,250000,500,0)
-        return tuple(getattr(self.settings,slot.provider+'_'+name,default)
-                     for name,default in zip(('rpm','tpm','rpd','tpd'),defaults))
+    def _raw_limits(self,slot,images=False):
+        if slot.limits is not None:
+            base=slot.limits
+        else:
+            defaults = (30,8000,1000,200000) if slot.provider=='groq' else (15,250000,500,0)
+            base=tuple(getattr(self.settings,slot.provider+'_'+name,default)
+                       for name,default in zip(('rpm','tpm','rpd','tpd'),defaults))
+        if slot.provider in ('groq','gemini'):
+            return cap_limits(slot.provider, self._model(slot, images), base)
+        return base
 
     def _limits(self,slot,images=False):
-        # Aliases explicitly sharing a quota bucket never multiply allowance.
-        caps=[self._raw_limits(other) for other in self._slots
+        # Aliases on the same key that share a quota bucket never multiply allowance.
+        # A second API key is a different pool and is not added into this TPM.
+        caps=[self._raw_limits(other, images) for other in self._slots
               if self._supports(other,images) and self._quota_key(other,images)==self._quota_key(slot,images)]
         return tuple(min((cap[i] for cap in caps if cap[i]>0),default=0) for i in range(4))
+
+    def _compact_class(self, slot, images):
+        tpm=self._limits(slot, images)[1]
+        return bool(tpm and tpm<=COMPACT_TPM and not images)
+
+    def _prepared(self, slot, system, user, max_tokens, images):
+        """Full packet for models that can hold it. Compact user text only for 8K TPM."""
+        if not self._compact_class(slot, images):
+            return system, user
+        compact=compact_decision_packet(user)
+        if not compact:
+            return system, user
+        completion=self._completion(slot, max_tokens)
+        if estimate_input_tokens(system, compact, images)+completion<=self._limits(slot, images)[1]:
+            return system, compact
+        if estimate_input_tokens(COMPACT_SYSTEM, compact, images)+completion<=self._limits(slot, images)[1]:
+            return COMPACT_SYSTEM, compact
+        return system, user
+
+    def _sized(self, slot, system, user, max_tokens, images, prompt_bytes=None):
+        """Tokens this slot would actually send, using a compact packet only on 8K models."""
+        if prompt_bytes is not None and system=='' and user=='':
+            body='x'*min(200000, max(0, int(prompt_bytes))+5000)
+            full=self._estimate(slot, '', body, max_tokens, [None]*3 if images else None)
+            if self._compact_class(slot, images):
+                return min(full, self._completion(slot, max_tokens)+3200)
+            return full
+        outbound_system, outbound_user=self._prepared(slot, system, user, max_tokens, images)
+        return self._estimate(slot, outbound_system, outbound_user, max_tokens, images)
+
+    def _fits_model(self, slot, tokens, images, state=None):
+        _rpm, tpm, _rpd, tpd=self._limits(slot, images)
+        if tpm and tokens>tpm:
+            return False
+        if tpd and tokens>tpd:
+            return False
+        reject=(state or {}).get('reject_tokens')
+        if reject and tokens>=reject:
+            return False
+        return True
 
     @staticmethod
     def _supports(slot,images):
@@ -244,8 +304,10 @@ class ProviderPool:
         self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',('pool:capacity_probe',json.dumps(state)))
 
     def _reserve(self, candidates, system, user, max_tokens, images):
-        """Choose and lease one group atomically; never hold DB locks during HTTP."""
+        """Choose and lease one model pool atomically; never hold DB locks during HTTP."""
         now=time.time()
+        preferred_name=getattr(self,'_preferred_provider','groq')+('_vision_model' if images else '_text_model')
+        preferred_model=getattr(self.settings, preferred_name, '')
         with self.store.lock,self.store.db:
             self.store.db.execute('BEGIN IMMEDIATE')
             admit=self._admitted_probe()
@@ -269,7 +331,10 @@ class ProviderPool:
                     continue
                 if lease and lease['until']>now:
                     continue
-                tokens=self._estimate(slot,system,user,max_tokens,images)
+                tokens=self._sized(slot,system,user,max_tokens,images)
+                # A short probe admission must not send a packet this model cannot hold.
+                if not self._fits_model(slot, tokens, images, state):
+                    continue
                 if not probe and blocked(state.get('provider_reported',{}),tokens,now):continue
                 rpm,tpm,rpd,tpd=self._limits(slot,images)
                 minute_tokens=sum(row['tokens'] for row in recent)
@@ -281,10 +346,11 @@ class ProviderPool:
                     minute_tokens/tpm if tpm else 0,len(daily)/rpd if rpd else 0,
                     daily_tokens/tpd if tpd else 0)
                 priority=-1 if probe else int(slot.provider!=getattr(self,'_preferred_provider','groq'))
-                choices.append((priority,utilization,state.get('last_used',0),slot.label,slot,key,state,rows,tokens))
+                same_model=0 if self._model(slot,images)==preferred_model else 1
+                choices.append((priority,same_model,utilization,state.get('last_used',0),slot.label,slot,key,state,rows,tokens))
             if not choices:
                 return None
-            _,_,_,_,slot,key,state,rows,tokens=min(choices,key=lambda row:row[:4])
+            _,_,_,_,_,slot,key,state,rows,tokens=min(choices,key=lambda row:row[:5])
             if slot.label==admit:
                 self._consume_probe_locked(slot.label)
             lease_id=uuid4().hex
@@ -293,21 +359,41 @@ class ProviderPool:
             self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(key,json.dumps(state)))
             return slot,key,lease_id,tokens
 
-    def _release(self,key,lease_id,attempt=None,cooldown=0):
+    def _release(self,key,lease_id,attempt=None,cooldown=0,*,forget=False,hold_slot=None):
         with self.store.lock,self.store.db:
             self.store.db.execute('BEGIN IMMEDIATE')
             state=self.store.get(key)
             if state and (state.get('lease') or {}).get('id')==lease_id:
                 state['lease']=None
-                if attempt and attempt.get('provider_reported'):state['provider_reported']=copy.deepcopy(attempt['provider_reported'])
-                if cooldown:
-                    state['retry_at']=max(state.get('retry_at',0),cooldown)
-                if attempt and all(isinstance(attempt.get(field),int) and attempt[field]>=0 for field in ('input_tokens','output_tokens')):
-                    for row in state['rows']:
-                        if row.get('id')==lease_id:
-                            row['tokens']=attempt['input_tokens']+attempt['output_tokens']
-                            row['usage_known']=True
+                if forget:
+                    rejected=next((row.get('tokens') for row in state.get('rows',[]) if row.get('id')==lease_id), None)
+                    state['rows']=[row for row in state.get('rows',[]) if row.get('id')!=lease_id]
+                    if rejected:
+                        previous=state.get('reject_tokens')
+                        state['reject_tokens']=rejected if not previous else min(previous, rejected)
+                else:
+                    if attempt and attempt.get('provider_reported'):state['provider_reported']=copy.deepcopy(attempt['provider_reported'])
+                    if cooldown:
+                        state['retry_at']=max(state.get('retry_at',0),cooldown)
+                    if attempt and all(isinstance(attempt.get(field),int) and attempt[field]>=0 for field in ('input_tokens','output_tokens')):
+                        for row in state['rows']:
+                            if row.get('id')==lease_id:
+                                row['tokens']=attempt['input_tokens']+attempt['output_tokens']
+                                row['usage_known']=True
                 self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(key,json.dumps(state)))
+            if cooldown and hold_slot is not None and hold_slot.key_id:
+                for other in self._slots:
+                    if other.key_id!=hold_slot.key_id or other.provider!=hold_slot.provider:
+                        continue
+                    for flag in (False, True):
+                        if not self._supports(other, flag):
+                            continue
+                        other_key=self._quota_key(other, flag)
+                        other_state=self.store.get(other_key, dict(rows=[]))
+                        if not isinstance(other_state, dict):
+                            continue
+                        other_state['retry_at']=max(other_state.get('retry_at',0), cooldown)
+                        self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(other_key, json.dumps(other_state)))
 
     def snapshot(self):
         """Safe local quota estimates; no provider credit or remaining-quota claim."""
@@ -326,7 +412,7 @@ class ProviderPool:
                 day=self._daily_rows(slot,state['rows'],now)
                 minute=[r for r in state['rows'] if 0<=now-r['at']<60]
                 rpm,tpm,rpd,tpd=self._limits(slot,images)
-                rows.append(dict(provider=slot.provider,model=self._model(slot,images),quota_group=slot.group[:12],
+                rows.append(dict(provider=slot.provider,model=self._model(slot,images),quota_group=self._group_label(slot,images),
                     requests_minute=len(minute),tokens_minute_estimate=sum(r['tokens'] for r in minute),
                     requests_daily=len(day),tokens_daily_estimate=sum(r['tokens'] for r in day),
                     daily_window='pacific_calendar_day' if slot.provider=='gemini' else 'utc_calendar_day' if slot.provider in ('openrouter','cloudflare') else 'rolling_24h_conservative',
@@ -414,11 +500,12 @@ class ProviderPool:
             store.put(router.prefix+'retry_at', 0)
             store.put(router.prefix+'probe_admit_until', window)
 
-    def probe_free_capacity(self, *, images=False):
+    def probe_free_capacity(self, *, images=False, prompt_bytes=None):
         """Ask one free route whether it answers. Never calls paid Claude.
 
         A JSON answer, including a valid BEKLE, admits that route for the next
         analysis and does not try another route. The caller spaces and caps probes.
+        A model that cannot hold this packet is not a failed probe of a fitting model.
         """
         self._reload_external()
         if not self._allowed():
@@ -427,9 +514,18 @@ class ProviderPool:
         state=self.store.get('pool:capacity_probe') or {}
         if state.get('label') and not state.get('used') and float(state.get('until') or 0)>now:
             return dict(admitted=state['label'], probed=False)
-        slots=[slot for slot in self._slots if self._supports(slot, images)]
+        slots=[]
+        for slot in self._slots:
+            if not self._supports(slot, images):
+                continue
+            if prompt_bytes is not None:
+                tokens=self._sized(slot, '', '', 1100, images, prompt_bytes=prompt_bytes)
+                recorded=self.store.get(self._quota_key(slot, images), {})
+                if not self._fits_model(slot, tokens, images, recorded if isinstance(recorded, dict) else None):
+                    continue
+            slots.append(slot)
         if not slots:
-            return dict(admitted=None, skipped=True)
+            return dict(admitted=None, skipped=True, does_not_fit=prompt_bytes is not None)
         cursor=int(state.get('cursor') or 0) % len(slots)
         chosen=None
         leased=None
@@ -444,14 +540,22 @@ class ProviderPool:
         if chosen is None:
             return dict(admitted=None, skipped=True)
         answered=False
+        oversized=False
         try:
             answered=bool(self._send_capacity_probe(chosen, images))
         finally:
             key, lease_id=leased
             attempts=(getattr(chosen.router, 'last_trace', None) or {}).get('attempts') or []
             attempt=attempts[-1] if attempts else {}
-            cooldown=self._cooldown(chosen, images) if attempt.get('http_status')==429 else 0
-            self._release(key, lease_id, attempt, cooldown)
+            oversized=attempt.get('http_status')==413 or attempt.get('error_category') in ('does-not-fit','request_token_budget')
+            if oversized:
+                self._release(key, lease_id, attempt, forget=True)
+            else:
+                cooldown=self._cooldown(chosen, images) if attempt.get('http_status')==429 else 0
+                self._release(key, lease_id, attempt, cooldown, hold_slot=chosen if cooldown else None)
+        if oversized:
+            self.store.put('pool:capacity_probe', dict(cursor=cursor, label=None, used=True, until=0))
+            return dict(admitted=None, probed=True, does_not_fit=True)
         saved=dict(cursor=cursor, label=None, used=True, until=0)
         if answered:
             self._clear_stale_capacity(chosen, images)
@@ -463,8 +567,8 @@ class ProviderPool:
     def analysis_capacity(self,*,prompt_bytes=18000,max_tokens=1100,images=False,ceiling=8):
         """Advisory current slots, not a quota guarantee; _reserve remains atomic authority.
 
-        Each quota-group/model already allows one in-flight operation. Never count
-        two credentials for the same quota group twice or invent extra paid slots.
+        Each key and model already allows one in-flight operation. Two API keys are
+        two pools. Do not invent extra paid slots.
         """
         self._reload_external()
         now=time.time();free=0;details=[];seen=set();admit=self._admitted_probe()
@@ -478,20 +582,29 @@ class ProviderPool:
             minute=[row for row in state['rows'] if 0<=now-row['at']<60]
             known=sorted(row['tokens'] for row in day[-20:] if row.get('usage_known'))
             observed=known[min(len(known)-1,math.ceil(.9*len(known))-1)] if known else 0
-            estimate=max(observed,self._estimate(slot,'','x'*min(200000,max(0,int(prompt_bytes))+5000),max_tokens,[None]*3 if images else None))
+            estimate=self._sized(slot,'','',max_tokens,images,prompt_bytes=prompt_bytes)
+            if observed and not self._compact_class(slot, images):
+                estimate=max(observed, estimate)
             rpm,tpm,rpd,tpd=self._limits(slot,images)
             busy=(state.get('lease') or {}).get('until',0)>now
             cooling=max(state.get('retry_at',0),self._cooldown(slot,images))>now
             external_ok=not hasattr(slot.router,'capacity_available') or slot.router.capacity_available()
             if external_ok and hasattr(slot.router,'request_fits'):
                 external_ok=slot.router.request_fits('','x'*min(200000,max(0,int(prompt_bytes))+5000),max_tokens,[None]*3 if images else None)
-            opened=slot.label==admit and not busy
-            allowed=opened or (external_ok and not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now)
-                and (not rpm or len(minute)<rpm) and (not tpm or sum(row['tokens'] for row in minute)+estimate<=tpm)
-                and (not rpd or len(day)<rpd) and (not tpd or sum(row['tokens'] for row in day)+estimate<=tpd))
+            fits=self._fits_model(slot, estimate, images, state)
+            opened=fits and slot.label==admit and not busy
+            quota_ok=(not rpm or len(minute)<rpm) and (not tpm or sum(row['tokens'] for row in minute)+estimate<=tpm) and (not rpd or len(day)<rpd) and (not tpd or sum(row['tokens'] for row in day)+estimate<=tpd)
+            allowed=opened or (fits and external_ok and not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now) and quota_ok)
             free+=int(allowed)
-            details.append(dict(provider=slot.provider,quota_group=slot.group[:12],estimated_request_tokens=estimate,
-                available=allowed,reason='probe_admitted' if opened else 'available' if allowed else 'in_flight' if busy else 'cooldown' if cooling else 'quota_or_request_size'))
+            if not fits:reason='does-not-fit'
+            elif opened:reason='probe_admitted'
+            elif allowed:reason='available'
+            elif busy:reason='in_flight'
+            elif cooling or blocked(state.get('provider_reported',{}),estimate,now) or (rpm and len(minute)>=rpm) or (tpm and sum(row['tokens'] for row in minute)+estimate>tpm):reason='window-full'
+            elif (rpd and len(day)>=rpd) or (tpd and sum(row['tokens'] for row in day)+estimate>tpd):reason='daily-full'
+            else:reason='quota_or_request_size'
+            details.append(dict(provider=slot.provider,quota_group=self._group_label(slot, images),estimated_request_tokens=estimate,
+                available=allowed,reason=reason))
         paid=self.store.get(self._paid_guard_key(),{})
         paid_available=bool(self.settings.ai_claude_fallback_enabled and self.claude.available
             and (self._paid_budget is None or self._paid_budget.can_spend())
@@ -535,7 +648,7 @@ class ProviderPool:
     def _attempt(self,reservation,system,user,max_tokens,images,*,vision_probe=False):
         slot,key,lease_id,tokens=reservation
         self.last_credential_id=slot.label
-        self.last_quota_group=slot.group[:12]
+        self.last_quota_group=self._group_label(slot, images)
         self.last_provider=slot.provider
         self.last_model=self._model(slot,images)
         router=slot.router
@@ -547,14 +660,15 @@ class ProviderPool:
         def progress(trace):
             attempts=copy.deepcopy(trace.get('attempts',[]))
             for item in attempts:
-                item.update(slot=slot.label,credential_id=slot.label,quota_group=slot.group[:12],quota_estimated_tokens=tokens)
+                item.update(slot=slot.label,credential_id=slot.label,quota_group=self._group_label(slot, images),quota_estimated_tokens=tokens)
             self.last_trace['attempts']=self.last_trace['attempts'][:base]+attempts
             self._notify()
         router.on_trace=progress
+        outbound_system, outbound_user=self._prepared(slot, system, user, max_tokens, images)
         try:
             complete = (router.complete_vision_probe if vision_probe and isinstance(router,ProviderRouter)
                         else router.complete_json)
-            result=complete(system=system,user=user,max_tokens=max_tokens,images=images)
+            result=complete(system=outbound_system,user=outbound_user,max_tokens=max_tokens,images=images)
             self.last_status=router.last_status
             self.last_fallback_reason=router.last_fallback_reason
             # Subrouter's generic final status is not the useful underlying failure.
@@ -564,8 +678,15 @@ class ProviderPool:
         finally:
             latest=router.last_trace.get('attempts',[])
             attempt=latest[-1] if latest else {}
-            cooldown=self._cooldown(slot,images) if attempt.get('http_status')==429 else 0
-            self._release(key,lease_id,attempt,cooldown)
+            oversized=attempt.get('http_status')==413 or attempt.get('error_category') in ('does-not-fit','request_token_budget')
+            if oversized:
+                attempt['error_category']='does-not-fit'
+                if self.last_trace.get('attempts'):
+                    self.last_trace['attempts'][-1]['error_category']='does-not-fit'
+                self._release(key,lease_id,attempt,forget=True)
+            else:
+                cooldown=self._cooldown(slot,images) if attempt.get('http_status')==429 else 0
+                self._release(key,lease_id,attempt,cooldown,hold_slot=slot if cooldown else None)
 
     def _wait(self,seconds):
         until=time.monotonic()+seconds
@@ -595,27 +716,27 @@ class ProviderPool:
             state=self.store.get(key,dict(rows=[]))
             day=self._daily_rows(slot,state.get('rows',[]),now)
             minute=[row for row in state.get('rows',[]) if 0<=now-row['at']<60]
-            tokens=self._estimate(slot,system,user,max_tokens,images)
+            tokens=self._sized(slot,system,user,max_tokens,images)
             rpm,tpm,rpd,tpd=self._limits(slot,images)
             cooling=max(state.get('retry_at',0),self._cooldown(slot,images))>now
             busy=(state.get('lease') or {}).get('until',0)>now
             external_ok=not hasattr(slot.router,'capacity_available') or slot.router.capacity_available()
             external_fits=not hasattr(slot.router,'request_fits') or slot.router.request_fits(system,user,max_tokens,images)
+            minute_tokens=sum(row['tokens'] for row in minute)
+            daily_tokens=sum(row['tokens'] for row in day)
             if not external_ok:reason='external_account_budget_or_cooldown'
             elif not external_fits:reason='external_context_or_neuron_budget'
-            elif (tpm and tokens>tpm) or (tpd and tokens>tpd):reason='request_too_large'
-            elif rpd and len(day)>=rpd:reason='daily_requests' if slot.provider=='gemini' else 'rolling_daily_requests'
-            elif tpd and sum(row['tokens'] for row in day)+tokens>tpd:reason='rolling_daily_tokens'
-            elif blocked(state.get('provider_reported',{}),tokens,now):reason='provider_reported_limit'
-            elif cooling:reason='provider_cooldown'
+            elif not self._fits_model(slot, tokens, images, state):reason='does-not-fit'
+            elif (rpd and len(day)>=rpd) or (tpd and daily_tokens+tokens>tpd):reason='daily-full'
+            elif blocked(state.get('provider_reported',{}),tokens,now) or cooling or (rpm and len(minute)>=rpm) or (tpm and minute_tokens+tokens>tpm):reason='window-full'
             elif busy:reason='free_capacity_in_flight'
-            elif rpm and len(minute)>=rpm:reason='minute_requests'
-            elif tpm and sum(row['tokens'] for row in minute)+tokens>tpm:reason='minute_tokens'
             else:reason='reservation_race'
             rows.append(dict(provider=slot.provider,model=self._model(slot,images),credential_id=slot.label,
-                quota_group=slot.group[:12],status='quota_skipped',phase='routing',error_category=reason,
+                quota_group=self._group_label(slot, images),status='quota_skipped',phase='routing',error_category=reason,
                 generation_requests=0,count_requests=0,estimated_input_tokens=tokens,
-                token_budget=tpm))
+                token_budget=tpm,
+                requests_daily_remaining=max(0,rpd-len(day)) if rpd else None,
+                requests_minute_remaining=max(0,rpm-len(minute)) if rpm else None))
         return rows
 
     def _retryable(self,slot,images):

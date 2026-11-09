@@ -105,6 +105,102 @@ def build_prompt(candidate, market, memory, positions, account, version, changes
     return canonical(prompt)
 
 
+COMPACT_SYSTEM = (
+    'Return JSON only for this MEXC USDT perpetual. HOLD is a valid decision. '
+    'A trade needs the supplied zone, a closed touch, and a later closed CHoCH or MSS. Touch alone is not an entry. '
+    'Use the text decision why, the BTC and ETH summary, equity, free margin, open positions, and the confirming timeframe closed candles. '
+    'If those are missing or the call would be a guess, return hold. Do not invent a trade.'
+)
+
+
+def _summary_frame(frame):
+    if not isinstance(frame, dict):
+        return frame
+    summary = {key: frame.get(key) for key in ('closed_at', 'trend', 'return_6_bars', 'relative_return_6_bars', 'last_break')}
+    shifts = frame.get('structure_shifts') or []
+    if shifts:
+        summary['last_shift'] = shifts[-1]
+    return summary
+
+
+def compact_decision_packet(user):
+    """Smaller user packet for an 8K TPM model. Required decision fields stay intact.
+
+    Returns canonical JSON, or None when the text is not a decision packet.
+    Callers must not delete zone, touch, CHoCH/MSS, why, BTC/ETH, equity,
+    free margin, open positions, or the confirming candles to force a fit.
+    The full packet used for Gemini is never rewritten here.
+    """
+    if not isinstance(user, str) or not user.startswith('{'):
+        return None
+    try:
+        data = json.loads(user)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    account = data.get('account') if isinstance(data.get('account'), dict) else {}
+    market = data.get('market') if isinstance(data.get('market'), dict) else {}
+    if data.get('context_policy') not in (POLICY_VERSION, 'pa-context-v4-compact') and not account and not market:
+        return None
+    options = (account.get('setup_selection') or {}).get('options') if isinstance(account.get('setup_selection'), dict) else []
+    kept = []
+    confirm = set()
+    for option in options if isinstance(options, list) else []:
+        if not isinstance(option, dict):
+            continue
+        evidence = option.get('evidence') if isinstance(option.get('evidence'), dict) else {}
+        shift = evidence.get('shift')
+        if shift is None:
+            shift = dict(kind=evidence.get('kind'), confirmation_at=evidence.get('confirmation_at'),
+                         context_last_shift=evidence.get('context_last_shift'))
+        trigger = option.get('trigger_timeframe')
+        if trigger:
+            confirm.add(trigger)
+        kept.append(dict(setup_id=option.get('setup_id'), state=option.get('state'), side=option.get('side'),
+                         horizon=option.get('horizon'), context_timeframe=option.get('context_timeframe'),
+                         trigger_timeframe=trigger, zone=evidence.get('zone'), touch_at=evidence.get('touch_at'),
+                         closed_choch_mss=shift, stop=option.get('stop_loss_price', option.get('stop')),
+                         target=option.get('take_profit_price', option.get('target')),
+                         reason=option.get('caveat') or evidence.get('kind')))
+    if not confirm:
+        confirm = {'15m', '5m'}
+    candles = []
+    for view in market.get('timeframes') or []:
+        if isinstance(view, dict) and view.get('timeframe') in confirm:
+            candles.append(dict(timeframe=view.get('timeframe'), closed_at=view.get('closed_at'),
+                                recent_ohlcv=view.get('recent_ohlcv')))
+    raw_bench = market.get('benchmarks') if isinstance(market.get('benchmarks'), dict) else {}
+    benchmarks = {}
+    for symbol in ('BTC_USDT', 'ETH_USDT'):
+        frames = raw_bench.get(symbol)
+        if isinstance(frames, dict):
+            benchmarks[symbol] = {name: _summary_frame(frame) for name, frame in frames.items()}
+        else:
+            benchmarks[symbol] = frames
+    text = account.get('text_model_decision') if isinstance(account.get('text_model_decision'), dict) else {}
+    card = data.get('setup_card') if isinstance(data.get('setup_card'), dict) else {}
+    changed = data.get('what_changed') if isinstance(data.get('what_changed'), dict) else {}
+    why = text.get('rationale') or card.get('last_reason') or changed.get('summary')
+    capital = account.get('capital_allocation') if isinstance(account.get('capital_allocation'), dict) else {}
+    operating = account.get('operating_context') if isinstance(account.get('operating_context'), dict) else {}
+    equity = capital.get('equity_usdt', account.get('equity', operating.get('equity_snapshot_usdt')))
+    free_margin = capital.get('available_usdt', operating.get('available_usdt', account.get('available')))
+    positions = data.get('open_positions')
+    if positions is None:
+        positions = capital.get('open_positions', operating.get('open_positions'))
+    packet = dict(context_policy='pa-context-v4-compact',
+                  symbol=(data.get('candidate') or {}).get('symbol') if isinstance(data.get('candidate'), dict) else market.get('symbol'),
+                  zone=[row.get('zone') for row in kept], touch=[row.get('touch_at') for row in kept],
+                  closed_choch_mss=[row.get('closed_choch_mss') for row in kept], why=why,
+                  text_decision_why=text.get('rationale'), benchmarks=benchmarks, equity=equity,
+                  free_margin=free_margin, open_positions=positions if positions is not None else [],
+                  confirming_candles=candles, setups=kept)
+    if not isinstance(packet['symbol'], str):
+        packet['symbol'] = market.get('symbol')
+    return canonical(packet)
+
+
 def _finite(value):
     from math import isfinite
     if isinstance(value,bool):

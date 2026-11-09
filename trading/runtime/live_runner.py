@@ -709,11 +709,21 @@ class LiveRunner:
         if attempts>=self.capacity_probe_cap or now-float(state.get('last_at') or 0)<self.capacity_probe_gap_seconds:
             return False
         try:
-            outcome=probe(images=images)
+            try:
+                outcome=probe(images=images, prompt_bytes=prompt_bytes)
+            except TypeError:
+                outcome=probe(images=images)
         except sqlite3.Error:
             raise
         except Exception:
             outcome=None
+        if isinstance(outcome, dict) and outcome.get('does_not_fit'):
+            # An oversized 413 is not one of the three failed probes of a fitting model.
+            if outcome.get('probed'):
+                state=self.store.get('live_capacity_probe') or {}
+                self.store.put('live_capacity_probe', dict(
+                    attempts=int(state.get('attempts') or 0), last_at=now, admitted=None))
+            return False
         if isinstance(outcome, dict) and outcome.get('skipped'):
             return False
         admitted=bool(isinstance(outcome, dict) and outcome.get('admitted'))

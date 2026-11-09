@@ -356,6 +356,21 @@ def test_zero_estimate_successful_probe_allows_the_next_analysis(tmp_path):
     assert calls==['probe','analysis']
 
 
+def test_oversized_probe_does_not_spend_a_fitting_model_attempt(tmp_path):
+    runner,_,_,_=prepare(tmp_path)
+    probes=[]
+    runner.llm.analysis_capacity=lambda **kw:dict(parallel_candidates=0,free_slots=0,paid_slots=0)
+    runner.llm.probe_free_capacity=lambda **kw:probes.append(kw) or dict(admitted=None,probed=True,does_not_fit=True)
+    runner.candidate_queue().refresh([candidate()])
+    runner._evaluate=lambda *a,**kw:probes.append('analysis')
+    assert runner.cycle()['reason']=='HOLD_LIVE_AI_CAPACITY'
+    assert probes[0]['prompt_bytes']>=18000
+    assert runner.store.get('live_capacity_probe')['attempts']==0
+    assert 'analysis' not in probes
+    assert runner.cycle()['reason']=='HOLD_LIVE_AI_CAPACITY'
+    assert len([row for row in probes if row!='analysis'])==1
+
+
 def test_zero_estimate_failed_probes_stay_on_hold_and_are_not_every_cycle(tmp_path):
     runner,_,_,_=prepare(tmp_path)
     probes=[]
