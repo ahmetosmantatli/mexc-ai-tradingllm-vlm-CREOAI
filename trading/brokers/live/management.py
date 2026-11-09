@@ -115,6 +115,7 @@ class PositionManagementMixin:
             rules=self.public.get_contract_rules(row['proposal']['symbol'])
             pending=dict(decision_id=decision_id,action=action,reason=decision['reason'],ai=decision.get('ai',{}),
                 at=time(),before_contracts=self.remaining_contracts(row),old_stop=stop,target=target,
+                management_runner_id=decision.get('management_runner_id'),
                 external_id='mg-'+uuid4().hex[:24],write_attempted=True)
             if action in ('move_stop','move_target'):
                 new=self._number(decision['stop_price' if action=='move_stop' else 'target_price'])

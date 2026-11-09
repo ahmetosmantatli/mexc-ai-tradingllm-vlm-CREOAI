@@ -4,6 +4,7 @@ import time
 from uuid import uuid4
 from trading.control.telegram import TelegramController,TRADER_MODES
 from trading.agents.telemetry import human_reason
+from trading.runtime.live_capabilities import management_runner
 
 
 BASELINE_RUNNER_ID = 'baseline-v1'
@@ -90,7 +91,7 @@ class LiveTelegramController(TelegramController):
         if selected not in runners:
             return text+'Seçili runner bu worker’da kullanılamıyor. Yeni girişler için kullanılabilir bir runner seç.'
         if self.runner_selection_pending(state,runners):
-            return text+'Yeni işlemler için runner seç. Açık pozisyonların yönetim planı kendi runner’ında kalır.'
+            return text+'Yeni işlemler için runner seç. Runner 3, korunmuş Runner 2 pozisyonlarının AI yönetimini de devralır.'
         text+=f'Yeni işlem runner’ı: {RUNNER_LABELS[selected]}\n'
         if not state.get('version_chosen'):return text+'Analizi seç: görselsiz veya VLM.'
         if not state.get('profile_chosen'):return text+'Trader profilini seç. Profil sınırları model önerilerinde uygulanır.'
@@ -152,6 +153,10 @@ class LiveTelegramController(TelegramController):
             origin=p.get('decision_ai') or {}
             if origin:text+=f"Karar: {origin.get('provider','?')} / {origin.get('model','?')}\n"
             text+=f"Koruma: {p.get('protection_status','borsa uzlaştırması bekleniyor')}\n"
+            opening=p.get('runner_id')
+            policy=management_runner(opening,self.control(account_id).get('runner_id'))
+            if opening!=policy and p.get('protection_status')=='protected':
+                text+=f"Açılış: {RUNNER_LABELS[opening]} | Seçili yönetim: {RUNNER_LABELS[policy]}\n"
             if p.get('remaining_contracts') is not None:text+=f"Kalan kontrat: {p['remaining_contracts']} | Yönetim sürümü: {p.get('management_revision',0)}\n"
         return text
 

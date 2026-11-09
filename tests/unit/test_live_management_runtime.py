@@ -270,3 +270,37 @@ def test_temporary_entry_candidate_guard_does_not_replace_management_permission(
     executor.revoke_start();allow_next(runner,row);market['timeframes'][1]['closed_at']+=900
     runner.manage_positions()
     assert len(llm.calls)==1 # Actual revoked operator grant still blocks management.
+
+
+def test_runner3_manages_protected_runner2_after_start_without_rewriting_entry(tmp_path,monkeypatch):
+    runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
+    row['proposal']['metadata'].update(runner_id='runner2',analysis_version='text')
+    executor._save(row)
+    opening=deepcopy(row['proposal'])
+    control['runner_id']='runner2'
+    runner.manage_positions()
+    assert llm.calls[-1][0]['position']['management_runner_id']=='runner2'
+
+    control.update(runner_id='runner3',updated_at=2,enabled=False)
+    allow_next(runner,row)
+    runner.manage_positions()
+    assert len(llm.calls)==1
+
+    control.update(enabled=True,updated_at=3)
+    executor.grant_start('7',3)
+    llm.action='move_stop'
+    runner.manage_positions()
+    data,request=llm.calls[-1]
+    assert len(llm.calls)==2 and 'Runner 3 manages' in request['system']
+    assert data['position']['opening_runner_id']=='runner2'
+    assert data['position']['management_runner_id']=='runner3'
+    assert 'daily_objective' in data['account']
+    current=executor.state(row['intent_id'])
+    assert current['proposal']==opening
+    assert current['current_protection']['stop']==99
+    assert current['management_events'][-1]['management_runner_id']=='runner3'
+    assert not private.closes and len(private.submits)==1
+
+    allow_next(runner,row)
+    runner.manage_positions()
+    assert len(llm.calls)==2

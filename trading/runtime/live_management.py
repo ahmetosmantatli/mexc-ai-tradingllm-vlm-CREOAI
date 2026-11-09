@@ -1,5 +1,5 @@
 """Event-driven AI reviews of owned positions, independent of entry scanning."""
-from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
+from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS, management_runner
 import copy
 import json
 import math
@@ -133,7 +133,8 @@ class LivePositionManager:
         if now-card.get('last_attempt_at',0)<r.cfg.live_management_min_interval_seconds:return
         proposal=intent['proposal'];symbol=proposal['symbol']
         metadata=proposal.get('metadata') or {}
-        runner_id=metadata.get('runner_id','baseline-v1')
+        opening_runner=metadata.get('runner_id','baseline-v1')
+        runner_id=management_runner(opening_runner,control.get('runner_id'))
         runner2=runner_id in STRUCTURAL_IOC_RUNNERS
         variant=metadata.get('analysis_version') if 'runner_id' in metadata else None
         variant=variant if variant in ('text','vlm') else control.get('version',r.cfg.analysis_version)
@@ -160,13 +161,15 @@ class LivePositionManager:
         retry_due=(retry.get('revision')==revision and retry.get('control_revision')==control.get('updated_at')
                    and retry.get('at',0)<=now<retry.get('expires_at',0))
         # No reason to download three histories again before either trigger can change.
-        if (previous.get('timeframe')==timeframe and previous.get('favorable_r_milestone')==milestone
+        if (previous.get('management_runner',opening_runner)==runner_id and previous.get('timeframe')==timeframe and previous.get('favorable_r_milestone')==milestone
                 and now<previous.get('closed_at',0)+TIMEFRAME_SECONDS[timeframe] and not retry_due and not near_target and not horizon_due):return
         bundle=build_bundle(r.public,symbol)
         market=bundle.to_context(ict=True) if runner2 else bundle.to_context()
         view=next((v for v in market['timeframes'] if v['timeframe']==timeframe),None)
         if view is None:raise ValueError('management entry timeframe evidence missing')
         event=dict(timeframe=timeframe,closed_at=view['closed_at'],favorable_r_milestone=milestone)
+        if runner_id!=opening_runner:
+            event['management_runner']=runner_id
         if horizon_due or (retry_due and due_at is not None and previous.get('horizon_due')==due_at):
             event['horizon_due']=due_at
         if runner2:
@@ -207,7 +210,7 @@ class LivePositionManager:
             entry_timeframe=entry_timeframe,review_timeframe=timeframe,elapsed_entry_bars=elapsed_bars,
             initial_risk_usdt=proposal.get('max_loss_if_stopped'),remaining_planned_loss_usdt=intent.get('planned_loss'),excursions={k:card.get(k) for k in ('current_r','mfe_r','mae_r','sampled_at','excursion_source')},
             previous_decisions=card.get('decisions',[])[-5:],confirmed_actions=intent.get('management_events',[])[-5:],
-            management_revision=revision)
+            management_revision=revision,opening_runner_id=opening_runner,management_runner_id=runner_id)
         if runner2:
             position_card['trade_horizon']=horizon
             position_card['target_extension_available']=bool(near_target and not intent.get('target_extensions'))
@@ -222,7 +225,7 @@ class LivePositionManager:
             ensure_ascii=False,separators=(',',':'),allow_nan=False)
         llm=r.management_llm()
         trace=dict(id=uuid4().hex,started_at=now,symbol=symbol,strategy='position_management',mode='LIVE',
-            runner_id=runner_id,
+            runner_id=runner_id,opening_runner_id=opening_runner,
             analysis_version=variant,status='pending',attempts=[],prompt_bytes=len(prompt.encode()),input_fingerprint=digest(prompt))
         def archive(update=None):
             if update:trace.update(copy.deepcopy(update))
@@ -273,7 +276,12 @@ class LivePositionManager:
             paths=[]
             if variant=='vlm':
                 paths=[str(c.path) for c in render_bundle(bundle,Path(r.cfg.analysis_chart_dir)/symbol/('management-'+bundle.fingerprint[:16]))]
-            raw=llm.complete_json(system=RUNNER2_POLICY if runner2 else POLICY,user=prompt,max_tokens=850,images=paths or None)
+            policy=RUNNER2_POLICY if runner2 else POLICY
+            if runner_id=='runner3':
+                policy+=(' Runner 3 manages the supplied existing position without re-sizing the entry. '
+                         'Compare the remaining net payoff, current structural evidence and open portfolio stop risk. '
+                         'The daily objective is reporting context. Do not increase exposure or loosen protection.')
+            raw=llm.complete_json(system=policy,user=prompt,max_tokens=850,images=paths or None)
             trace.update(copy.deepcopy(getattr(llm,'last_trace',{})))
             trace.update(completed_at=time.time(),provider=getattr(llm,'last_provider','none'),model=getattr(llm,'last_model',''),
                 status='failed' if raw is None else 'completed')
@@ -294,6 +302,7 @@ class LivePositionManager:
             if not self._permitted(control.get('updated_at')) or time.time()-now>r.cfg.decision_ttl_seconds:
                 trace['execution_reason']='management_control_changed_or_expired';return
             data=decision.model_dump();data['ai']=ai
+            data['management_runner_id']=runner_id
             if (horizon and decision.action=='move_target'
                     and TIMEFRAME_SECONDS[decision.review_timeframe]>TIMEFRAME_SECONDS[timeframe]):
                 data['trade_horizon']=trade_horizon(decision.review_timeframe,time.time())
