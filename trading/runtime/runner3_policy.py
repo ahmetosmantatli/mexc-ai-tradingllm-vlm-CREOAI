@@ -54,6 +54,16 @@ def margin_policy(equity, capital, available, grade, horizon):
                 max_entry_cost_usdt=max(0., min(target, available - reserve)))
 
 
+def ioc_target_economics(*, side, entry, stop, target, fee, slippage):
+    """Per-unit gross reward, net reward and modeled stop loss at the IOC limit."""
+    direction = 1 if side == 'long' else -1
+    stop_fill = stop * (1 - direction * slippage)
+    target_fill = target * (1 - direction * slippage)
+    loss = abs(entry - stop_fill) + fee * (entry + stop_fill)
+    net = direction * (target_fill - entry) - fee * (entry + target_fill)
+    return abs(target - entry), net, loss
+
+
 def validate_economics(gross, net, loss):
     if loss <= 0 or net / loss < MIN_NET_TARGET_R:
         raise ValueError('runner3_net_target_r_too_low')

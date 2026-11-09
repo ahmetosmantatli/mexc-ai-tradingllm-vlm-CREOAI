@@ -4,6 +4,15 @@ from decimal import Decimal, ROUND_DOWN
 from math import isfinite
 
 
+class ContractQuantityError(ValueError):
+    def __init__(self, message, *, quantity, minimum, maximum, step):
+        super().__init__(message)
+        self.quantity = quantity
+        self.minimum = minimum
+        self.maximum = maximum
+        self.step = step
+
+
 @dataclass(frozen=True)
 class ContractRules:
     size: float
@@ -37,7 +46,9 @@ class ContractRules:
         step = Decimal(str(self.step))
         qty = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
         if not Decimal(str(self.minimum)) <= qty <= Decimal(str(self.maximum)):
-            raise ValueError('contract quantity outside exchange limits')
+            raise ContractQuantityError('contract quantity outside exchange limits',
+                quantity=float(qty), minimum=self.minimum, maximum=self.maximum, step=self.step)
         if self.base_tier_max and qty > Decimal(str(self.base_tier_max)):
-            raise ValueError('position exceeds supported base risk tier')
+            raise ContractQuantityError('position exceeds supported base risk tier',
+                quantity=float(qty), minimum=self.minimum, maximum=self.base_tier_max, step=self.step)
         return float(qty), float(qty * Decimal(str(self.size)) * Decimal(str(price)))

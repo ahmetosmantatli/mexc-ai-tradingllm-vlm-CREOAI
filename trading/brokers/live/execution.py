@@ -217,15 +217,19 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             if readiness.planned_margin+notional*self.fee>cap['max_entry_cost_usdt']+1e-8:
                 raise LiveExecutionError('runner3_margin_reserve')
         if abs(notional-proposal.notional)>max(1e-8,entry*rules.size*rules.step):raise LiveExecutionError('approved_notional_changed')
-        worst_entry=entry if ioc else entry*(1+self.slip if proposal.side.value=='long' else 1-self.slip)
-        worst_stop=sl*(1-self.slip if proposal.side.value=='long' else 1+self.slip)
         quantity=contracts*rules.size
-        planned_loss=abs(worst_entry-worst_stop)*quantity+self.fee*quantity*(worst_entry+worst_stop)
+        if proposal.metadata.get('runner_id')=='runner3':
+            gross, net, unit_loss = runner3_policy.ioc_target_economics(
+                side=proposal.side.value, entry=entry, stop=sl, target=tp,
+                fee=self.fee, slippage=self.slip)
+            planned_loss = unit_loss * quantity
+        else:
+            worst_entry=entry if ioc else entry*(1+self.slip if proposal.side.value=='long' else 1-self.slip)
+            worst_stop=sl*(1-self.slip if proposal.side.value=='long' else 1+self.slip)
+            planned_loss=abs(worst_entry-worst_stop)*quantity+self.fee*quantity*(worst_entry+worst_stop)
         if planned_loss>proposal.max_loss_if_stopped+1e-8:raise LiveExecutionError('fees_slippage_exceed_approved_risk')
         if proposal.metadata.get('runner_id')=='runner3':
-            target=tp*(1-self.slip if proposal.side.value=='long' else 1+self.slip)
-            net=(target-worst_entry if proposal.side.value=='long' else worst_entry-target)-self.fee*(target+worst_entry)
-            runner3_policy.validate_economics(abs(tp-entry),net,planned_loss/quantity)
+            runner3_policy.validate_economics(gross,net,unit_loss)
         if notional/proposal.leverage+notional*self.fee>available:raise LiveExecutionError('insufficient_available_margin')
         side=1 if proposal.side.value=='long' else 2
         private_maintenance=max(row['maintenance_rate'] for group in ('risk_limits','leverage')

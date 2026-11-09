@@ -48,6 +48,13 @@ def test_real_software_pipeline_opens_reconciles_native_close_and_reenters_witho
         llm=llm,external_control=lambda:dict(control),executor=executor)
     monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='closed',to_context=lambda:{'timeframes':[]}))
     monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
+    authorize = executor.authorize
+
+    def authorize_after_equity_moves(*args, **kwargs):
+        private.assets[0]['equity'] -= .01
+        return authorize(*args, **kwargs)
+
+    monkeypatch.setattr(executor, 'authorize', authorize_after_equity_moves)
     executor.grant_start('7',1)
     first=candidate()
     runner.candidate_queue().refresh([first])

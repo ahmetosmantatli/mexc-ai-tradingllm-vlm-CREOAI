@@ -60,3 +60,29 @@ def test_runner3_reserve_rechecks_account_before_sending_ioc(tmp_path):
     with pytest.raises(LiveExecutionError,match='runner3_margin_reserve'):
         executor.execute(row['intent_id'])
     assert not executor.state(row['intent_id'])['entry_write_attempted']
+
+
+@pytest.mark.parametrize(('side', 'stop', 'target'), [
+    ('long', 99., 101.65),
+    ('short', 101., 98.35),
+])
+def test_ioc_economics_at_executable_limit(side, stop, target):
+    from trading.runtime.runner3_policy import ioc_target_economics
+
+    gross, net, loss = ioc_target_economics(
+        side=side, entry=100., stop=stop, target=target, fee=.0006, slippage=.0005)
+    assert gross == pytest.approx(1.65)
+    assert 1.25 < net / loss < 1.3
+    validate_economics(gross, net, loss)
+
+
+def test_quantity_rejection_preserves_exchange_constraints_for_audit():
+    from trading.exchange.contracts import ContractRules
+    from trading.runtime.execution_diagnostics import safe_execution_error
+
+    rules = ContractRules(1., 1., 2., 100., 10., .005, .01, 50.)
+    with pytest.raises(ValueError) as error:
+        rules.size_order(19., 10., 5.)
+    detail = safe_execution_error(error.value)
+    assert detail['code'] == 'CONTRACT_QUANTITY_LIMIT'
+    assert detail['contracts'] == {'quantity': 1., 'minimum': 2., 'maximum': 100., 'step': 1.}

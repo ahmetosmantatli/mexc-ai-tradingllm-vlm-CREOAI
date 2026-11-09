@@ -340,10 +340,18 @@ class LiveRunner:
             raise ValueError('live entry price drift')
         entry=ticker.ask1 if candidate.side.value=='long' else ticker.bid1
         slip=self.cfg.paper_slippage_bps/10000;fee=self.cfg.paper_fee_rate
-        worst_entry=entry*(1+slip if candidate.side.value=='long' else 1-slip)
-        stop=proposal.stop_loss.price*(1-slip if candidate.side.value=='long' else 1+slip)
-        loss_fraction=(abs(worst_entry-stop)+fee*(worst_entry+stop))/entry
-        if result.metadata.get('price_plan') is not None:
+        if runner_id == 'runner3':
+            fee = getattr(self.executor, 'fee', fee)
+            slip = getattr(self.executor, 'slip', slip)
+            gross_target, expected_net, unit_loss = runner3_policy.ioc_target_economics(
+                side=candidate.side.value, entry=entry, stop=proposal.stop_loss.price,
+                target=proposal.take_profit_price, fee=fee, slippage=slip)
+            loss_fraction = unit_loss / entry
+        else:
+            worst_entry=entry*(1+slip if candidate.side.value=='long' else 1-slip)
+            stop=proposal.stop_loss.price*(1-slip if candidate.side.value=='long' else 1+slip)
+            loss_fraction=(abs(worst_entry-stop)+fee*(worst_entry+stop))/entry
+        if runner_id != 'runner3' and result.metadata.get('price_plan') is not None:
             worst_target=proposal.take_profit_price*(1-slip if candidate.side.value=='long' else 1+slip)
             gross_target=abs(proposal.take_profit_price-entry)
             expected_net=(worst_target-worst_entry if candidate.side.value=='long' else worst_entry-worst_target)-fee*(worst_entry+worst_target)
@@ -352,7 +360,7 @@ class LiveRunner:
         limits=dict(model_stop_budget=proposal.notional,stop_budget_with_costs=proposal.max_loss_if_stopped/loss_fraction,
                     available_margin=snapshot['balance']['available']/margin_rate*.95)
         if runner_id=='runner3':
-            runner3_policy.validate_economics(gross_target,expected_net,loss_fraction*entry)
+            runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
             allocation=runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
                 snapshot['balance']['available'],runner3_policy.evidence_grade(setup),setup['horizon'])
             limits['runner3_margin_policy']=allocation['max_entry_cost_usdt']/margin_rate
@@ -360,7 +368,7 @@ class LiveRunner:
                 raise ValueError('runner3_margin_reserve')
             proposal.metadata['runner3_allocation']=dict(allocation,limiting_factor=min(limits,key=limits.get),
                 setup_id=setup['setup_id'],evidence_expires_at=setup['evidence'].get('expires_at'),
-                calibrated_probability=None,expected_target_net_r=expected_net/(loss_fraction*entry))
+                calibrated_probability=None,expected_target_net_r=expected_net/unit_loss)
         _,notional=rules.size_order(min(limits.values()),entry,proposal.leverage)
         proposal.notional=notional
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)
@@ -419,7 +427,10 @@ class LiveRunner:
             return finish('HOLD_LIVE_UNVALIDATED_MODEL')
         proposal=self._final_proposal(selected,result,snapshot,control)
         # Execution performs its own fresh account/risk/quote and grant checks.
-        self.executor.allowed_capital=self._capital(snapshot,control)
+        self.executor.allowed_capital = (
+            None if control.get('allocation_mode') in ('full','all','entire')
+            else self._capital(snapshot,control)
+        )
         intent=self.executor.authorize(proposal,control_revision=control.get('updated_at'))
         observed=next(row for row in snapshot['leverage'][candidate.symbol] if row['side']==(1 if selected.side.value=='long' else 2))
         if observed['leverage']!=proposal.leverage:

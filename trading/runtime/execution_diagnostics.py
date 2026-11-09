@@ -1,4 +1,8 @@
 """Closed-set execution diagnostics. Never persist arbitrary exception text."""
+from math import isfinite
+
+from trading.exchange.contracts import ContractQuantityError
+
 CODES={
     'runner3_net_target_r_too_low':'RUNNER3_NET_TARGET_R',
     'runner3_cost_share_too_high':'RUNNER3_COST_SHARE',
@@ -49,4 +53,7 @@ def safe_execution_error(exc):
     for source,target in [('code','exchange_code'),('status_code','http_status')]:
         value=getattr(exc,source,None)
         if type(value) is int and 0<=value<=1000000000:result[target]=value
+    if isinstance(exc, ContractQuantityError):
+        result['contracts'] = {field: value for field in ('quantity','minimum','maximum','step')
+            if isfinite(value := getattr(exc, field))}
     return result
