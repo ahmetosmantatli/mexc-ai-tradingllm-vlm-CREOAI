@@ -28,6 +28,8 @@ def validate_evidence(setup, plan, now=None):
     if not setup or plan is None:
         raise ValueError('runner3_requires_verified_setup')
     evidence = setup['evidence']
+    if evidence.get('stage') in ('awaiting_touch', 'awaiting_confirmation'):
+        raise ValueError('touch_is_not_an_entry')
     if evidence.get('expires_at', float('inf')) <= now:
         raise ValueError('runner3_evidence_expired')
     if setup.get('context_timeframe'):
@@ -85,6 +87,33 @@ def small_account_risk_target(equity, ceiling, grade):
     return None
 
 
+def cost_adjusted_r(*, side, entry, stop, target, fee, slippage):
+    """Net reward divided by modeled stop loss, after fees and slippage."""
+    _gross, net, loss = ioc_target_economics(
+        side=side, entry=entry, stop=stop, target=target, fee=fee, slippage=slippage)
+    if loss <= 0 or not isfinite(net) or not isfinite(loss):
+        return None
+    return net / loss
+
+
+def thesis_invalidated(position, price):
+    """The open thesis is invalidated only when price has crossed its structural level."""
+    if not isinstance(position, dict):
+        return False
+    level = position.get('invalidation_price')
+    if not isinstance(level, (int, float)) or isinstance(level, bool):
+        level = position.get('stop')
+    if not isinstance(level, (int, float)) or isinstance(level, bool) or level <= 0:
+        return False
+    if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0:
+        return False
+    if position.get('side') == 'long':
+        return price <= level
+    if position.get('side') == 'short':
+        return price >= level
+    return False
+
+
 def rank_confirmed_plans(plans):
     """Stronger evidence and payoff first. Ties stay on symbol and setup id."""
     def key(plan):
@@ -104,7 +133,9 @@ def position_brief(position):
                 thesis=str(position.get('thesis') or '')[:500],
                 remaining_room=copy_room(position.get('remaining_room')),
                 leverage=position.get('leverage'), entry=position.get('entry'),
-                stop=position.get('stop'), target=position.get('target'))
+                stop=position.get('stop'), target=position.get('target'),
+                mark=position.get('mark'),
+                invalidation_price=position.get('invalidation_price'))
 
 
 def copy_room(room):

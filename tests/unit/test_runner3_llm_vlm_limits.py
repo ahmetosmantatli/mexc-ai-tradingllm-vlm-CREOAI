@@ -110,25 +110,45 @@ def test_vlm_timeout_keeps_the_text_decision_and_labels_it_text(tmp_path, monkey
 
     def vision(model, packet):
         assert packet['account']['text_model_decision']['action'] == 'trade'
+        assert model.calls[-1].get('images')
+        option = next(row for row in packet['account']['setup_selection']['options']
+                      if row['family'] == 'pullback' and row['state'] == 'ready')
+        entry = packet['candidate']['entry_price']
+        model.late_limit = entry - 1 if option['side'] == 'long' else entry + 1
         model.gate.wait(2)
-        model.vision_answer = ready_answer(packet, rationale='Grafik modeli geç kaldı.')
+        model.vision_answer = ready_answer(packet, limit_price=model.late_limit,
+                                           rationale='Grafik modeli geç kaldı ve limiti yazdı.')
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'success'}]}
 
     model = DecisionModel(text, vision)
     run, store = evaluator(tmp_path, monkeypatch, model)
+    started = time.time()
     try:
         result = run()
     finally:
         model.gate.set()
+    assert time.time() - started < 1.5
     assert result.action.value == 'trade'
     assert result.metadata['decision_ai']['review_mode'] == 'text'
     assert result.metadata['decision_ai']['model'] == 'text-model'
     assert result.metadata['rationale'].startswith('Metin modeli')
-    assert '4h zone then 15m' in model.calls[0]['system']
-    assert '1h zone then 5m' in model.calls[0]['system']
+    assert '15m wick' in model.calls[0]['system']
+    assert '5m wick' in model.calls[0]['system']
+    assert 'Do not open a hedge' in model.calls[0]['system']
     assert 'Touch alone is not an entry' in model.calls[0]['system']
     trace = store.get('analysis_trace')
     assert trace['decision_mode'] == 'text'
     assert trace['attempts'][-1] == {'review_mode': 'vlm', 'status': 'timeout', 'generation_requests': 0}
+    assert result.metadata['pending_vlm'].settled.wait(2)
+    assert result.metadata['pending_vlm'].late_action == 'local_plan'
+    assert result.action.value == 'trade'
+    assert result.metadata['decision_ai']['review_mode'] == 'text'
+    stored = store.get('local_plan_updates')
+    assert stored and stored[-1]['status'] == 'next_trigger'
+    limits = store.get('local_entry_limits')
+    assert limits[-1]['limit_price'] == model.late_limit
+    assert limits[-1]['status'] == 'resting'
+    assert limits[-1]['decision_mode'] == 'vlm'
 
 
 def test_valid_vlm_decision_replaces_the_text_decision(tmp_path, monkeypatch):
@@ -152,34 +172,44 @@ def test_valid_vlm_decision_replaces_the_text_decision(tmp_path, monkeypatch):
 
 
 def test_ranked_plans_and_open_positions_reach_the_model(tmp_path, monkeypatch):
-    def text(packet):
-        allocation = packet['account']['capital_allocation']
-        assert allocation['small_account'] is True
-        assert allocation['open_positions'][0]['symbol'] == 'ETH_USDT'
-        assert allocation['open_positions'][0]['thesis'].startswith('Eski')
-        assert allocation['queued_confirmed_plans'][0]['symbol'] == 'SOL_USDT'
-        return ready_answer(packet, release_symbol='ETH_USDT',
-                            rationale='ETH tezi zayıf; marjini güçlü plana bırak.')
+    briefs = [dict(symbol='ETH_USDT', side='long', unrealized_pnl=-1.2,
+                   thesis='Eski tez zayıf kaldı.',
+                   remaining_room={'to_target_price': 2, 'to_target_r': .4},
+                   leverage=5, entry=100, stop=98, target=104, mark=97)]
+    queue = [dict(symbol='BTC_USDT', capital_rank=1, grade='standard'),
+             dict(symbol='SOL_USDT', capital_rank=4, grade='strong', evidence_kind='htf_zone_mss')]
 
-    def vision(model, packet):
-        model.vision_answer = ready_answer(
-            packet, release_symbol='ETH_USDT',
-            rationale='Grafik de ETH kapanışını ve bu planı seçiyor.')
-        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'success'}]}
+    def decide(flag, path):
+        def text(packet):
+            allocation = packet['account']['capital_allocation']
+            assert allocation['small_account'] is True
+            assert allocation['open_positions'][0]['symbol'] == 'ETH_USDT'
+            assert allocation['open_positions'][0]['thesis'].startswith('Eski')
+            assert allocation['queued_confirmed_plans'][0]['symbol'] == 'SOL_USDT'
+            if flag:
+                return ready_answer(packet, release_symbol='ETH_USDT',
+                                    rationale='Yeni plan daha kârlı göründüğü için ETH kapatılsın.')
+            return ready_answer(packet, release_symbol='ETH_USDT', thesis_invalidated=True,
+                                rationale='ETH tezi fiyatla bozuldu ve serbest marjin yetmiyor.')
 
-    model = DecisionModel(text, vision)
-    run, store = evaluator(tmp_path, monkeypatch, model)
-    result = run(open_position_briefs=[dict(symbol='ETH_USDT', side='long', unrealized_pnl=-1.2,
-                                            thesis='Eski tez zayıf kaldı.',
-                                            remaining_room={'to_target_price': 2, 'to_target_r': .4},
-                                            leverage=5, entry=100, stop=98, target=104)],
-                 queued_confirmed_plans=[dict(symbol='BTC_USDT', capital_rank=1, grade='standard'),
-                                         dict(symbol='SOL_USDT', capital_rank=4, grade='strong',
-                                              evidence_kind='htf_zone_mss')])
-    assert result.action.value == 'trade'
-    assert result.metadata['release_symbol'] == 'ETH_USDT'
-    assert result.metadata['decision_ai']['review_mode'] == 'vlm'
+        def vision(model, packet):
+            model.vision_answer = text(packet)
+            model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'success'}]}
+
+        model = DecisionModel(text, vision)
+        run, store = evaluator(path, monkeypatch, model)
+        return run(open_position_briefs=briefs, queued_confirmed_plans=queue, available_usdt=1), store
+
+    better, better_store = decide(True, tmp_path / 'better')
+    assert better.action.value == 'trade'
+    assert better.metadata.get('release_symbol') is None
+    both, store = decide(False, tmp_path / 'both')
+    assert both.action.value == 'trade'
+    assert both.metadata['release_symbol'] == 'ETH_USDT'
+    assert both.metadata['thesis_invalidated'] is True
+    assert both.metadata['decision_ai']['review_mode'] == 'vlm'
     assert store.get('local_entry_limits', []) == []
+    assert better_store.get('local_entry_limits', []) == []
 
 
 def test_zone_touch_trade_is_rejected_before_any_order(tmp_path, monkeypatch):
@@ -359,8 +389,7 @@ def test_stronger_parallel_plan_is_applied_first(tmp_path):
     assert executor.calls == []
 
 
-def test_unconfirmed_close_does_not_open_the_replacement(tmp_path, monkeypatch):
-    from trading.runtime.live_runner import LiveRunner
+def test_profitable_plan_alone_does_not_close_an_open_trade(tmp_path, monkeypatch):
     from .test_live_runner import candidate, prepare, result
 
     runner, _, executor, control = prepare(tmp_path)
@@ -368,6 +397,29 @@ def test_unconfirmed_close_does_not_open_the_replacement(tmp_path, monkeypatch):
     runner.candidate_queue().refresh([seed])
     trade = result(runner, seed)
     trade.metadata['release_symbol'] = 'ETH_USDT'
+    closed = []
+    monkeypatch.setattr(runner, '_release_confirmed', lambda symbol: closed.append(symbol) or False)
+    status = runner._apply(seed, trade, control)
+    assert closed == []
+    assert status['reason'] == 'LIVE_PROTECTED'
+    assert [row[0] for row in executor.calls] == ['authorize', 'execute']
+
+
+def test_unconfirmed_close_does_not_open_the_replacement(tmp_path, monkeypatch):
+    from trading.runtime.live_runner import LiveRunner
+    from .test_live_runner import candidate, prepare, result
+
+    runner, private, executor, control = prepare(tmp_path)
+    seed = candidate()
+    runner.candidate_queue().refresh([seed])
+    trade = result(runner, seed)
+    trade.metadata['release_symbol'] = 'ETH_USDT'
+    trade.metadata['thesis_invalidated'] = True
+    private.available = 1
+    private.positions = [dict(positionId=45, symbol='ETH_USDT', positionType=1, openType=1, state=1,
+                              holdVol=1, leverage=3, holdAvgPrice=100, im=10, unRealizedPnl=-1, liquidatePrice=70)]
+    executor.rows = [dict(intent_id='eth', position_id='45', status='protected',
+                          proposal={'symbol': 'ETH_USDT', 'stop_loss': {'price': 100}, 'take_profit_price': 110})]
     monkeypatch.setattr(runner, '_release_confirmed', lambda symbol: False)
     status = runner._apply(seed, trade, control)
     assert status['reason'] == 'HOLD_LIVE_CLOSE_UNCONFIRMED'
@@ -390,7 +442,12 @@ def test_unconfirmed_close_does_not_open_the_replacement(tmp_path, monkeypatch):
 
     assert LiveRunner._release_confirmed(Unconfirmed(), 'ETH_USDT') is False
     assert LiveRunner._release_confirmed(Confirmed(), 'ETH_USDT') is True
-    monkeypatch.setattr(runner, '_release_confirmed', lambda symbol: True)
+
+    def confirmed_close(symbol):
+        private.available = 400
+        return True
+
+    monkeypatch.setattr(runner, '_release_confirmed', confirmed_close)
     assert runner._apply(seed, trade, control)['reason'] == 'LIVE_PROTECTED'
     assert [row[0] for row in executor.calls] == ['authorize', 'execute']
 
@@ -416,3 +473,53 @@ def test_confirmed_plans_rank_by_evidence_and_payoff():
         dict(symbol='CCC', capital_rank=3, grade='standard'),
     ])
     assert [row['symbol'] for row in ranked] == ['AAA', 'BBB', 'CCC']
+
+
+def test_local_limits_rank_by_cost_adjusted_r_not_by_preference(tmp_path):
+    from trading.evaluation.local_limits import rank_local_limits, save_local_limit
+    from .test_live_runner import prepare
+
+    ranked = rank_local_limits([
+        dict(symbol='LOW', cost_adjusted_r=0.4, id='a'),
+        dict(symbol='MISS', cost_adjusted_r=None, id='b'),
+        dict(symbol='HIGH', cost_adjusted_r=2.5, id='c'),
+        dict(symbol='NAN', cost_adjusted_r=float('nan'), id='d'),
+    ])
+    assert [row['symbol'] for row in ranked] == ['HIGH', 'LOW', 'MISS', 'NAN']
+    runner, _, _, control = prepare(tmp_path)
+    control['runner_id'] = 'runner3'
+    save_local_limit(runner.store, symbol='BTC_USDT', side='long', limit_price=100,
+                     rationale='düşük R', cost_adjusted_r=0.4)
+    save_local_limit(runner.store, symbol='ETH_USDT', side='long', limit_price=100,
+                     rationale='yüksek R', cost_adjusted_r=2.5)
+    runner._queue_reached_limits()
+    first = runner.candidate_queue().next(htf_zone_entries=True, lease_seconds=30)
+    second = runner.candidate_queue().next(htf_zone_entries=True, lease_seconds=30)
+    assert first.symbol == 'ETH_USDT' and first.features['capital_rank'] == 2.5
+    assert second.symbol == 'BTC_USDT' and second.features['capital_rank'] == 0.4
+
+
+def test_a_tighter_stop_is_rejected_for_a_small_account():
+    import pytest
+    from trading.evaluation.price_plan import CandleReference, MarketPricePlan
+    from trading.runtime.runner3_policy import validate_evidence
+
+    swing_stop = CandleReference(timeframe='15m', open_time=1, field='low')
+    target = CandleReference(timeframe='4h', open_time=2, field='high')
+    swing = dict(side='long', state='ready', context_timeframe='4h', trigger_timeframe='15m',
+                 evidence=dict(kind='htf_zone_mss', stage='confirmed', expires_at=time.time() + 60),
+                 stop_loss_price=90., stop_reference=swing_stop.model_dump(), target_reference=target.model_dump())
+    tight = MarketPricePlan(entry_type='market', entry_price=100, stop_loss_price=92, take_profit_price=110,
+                            entry_timeframe='15m', stop_reference=swing_stop, target_reference=target,
+                            reason='Küçük hesap için stop daraltıldı.')
+    with pytest.raises(ValueError, match='runner3_structural_stop_too_tight'):
+        validate_evidence(swing, tight)
+    validate_evidence(swing, tight.model_copy(update={'stop_loss_price': 90}))
+    intraday_stop = CandleReference(timeframe='5m', open_time=1, field='low')
+    intraday = dict(swing, context_timeframe='1h', trigger_timeframe='5m', stop_reference=intraday_stop.model_dump())
+    exact = MarketPricePlan(entry_type='market', entry_price=100, stop_loss_price=90, take_profit_price=110,
+                            entry_timeframe='5m', stop_reference=intraday_stop, target_reference=target,
+                            reason='5m fitil stopu aynen duruyor.')
+    validate_evidence(intraday, exact)
+    with pytest.raises(ValueError, match='runner3_structural_stop_too_tight'):
+        validate_evidence(intraday, exact.model_copy(update={'stop_loss_price': 92}))

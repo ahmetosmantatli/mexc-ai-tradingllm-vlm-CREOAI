@@ -286,8 +286,37 @@ class LiveRunner:
                 features=dict(local_limit_review=True, htf_zone_seed=True, structure_seed=True,
                     seed_timeframe=row.get('trigger_timeframe') or '15m',
                     source_open_at=now-60, source_closed_at=now-1,
+                    capital_rank=row.get('cost_adjusted_r') or 0,
                     dedup_key='local-limit:'+row['id'], setup_id=row.get('setup_id'))))
         self.candidate_queue().refresh(signals, refreshed_symbols=set())
+
+    def _rotation_allowed(self, symbol, snapshot, result, control):
+        """A market close needs an invalidated thesis and no free margin for the new plan."""
+        if not result.metadata.get('thesis_invalidated'):
+            return False
+        position=self._positions(snapshot).get(symbol)
+        if not position:
+            return False
+        try:
+            price=self.quote(symbol).last_price
+        except Exception:
+            return False
+        if not runner3_policy.thesis_invalidated(position, price):
+            return False
+        setup=result.metadata.get('setup_selection') or {}
+        grade='standard'
+        if setup.get('evidence'):
+            try:
+                grade=runner3_policy.evidence_grade(setup)
+            except (KeyError, TypeError):
+                grade='standard'
+        horizon=setup.get('horizon') if setup.get('horizon') in ('scalp', 'intraday', 'swing') else 'intraday'
+        try:
+            allocation=runner3_policy.margin_policy(snapshot['balance']['equity'], self._capital(snapshot, control),
+                snapshot['balance']['available'], grade, horizon)
+        except ValueError:
+            return False
+        return allocation['max_entry_cost_usdt']<=0
 
     def _release_confirmed(self, symbol):
         """Close one open trade with the existing writer. True only after the exchange confirms."""
@@ -394,7 +423,15 @@ class LiveRunner:
                 note='Maximum is an upper bound, not a target. Use a validated grounded price plan only when price planning is enabled, otherwise keep quant levels. Preserve loss budget and liquidation buffer; choose lower leverage or HOLD when incompatible.')
             live_positions=self._positions(snapshot)
             if control.get('runner_id')=='runner3':
-                live_context['open_position_briefs']=[runner3_policy.position_brief(row) for row in live_positions.values()]
+                briefs=[]
+                for row in live_positions.values():
+                    brief=runner3_policy.position_brief(row)
+                    try:
+                        brief['mark']=self.quote(row['symbol']).last_price
+                    except Exception:
+                        brief['mark']=None
+                    briefs.append(brief)
+                live_context['open_position_briefs']=briefs
                 live_context['queued_confirmed_plans']=self._queued_confirmed_plans()
             return evaluator.evaluate_candidates([candidate],equity=capital,risk_per_trade_pct=self._risk_fraction(control),
                 target_leverage=self._leverage_cap(control,exchange_cap),risk_profile=self.cfg.risk_profile.value,
@@ -552,6 +589,8 @@ class LiveRunner:
             return finish('HOLD_LIVE_UNVALIDATED_MODEL')
         proposal=self._final_proposal(selected,result,snapshot,control)
         release=result.metadata.get('release_symbol')
+        if release and not self._rotation_allowed(release, snapshot, result, control):
+            release=None
         if release:
             if not self._release_confirmed(release):
                 return finish('HOLD_LIVE_CLOSE_UNCONFIRMED')
@@ -585,6 +624,9 @@ class LiveRunner:
                 and latest['revision']==card['revision'] and latest.get('last_action')=='trade'
                 and time.time()-started<=self.cfg.decision_ttl_seconds)
         self.executor.can_execute=current
+        pending=result.metadata.get('pending_vlm')
+        if pending is not None:
+            pending.arm_send()
         try:
             state=self.executor.execute(intent['intent_id'])
         finally:

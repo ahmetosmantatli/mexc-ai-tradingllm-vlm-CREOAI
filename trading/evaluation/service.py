@@ -23,6 +23,7 @@ class ModelDecision(BaseModel):
     reviewed_watch_revision: int | None = Field(default=None,ge=0,strict=True)
     limit_price: float | None = Field(default=None, gt=0)
     release_symbol: str | None = Field(default=None, max_length=40)
+    thesis_invalidated: bool = False
     action: str = Field(pattern='^(trade|watch|hold|cancel_watch)$')
     signal_id: str | None
     rationale: str = Field(max_length=1200)
@@ -49,10 +50,12 @@ VLM_DECISION_TIMEOUT_SECONDS = 120
 def _decision_packet(decision):
     if decision is None:
         return dict(action=None, rationale='Metin modeli geçerli bir karar üretemedi.',
-                    limit_price=None, release_symbol=None, setup_id=None, signal_id=None)
+                    limit_price=None, release_symbol=None, thesis_invalidated=False,
+                    setup_id=None, signal_id=None)
     return dict(action=decision.action, rationale=decision.rationale, setup_id=decision.setup_id,
                 signal_id=decision.signal_id, invalidation=decision.invalidation,
                 limit_price=decision.limit_price, release_symbol=decision.release_symbol,
+                thesis_invalidated=bool(decision.thesis_invalidated),
                 price_plan=decision.price_plan.model_dump() if decision.price_plan else None,
                 sizing_plan=decision.sizing_plan.model_dump() if decision.sizing_plan else None,
                 watch_plan=decision.watch_plan.model_dump() if decision.watch_plan else None)
@@ -261,11 +264,12 @@ class ContextEvaluator:
                     and 0 < equity_now < runner3_policy.SMALL_ACCOUNT_EQUITY_USDT,
                 open_positions=list(live_account.get('open_position_briefs') or []),
                 queued_confirmed_plans=runner3_policy.rank_confirmed_plans(live_account.get('queued_confirmed_plans') or []),
-                note=('Confirmed plans share one balance and are ranked by evidence and payoff. '
-                      'A local limit does not reserve margin. Equity under 100 USDT should be used when a READY plan is valid; '
-                      'the risk engine still caps size and loss. Open positions include unrealized pnl, thesis, and remaining room. '
-                      'release_symbol closes one different open position at market through the single writer. '
-                      'The new entry waits until the exchange confirms that close.'))
+                note=('Confirmed plans share one balance. Simultaneous local limits are ranked by cost-adjusted R. '
+                      'A local limit does not reserve margin. Equity under 100 USDT is not a reason to enter without a valid zone, '
+                      'a closed touch, and a later closed CHoCH/MSS. Touch alone never places an order. '
+                      'The risk engine still caps size and loss. Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
+                      'release_symbol closes one different open position only when its thesis is invalidated and free margin cannot fund the new plan. '
+                      'The close uses the single writer and the new entry waits until the exchange confirms that close.'))
         account['setup_selection']=dict(enabled=selection_enabled,options=options,
             countertrend_max_risk_fraction=risk_per_trade_pct*.5,
             note='Select setup_id and provide a fresh grounded price_plan for TRADE. No hypothesis means no forced trade.')
@@ -353,11 +357,19 @@ class ContextEvaluator:
             if decision.release_symbol:
                 if not runner3 or decision.action != 'trade':
                     raise ValueError('release_symbol is only for a runner3 market entry')
-                opens = {row.get('symbol') for row in (account.get('capital_allocation') or {}).get('open_positions') or []}
-                if decision.release_symbol not in opens or decision.release_symbol == symbol:
+                opens = [row for row in (account.get('capital_allocation') or {}).get('open_positions') or []
+                         if isinstance(row, dict)]
+                position = next((row for row in opens if row.get('symbol') == decision.release_symbol), None)
+                if position is None or decision.release_symbol == symbol:
                     raise ValueError('release_symbol must be a different open position')
                 if len(decision.rationale.strip()) < 12:
                     raise ValueError('release requires a rationale')
+                # A more profitable plan is not a close. Both gates are required.
+                cost = ((option or {}).get('allocation') or {}).get('max_entry_cost_usdt')
+                funded = not (isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost <= 0)
+                if funded or not decision.thesis_invalidated or not runner3_policy.thesis_invalidated(position, position.get('mark')):
+                    decision.release_symbol = None
+                    decision.thesis_invalidated = False
             if decision.price_plan is not None:
                 if not price_planning or decision.action!='trade':
                     raise ValueError('price planning disabled or not trade')
@@ -413,12 +425,16 @@ class ContextEvaluator:
                      'invalidation. BTC/ETH structure provides context; an altcoin can diverge if its own closed evidence supports it. '
                      'Use allocation as a margin target ceiling, separate from stop risk. '
                      'Use the suggested risk fraction as a starting point; adjust down for portfolio risk, liquidity, and weak payoff. Choose leverage from current account and price evidence. '
-                     'Do not narrow the structural stop to fit the desired size. '
+                     'Do not narrow the structural stop to fit the desired size or to protect a small account. '
+                     'The swing stop stays on the 15m wick. The intraday stop stays on the 5m wick. Do not open a hedge. '
                      'Decide from the numeric setup: zone, touch, closed CHoCH/MSS, price-action and ICT labels, and the algorithm reason. '
                      'Swing stays 4h zone then 15m confirmation. Intraday stays 1h zone then 5m confirmation. Touch alone is not an entry. '
-                     'Equity under 100 USDT should not sit idle when a READY plan is valid; the risk engine still caps size and loss. '
-                     'Queued confirmed plans share one balance and are already ranked. Open positions include unrealized pnl, thesis, and remaining room. '
-                     'release_symbol may name one different open position to close at market so its margin can back a stronger plan. '
+                     'Equity under 100 USDT is not a reason to enter. A trade still requires the valid HTF zone, a closed touch, '
+                     'and a later closed CHoCH/MSS. Touch alone never places an order. The risk engine still caps size and loss. '
+                     'Queued confirmed plans share one balance. Simultaneous local limits are ranked by cost-adjusted R, not by preference. '
+                     'Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
+                     'release_symbol may name one different open position only when thesis_invalidated is true and that thesis is already invalidated, '
+                     'and free margin cannot fund this confirmed plan. A higher payoff alone is not a close. '
                      'The close uses the single order writer and the new entry waits until the exchange confirms that close. '
                      'limit_price is optional. Omit it or null for a market-now entry. A number is stored locally and is not a resting exchange order.')
         decision_mode = None
@@ -452,12 +468,15 @@ class ContextEvaluator:
             if mode == 'vlm':
                 review_policy += (' text_model_decision is the text model choice and why, already made from the numeric setup: '
                                   'zone, touch, closed CHoCH/MSS, price-action and ICT labels, and the algorithm reason. '
-                                  'You have that same packet plus the chart. You may drop the trade, rebuild the plan, '
-                                  'refuse the pair, take the market-now setup, or name limit_price. '
+                                  'You have that same packet plus the chart. Text and this review run together. '
+                                  'You have two minutes to answer. A valid answer in that time is the decision. '
+                                  'You may drop the trade, rebuild the plan, refuse the pair, take the market-now setup, or name limit_price. '
+                                  'An answer after the order is already sent does not unwind it. It may only update the saved local plan for the next trigger. '
                                   'limit_price is stored locally and is not a resting exchange order. '
                                   'Price reaching it only reopens analysis; confirmation is still required. '
                                   'A resting local limit does not reserve margin. '
-                                  'Chart annotations cannot replace candle references or mandatory price and risk checks.')
+                                  'Chart annotations cannot replace candle references or mandatory price and risk checks. '
+                                  'Equity under 100 USDT is not a reason to enter without zone, touch, and closed CHoCH/MSS. Touch alone never places an order.')
             review_account = account if prompt_account is None else prompt_account
             review_prompt = build_prompt(candidate, chart_context, memory, positions, review_account, mode, changes)
             payload = client.complete_json(system=review_policy, user=review_prompt,
@@ -481,6 +500,7 @@ class ContextEvaluator:
                         called=called, raw=raw_trace)
 
         provider_called = False
+        pending = None
         if runner3 and paths:
             text_result = run_review('text', deadline_at=deadline)
             provider_called = bool(text_result['called'])
@@ -495,46 +515,55 @@ class ContextEvaluator:
             vlm_account = copy.deepcopy(account)
             vlm_account['text_model_decision'] = _decision_packet(text_decision)
             vlm_client = self.llm.fork() if callable(getattr(self.llm, 'fork', None)) else self.llm
-            box = {}
+            from trading.evaluation.pending_vlm import PendingVlm
+            pending = PendingVlm(self.store, fee=self.cfg.paper_fee_rate,
+                                 slippage=self.cfg.paper_slippage_bps / 10000)
             finished = threading.Event()
-            cancelled = threading.Event()
 
             def vlm_work():
                 try:
-                    box['value'] = run_review('vlm', client=vlm_client, prompt_account=vlm_account,
-                                              base_attempts=list(text_attempts),
-                                              deadline_at=time.time() + VLM_DECISION_TIMEOUT_SECONDS,
-                                              cancel=cancelled)
-                except Exception as exc:
-                    box['error'] = exc
+                    review = run_review('vlm', client=vlm_client, prompt_account=vlm_account,
+                                        base_attempts=list(text_attempts),
+                                        deadline_at=time.time() + VLM_DECISION_TIMEOUT_SECONDS,
+                                        cancel=pending.cancelled)
+                    review['symbol'] = symbol
+                    pending.complete(review)
+                except Exception:
+                    pending.complete(dict(decision=None, symbol=symbol))
                 finally:
                     finished.set()
                     if vlm_client is not self.llm and callable(getattr(vlm_client, 'close', None)):
                         vlm_client.close()
 
+            # Text already decided. VLM is asked the same question and has two minutes.
             threading.Thread(target=vlm_work, name='vlm-decision', daemon=True).start()
             arrived = finished.wait(VLM_DECISION_TIMEOUT_SECONDS)
-            if not arrived:
-                cancelled.set()
+            vlm_result = pending.take() if arrived else None
+            if vlm_result is not None:
+                provider_called = provider_called or bool(vlm_result.get('called'))
+                attempts = vlm_result.get('attempts') or attempts
+                raw_trace = vlm_result.get('raw') or raw_trace
+                decision = vlm_result['decision']
+                decision_mode = 'vlm'
+                winning_identity = vlm_result.get('identity') or winning_identity
+                winning_prompt = vlm_result.get('prompt') or winning_prompt
+            elif not arrived and text_decision is not None:
+                pending.close_deadline()
                 if hasattr(vlm_client, 'on_trace'):
                     vlm_client.on_trace = lambda update: None
-            if arrived and box.get('value'):
-                vlm_result = box['value']
-                provider_called = provider_called or bool(vlm_result['called'])
-                attempts = vlm_result['attempts']
-                raw_trace = vlm_result['raw']
-                if vlm_result['decision'] is not None:
-                    decision = vlm_result['decision']
-                    decision_mode = 'vlm'
-                    winning_identity = vlm_result['identity']
-                    winning_prompt = vlm_result['prompt']
-            elif not arrived and text_decision is not None:
                 decision = text_decision
                 decision_mode = 'text'
                 attempts = list(text_attempts) + [dict(review_mode='vlm', status='timeout', generation_requests=0)]
                 winning_identity = text_result['identity']
                 winning_prompt = text_result['prompt']
                 raw_trace = text_result['raw']
+            else:
+                review = pending.box.get('value') or {}
+                pending.close_deadline()
+                if review.get('attempts'):
+                    attempts = review['attempts']
+                    raw_trace = review.get('raw') or raw_trace
+                    provider_called = provider_called or bool(review.get('called'))
         else:
             mode = 'vlm' if self.cfg.analysis_version == 'vlm' and paths else 'text'
             single = run_review(mode, deadline_at=deadline)
@@ -558,7 +587,8 @@ class ContextEvaluator:
         metadata=dict(charts=paths,analysis_version=self.cfg.analysis_version,provider_called=provider_called,analysis_trace_id=trace['id'],
             decision_created_at=time.time(),decision_started_at=decision_clock,fingerprint=fingerprint,
             input_fingerprint=trace['input_fingerprint'],context_policy=POLICY_VERSION,
-            why_reconsidered=changes,prompt_bytes=trace['prompt_bytes'],strategy_cohort=trace.get('strategy_cohort'))
+            why_reconsidered=changes,prompt_bytes=trace['prompt_bytes'],strategy_cohort=trace.get('strategy_cohort'),
+            pending_vlm=pending)
         if decision is None:
             metadata['provider_busy']=getattr(self.llm,'last_status','')=='paid_in_flight'
             wait_statuses={'cooldown_skipped','quota_skipped','paid_in_flight','stopped','missing_key','budget_exhausted','budget_or_interval_hold'}
@@ -683,14 +713,25 @@ class ContextEvaluator:
         self.store.put('last_analysis',record)
         metadata.update(decision_ai=decision_ai,invalidation=decision.invalidation,rationale=decision.rationale,
             watch_note=decision.watch_note,sizing_plan=decision.sizing_plan.model_dump() if decision.sizing_plan else None,
-            release_symbol=decision.release_symbol)
+            release_symbol=decision.release_symbol,
+            thesis_invalidated=bool(decision.release_symbol and decision.thesis_invalidated))
         if local_limit:
             from trading.evaluation.local_limits import save_local_limit
+            plan = decision.price_plan
+            side_name = selection['side'] if selection else candidate.side.value
+            adjusted = None
+            if plan is not None:
+                adjusted = runner3_policy.cost_adjusted_r(
+                    side=side_name, entry=decision.limit_price, stop=plan.stop_loss_price,
+                    target=plan.take_profit_price, fee=self.cfg.paper_fee_rate,
+                    slippage=self.cfg.paper_slippage_bps / 10000)
             metadata['local_limit']=save_local_limit(
-                self.store, symbol=symbol, side=(selection['side'] if selection else candidate.side.value),
+                self.store, symbol=symbol, side=side_name,
                 limit_price=decision.limit_price, setup_id=decision.setup_id, rationale=decision.rationale,
                 decision_mode=decision_mode, trace_id=trace['id'],
-                trigger_timeframe=(selection or {}).get('trigger_timeframe'))
+                trigger_timeframe=(selection or {}).get('trigger_timeframe'),
+                cost_adjusted_r=adjusted, stop=None if plan is None else plan.stop_loss_price,
+                target=None if plan is None else plan.take_profit_price)
         if time.time()-decision_clock>self.cfg.decision_ttl_seconds:
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='decision_expired',metadata=metadata)
         if local_limit:
