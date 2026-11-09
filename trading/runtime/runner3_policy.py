@@ -85,6 +85,34 @@ def small_account_risk_target(equity, ceiling, grade):
     return None
 
 
+def rank_confirmed_plans(plans):
+    """Stronger evidence and payoff first. Ties stay on symbol and setup id."""
+    def key(plan):
+        grade = 1 if plan.get('grade') == 'strong' or plan.get('evidence_kind') == 'htf_zone_mss' else 0
+        try:
+            reward = float(plan.get('capital_rank') if plan.get('capital_rank') is not None else plan.get('reward_risk') or 0)
+        except (TypeError, ValueError):
+            reward = 0.
+        return (-grade, -reward, str(plan.get('symbol') or ''), str(plan.get('setup_id') or ''))
+    return sorted(list(plans or []), key=key)
+
+
+def position_brief(position):
+    """PnL, thesis, and room to the planned target for a capital comparison."""
+    return dict(symbol=position.get('symbol'), side=position.get('side'),
+                unrealized_pnl=position.get('unrealized'),
+                thesis=str(position.get('thesis') or '')[:500],
+                remaining_room=copy_room(position.get('remaining_room')),
+                leverage=position.get('leverage'), entry=position.get('entry'),
+                stop=position.get('stop'), target=position.get('target'))
+
+
+def copy_room(room):
+    if not isinstance(room, dict):
+        return None
+    return {key: room.get(key) for key in ('to_target_price', 'to_target_r')}
+
+
 def daily_objective(closed, target, now):
     local = datetime.fromtimestamp(now, ZoneInfo('Europe/Istanbul'))
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)

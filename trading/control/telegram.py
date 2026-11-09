@@ -280,8 +280,8 @@ class TelegramController:
                 text+='Gerekçe: '+str(trace['rationale'])[:300]+'\n'
             model_action=trace.get('model_action') or (trace.get('action') if trace.get('status')=='completed' else None)
             if model_action:
-                mode={'vlm':' · VLM', 'text':' · görselsiz'}.get(trace.get('decision_mode'), '')
-                text+='Model kararı: '+{'trade':'İşlem öner','watch':'Takibe al','hold':'Bekle','cancel_watch':'Takibi iptal et'}.get(model_action,'Bilinmiyor')+mode+'\n'
+                mode={'vlm':' · VLM', 'text':' · metin'}.get(trace.get('decision_mode'), '')
+                text+='Model kararı: '+{'trade':'İşlem öner','watch':'Takibe al','hold':'Bekle','cancel_watch':'Takibi iptal et','local_limit':'Yerel limit'}.get(model_action,'Bilinmiyor')+mode+'\n'
             if trace.get('setup_family'):text+='Seçilen kurulum: '+str(trace['setup_family'])+' | Yön: '+str(trace.get('side','?'))+'\n'
             if trace.get('execution_reason'):text+='Yürütme sonucu: '+str(trace['execution_reason'])+'\n'
             if trace.get('execution_details'):text+='Kontrol ayrıntısı: '+str(trace['execution_details'])[:400]+'\n'
