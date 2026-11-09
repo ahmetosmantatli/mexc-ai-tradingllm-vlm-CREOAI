@@ -334,3 +334,37 @@ def test_dynamic_zero_capacity_blocks_provider_work_without_consuming_candidate(
     assert result['reason']=='HOLD_LIVE_AI_CAPACITY' and not calls
     assert runner.store.get('candidate_queue')[0]['last_considered_at']==0
     assert runner.monitor()['entry_status']['reason']=='HOLD_LIVE_AI_CAPACITY'
+
+
+def test_runner3_evidence_bonus_changes_sizing_only_without_same_side_exposure(tmp_path, monkeypatch):
+    runner, _, _, control = prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled = True
+    control['runner_id'] = 'runner3'
+    signal = candidate()
+    decision = result(runner, signal, dict(leverage=5, risk_per_trade_pct=.006))
+    stamp = int(time()) - 1800
+    stop_reference = dict(timeframe='15m', open_time=stamp, field='low')
+    decision.metadata.update(
+        setup_selection=dict(setup_id='setup1', family='trend_continuation', horizon='intraday',
+                             macro_trend='bullish', side='long', reward_risk=2.,
+                             evidence={'kind': 'closed_bos'}, stop_reference=stop_reference, stop_loss_price=98.),
+        price_plan=dict(entry_type='market', entry_price=100., stop_loss_price=98., take_profit_price=106.,
+                        entry_timeframe='15m', stop_reference=stop_reference,
+                        target_reference=dict(timeframe='15m', open_time=stamp, field='high'),
+                        reason='Closed wick and structural target.'),
+        price_evidence={'15m': [[stamp, 100, 106, 98, 101, 1]]},
+    )
+    snapshot = runner._refresh([signal.symbol])
+    segment = ('trend_continuation', 'intraday', 'bullish', runner.cfg.analysis_version)
+    monkeypatch.setattr('trading.runtime.runner3_policy.evidence_risk_groups',
+                        lambda *args: {segment: {'eligible': True}})
+    boosted = runner._final_proposal(signal, decision, snapshot, control)
+    assert boosted.metadata['runner3_allocation']['risk_boost_applied']
+    assert boosted.metadata['sizing_plan']['risk_per_trade_pct'] == .006
+    assert boosted.max_loss_if_stopped == pytest.approx(1.5)
+    snapshot['positions'] = [{'side': 1}]
+    baseline = runner._final_proposal(signal, decision, snapshot, control)
+    assert not baseline.metadata['runner3_allocation']['risk_boost_applied']
+    assert baseline.max_loss_if_stopped == pytest.approx(1.2)
+    assert baseline.notional < boosted.notional
+    assert baseline.stop_loss == boosted.stop_loss

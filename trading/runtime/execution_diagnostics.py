@@ -3,6 +3,13 @@ from math import isfinite
 
 from trading.exchange.contracts import ContractQuantityError
 
+class EntryPriceDrift(ValueError):
+    def __init__(self, message, *, stage, planned, observed, tolerance):
+        super().__init__(message)
+        self.price_drift = dict(stage=stage, planned=planned, observed=observed,
+                                deviation=observed / planned - 1, tolerance=tolerance)
+
+
 CODES={
     'runner3_net_target_r_too_low':'RUNNER3_NET_TARGET_R',
     'runner3_cost_share_too_high':'RUNNER3_COST_SHARE',
@@ -34,6 +41,7 @@ CODES={
     'live_halt_latched':'LIVE_HALT',
     'private_account_reconciliation_failed':'ACCOUNT_RECONCILIATION',
     'automatic_position_cap':'POSITION_LIMIT',
+    'runner3_boost_same_side_exposure':'RUNNER3_BOOST_CONCENTRATION',
 }
 REASONS=set('''NONFINITE_RISK_INPUT UNVERIFIED_EXCHANGE_LEVERAGE_CAP LEVERAGE_CAP INSUFFICIENT_MARGIN
 INVALID_STOP_DIRECTION UNDERSTATED_STOP_LOSS MISSING_STOP_LOSS INVALID_MAX_LOSS EQUITY_ZERO_HALT
@@ -56,4 +64,10 @@ def safe_execution_error(exc):
     if isinstance(exc, ContractQuantityError):
         result['contracts'] = {field: value for field in ('quantity','minimum','maximum','step')
             if isfinite(value := getattr(exc, field))}
+    drift = getattr(exc, 'price_drift', None)
+    if (isinstance(drift, dict) and drift.get('stage') in ('planning', 'preflight')
+            and all(type(drift.get(field)) in (int, float) and isfinite(drift[field])
+                    for field in ('planned','observed','deviation','tolerance'))):
+        result['price_drift'] = {field: drift[field]
+                                 for field in ('stage','planned','observed','deviation','tolerance')}
     return result

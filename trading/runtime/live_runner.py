@@ -26,6 +26,7 @@ from trading.quant.scanner import MarketScanner,LiquidityFilter
 from trading.risk.engine import RiskEngine
 from trading.risk.presets import get_preset
 from trading.runtime.candidates import CandidateQueue
+from trading.runtime.execution_diagnostics import EntryPriceDrift
 from trading.runtime.live_account import LiveAccountReconciler,observe_risk_reference
 
 
@@ -336,8 +337,10 @@ class LiveRunner:
                 price_step=rules.price_step,current_price=ticker.ask1 if candidate.side.value=='long' else ticker.bid1,now=time.time())
         proposal=apply_decision_sizing(planning_candidate,result.metadata.get('sizing_plan'),self._capital(snapshot,control),
             self._risk_fraction(control),self._leverage_cap(control,exchange_cap),exchange_cap)
-        if abs(ticker.last_price/planning_candidate.entry_price-1)>min(planning_candidate.stop_distance_pct/2,.005):
-            raise ValueError('live entry price drift')
+        drift_limit = min(planning_candidate.stop_distance_pct / 2, .005)
+        if abs(ticker.last_price / planning_candidate.entry_price - 1) > drift_limit:
+            raise EntryPriceDrift('live entry price drift', stage='planning', planned=planning_candidate.entry_price,
+                                  observed=ticker.last_price, tolerance=drift_limit)
         entry=ticker.ask1 if candidate.side.value=='long' else ticker.bid1
         slip=self.cfg.paper_slippage_bps/10000;fee=self.cfg.paper_fee_rate
         if runner_id == 'runner3':
@@ -357,18 +360,37 @@ class LiveRunner:
             expected_net=(worst_target-worst_entry if candidate.side.value=='long' else worst_entry-worst_target)-fee*(worst_entry+worst_target)
             if expected_net<=0:raise ValueError('model target does not cover expected trading costs')
         margin_rate=max(1/proposal.leverage,private_risk['initial_rate'])+fee
+        risk_adjustment = {}
+        if runner_id == 'runner3':
+            grade = runner3_policy.evidence_grade(setup)
+            model_fraction = proposal.metadata['risk_per_trade_pct']
+            ceiling = self._risk_fraction(control) * (.5 if setup['family'] == 'countertrend_sweep_reclaim' else 1.)
+            segment = (setup['family'], setup['horizon'], setup['macro_trend'], self.cfg.analysis_version)
+            comparison = None
+            if grade == 'strong' and model_fraction < ceiling:
+                comparison = runner3_policy.evidence_risk_groups(self._intents(), time.time()).get(segment)
+            effective = runner3_policy.evidence_risk_budget(model_fraction, ceiling, grade=grade,
+                comparison=comparison, same_side_open=any(row['side'] == side for row in snapshot['positions']))
+            if effective > model_fraction:
+                multiplier = effective / model_fraction
+                proposal.max_loss_if_stopped *= multiplier
+                proposal.notional *= multiplier
+                proposal.metadata['risk_per_trade_pct'] = effective
+            risk_adjustment = dict(macro_trend=setup['macro_trend'], model_risk_fraction=model_fraction,
+                effective_risk_fraction=effective, risk_ceiling=ceiling, risk_boost_applied=effective > model_fraction,
+                risk_comparison=comparison)
         limits=dict(model_stop_budget=proposal.notional,stop_budget_with_costs=proposal.max_loss_if_stopped/loss_fraction,
                     available_margin=snapshot['balance']['available']/margin_rate*.95)
         if runner_id=='runner3':
             runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
             allocation=runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
-                snapshot['balance']['available'],runner3_policy.evidence_grade(setup),setup['horizon'])
+                snapshot['balance']['available'],grade,setup['horizon'])
             limits['runner3_margin_policy']=allocation['max_entry_cost_usdt']/margin_rate
             if limits['runner3_margin_policy']<=0:
                 raise ValueError('runner3_margin_reserve')
             proposal.metadata['runner3_allocation']=dict(allocation,limiting_factor=min(limits,key=limits.get),
                 setup_id=setup['setup_id'],evidence_expires_at=setup['evidence'].get('expires_at'),
-                calibrated_probability=None,expected_target_net_r=expected_net/unit_loss)
+                calibrated_probability=None,expected_target_net_r=expected_net/unit_loss,**risk_adjustment)
         _,notional=rules.size_order(min(limits.values()),entry,proposal.leverage)
         proposal.notional=notional
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)

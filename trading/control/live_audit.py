@@ -110,7 +110,8 @@ def audit(path,*,since=0,now=None,include_performance=False):
         account=next((json.loads(value) for value, in db.execute("SELECT value FROM state WHERE key LIKE 'account:%:live_snapshot'")),{})
         binding=account.get('binding_id')
         intents=[json.loads(value) for value, in db.execute("SELECT value FROM state WHERE key LIKE 'live:intent:%'")]
-        intents=[row for row in intents if row.get('staged_at',0)>=since and (not binding or row.get('binding_id')==binding)]
+        bound_intents=[row for row in intents if not binding or row.get('binding_id')==binding]
+        intents=[row for row in bound_intents if row.get('staged_at',0)>=since]
         errors=[json.loads(value) for value, in db.execute("SELECT value FROM state WHERE key LIKE 'live_candidate_error:%'")]
         errors=[row for row in errors if row.get('at',0)>=since]
         detail=[]
@@ -129,7 +130,12 @@ def audit(path,*,since=0,now=None,include_performance=False):
             halt=bool(state('live:halt')),last_entry_reason=state('live_entry_status',{}).get('reason'),
             limitations='Persisted records only, not a fresh exchange check. Entry attempt record is not proof of a POST/fill. Old unfinalized traces cannot establish a rejection reason.')
         if include_performance:
+            from trading.runtime.runner3_policy import evidence_risk_groups
             report['performance']=performance(traces,intents)
+            report['runner3_evidence_risk']=[
+                dict(setup_family=family, horizon=horizon, macro_trend=trend, variant=variant, **comparison)
+                for (family,horizon,trend,variant), comparison in sorted(evidence_risk_groups(bound_intents,now).items())
+            ]
         return report
     finally:db.close()
 

@@ -1,5 +1,7 @@
 """Deterministic Runner 3 allocation and evidence rules."""
+from collections import defaultdict
 from datetime import datetime, timedelta
+from statistics import mean
 from math import isfinite
 from time import time
 from zoneinfo import ZoneInfo
@@ -69,6 +71,53 @@ def validate_economics(gross, net, loss):
         raise ValueError('runner3_net_target_r_too_low')
     if gross <= 0 or (gross - net) / gross > MAX_COST_SHARE:
         raise ValueError('runner3_cost_share_too_high')
+
+def evidence_risk_groups(intents, now):
+    """Compare confirmed, unboosted returns in two non-overlapping 30-day windows."""
+    groups = defaultdict(lambda: defaultdict(list))
+    for row in intents:
+        metadata = row.get('proposal', {}).get('metadata') or {}
+        allocation = metadata.get('runner3_allocation') or {}
+        segment = (metadata.get('setup_family'), allocation.get('horizon'),
+                   allocation.get('macro_trend'), metadata.get('analysis_version'))
+        grade = allocation.get('grade')
+        closed_at = row.get('closed_at')
+        net = row.get('net_pnl')
+        risk = (row.get('entry_metrics') or {}).get('initial_stop_risk_usdt')
+        if (metadata.get('runner_id') != 'runner3' or metadata.get('strategy_cohort') != COHORT
+                or row.get('status') != 'closed' or row.get('realized_complete') is not True
+                or not row.get('entry_fill_price') or allocation.get('risk_boost_applied')
+                or not all(segment) or grade not in ('standard', 'strong')
+                or not all(type(v) in (int, float) and isfinite(v) for v in (closed_at, net, risk))
+                or risk <= 0):
+            continue
+        age_days = (now - closed_at / 1000) / 86400
+        if 0 <= age_days < 60:
+            groups[segment][int(age_days >= 30), grade].append(net / risk)
+
+    results = {}
+    for segment, values in groups.items():
+        windows = []
+        for index in (1, 0):
+            strong, standard = values[index, 'strong'], values[index, 'standard']
+            strong_r = mean(strong) if strong else None
+            standard_r = mean(standard) if standard else None
+            qualifies = (len(strong) >= 10 and len(standard) >= 10
+                         and strong_r > 0 and strong_r - standard_r >= .25)
+            windows.append(dict(strong_count=len(strong), standard_count=len(standard),
+                                strong_mean_net_r=strong_r, standard_mean_net_r=standard_r,
+                                qualifies=qualifies))
+        results[segment] = dict(prior_30_days=windows[0], recent_30_days=windows[1],
+                                eligible=all(window['qualifies'] for window in windows))
+    return results
+
+
+def evidence_risk_budget(model_fraction, ceiling, *, grade, comparison, same_side_open):
+    if (grade == 'strong' and model_fraction < ceiling and comparison
+            and comparison['eligible'] and not same_side_open):
+        return min(ceiling, model_fraction * 1.25, model_fraction + .0025)
+    return model_fraction
+
 
 def daily_objective(closed, target, now):
     local = datetime.fromtimestamp(now, ZoneInfo('Europe/Istanbul'))

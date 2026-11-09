@@ -41,6 +41,7 @@ ENTRY_REJECTION_REASONS = {
     'HOLD_LIVE_EXECUTOR_DISABLED': 'Canlı emir yürütücüsü etkin değil.',
     'HOLD_LIVE_UNVALIDATED_MODEL': 'Model önerisi giriş doğrulamasını geçmedi.',
     'HOLD_LIVE_EXECUTION_POSITION_LIMIT': 'Açık pozisyon sayısı sınırı dolu.',
+    'HOLD_LIVE_EXECUTION_RUNNER3_BOOST_CONCENTRATION': 'Son kontrolde aynı yönde açık pozisyon bulundu; artırılmış risk planı kullanılmadı.',
     'HOLD_LIVE_EXECUTION_CONTRACT_RISK_TIER': 'Kontrat adedi desteklenen risk kademesini aşıyor.',
     'HOLD_LIVE_EXECUTION_INSUFFICIENT_MARGIN': 'Kullanılabilir teminat işlem için yetersiz.',
     'HOLD_LIVE_EXECUTION_STALE_QUOTE': 'Güncel emir fiyatı doğrulanamadı.',
@@ -431,6 +432,11 @@ class LiveFleet:
                                        if code in ENTRY_REJECTION_DETAILS)
                 if not explanation:
                     explanation = ENTRY_REJECTION_REASONS.get(reason) or human_reason(reason)
+                drift = details.get('price_drift')
+                if drift:
+                    stage = 'Plan kontrolü' if drift['stage'] == 'planning' else 'Emir öncesi'
+                    explanation += (f"\n{stage} | Plan {drift['planned']:.10g} | Güncel {drift['observed']:.10g}"
+                                    f" | Sapma {drift['deviation']:+.3%} | Sınır {drift['tolerance']:.3%}")
                 contracts = details.get('contracts', {})
                 if {'quantity', 'minimum', 'maximum'} <= contracts.keys():
                     explanation += (f" Hesaplanan {contracts['quantity']:g} kontrat, "
@@ -492,6 +498,12 @@ class LiveFleet:
                 quality='Güçlü' if allocation['grade']=='strong' else 'Standart'
                 text+=f"Teminat hedefi: {allocation['target_margin_usdt']:.4f} USDT | Boyutu sınırlayan: {factor}\n"
                 text+=f"Kanıt kalitesi: {quality} | Kalibre olasılık: ölçülmedi\n"
+                if 'model_risk_fraction' in allocation:
+                    text+=(f"Model riski: {allocation['model_risk_fraction']:.2%} | "
+                           f"Uygulanan stop bütçesi: {allocation['effective_risk_fraction']:.2%} | "
+                           f"İzin verilen tavan: {allocation['risk_ceiling']:.2%}\n")
+                    if allocation.get('risk_boost_applied'):
+                        text+='Güçlü kanıt için geçmiş sonuçlara dayalı sınırlı artış uygulandı.\n'
             entry_timeframe=(metadata.get('price_plan') or {}).get('entry_timeframe')
             if entry_timeframe in ('5m','15m','4h'):
                 text+=f"Giriş zaman dilimi: {entry_timeframe}\n"

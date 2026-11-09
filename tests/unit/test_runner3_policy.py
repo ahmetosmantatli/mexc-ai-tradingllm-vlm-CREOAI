@@ -86,3 +86,48 @@ def test_quantity_rejection_preserves_exchange_constraints_for_audit():
     detail = safe_execution_error(error.value)
     assert detail['code'] == 'CONTRACT_QUANTITY_LIMIT'
     assert detail['contracts'] == {'quantity': 1., 'minimum': 2., 'maximum': 100., 'step': 1.}
+
+
+def test_evidence_risk_requires_repeatable_net_results_and_limits_the_bonus():
+    from trading.runtime.runner3_policy import COHORT, evidence_risk_budget, evidence_risk_groups
+
+    now = 1800000000.
+    rows = []
+    segment = ('trend_continuation', 'intraday', 'bearish', 'text')
+    for age in (10, 40):
+        for grade, pnl in [('strong', .2), ('standard', .1)]:
+            for i in range(10):
+                rows.append(dict(status='closed', realized_complete=True, entry_fill_price=100.,
+                    closed_at=(now-age*86400-i)*1000, net_pnl=pnl,
+                    entry_metrics={'initial_stop_risk_usdt': .2},
+                    proposal={'metadata': dict(runner_id='runner3', strategy_cohort=COHORT,
+                        setup_family=segment[0], analysis_version='text',
+                        runner3_allocation=dict(grade=grade, horizon='intraday', macro_trend='bearish'))}))
+    comparison = evidence_risk_groups(rows, now)[segment]
+    assert comparison['eligible']
+    assert comparison['prior_30_days']['strong_mean_net_r'] == pytest.approx(1.)
+    assert comparison['recent_30_days']['standard_mean_net_r'] == pytest.approx(.5)
+    assert not evidence_risk_groups(rows[:-1], now)[segment]['eligible']
+    rows[-1]['proposal']['metadata']['runner3_allocation']['risk_boost_applied'] = True
+    assert not evidence_risk_groups(rows, now)[segment]['eligible']
+
+    def budget(model=.015, ceiling=.03, grade='strong', same_side=False):
+        return evidence_risk_budget(model, ceiling, grade=grade, comparison=comparison, same_side_open=same_side)
+
+    assert budget() == pytest.approx(.0175)
+    assert budget(model=.004) == pytest.approx(.005)
+    assert budget(ceiling=.016) == pytest.approx(.016)
+    assert budget(grade='standard') == .015
+    assert budget(same_side=True) == .015
+    assert evidence_risk_budget(.015, .03, grade='strong', comparison=None, same_side_open=False) == .015
+
+
+def test_price_drift_diagnostics_capture_stage_and_signed_move():
+    from trading.runtime.execution_diagnostics import EntryPriceDrift, safe_execution_error
+
+    error = EntryPriceDrift('live entry price drift', stage='planning',
+                            planned=100., observed=99.6, tolerance=.003)
+    detail = safe_execution_error(error)
+    assert detail['code'] == 'ENTRY_PRICE_DRIFT'
+    assert detail['price_drift'] == pytest.approx(dict(
+        stage='planning', planned=100., observed=99.6, deviation=-.004, tolerance=.003))

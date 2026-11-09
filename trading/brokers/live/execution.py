@@ -26,9 +26,10 @@ from trading.runtime.runner2_entry import ioc_price_limit
 
 class LiveExecutionError(RuntimeError):
     """Safe fixed error category; never a raw exchange response or key."""
-    def __init__(self,code,*,reason_codes=()):
+    def __init__(self,code,*,reason_codes=(),price_drift=None):
         super().__init__(code)
         self.reason_codes=tuple(reason_codes)
+        self.price_drift=price_drift
 
 
 @dataclass(frozen=True)
@@ -174,7 +175,13 @@ class ApprovedLiveExecutor(PositionManagementMixin):
         bid,ask=self._number(ticker.bid1),self._number(ticker.ask1)
         if not -5<=age<=self.max_age or bid<=0 or ask<bid:raise LiveExecutionError('fresh_executable_quote_required')
         entry=ask if proposal.side.value=='long' else bid
-        if not proposal.entry_price or abs(entry/proposal.entry_price-1)>self.max_drift:raise LiveExecutionError('approved_entry_price_drift')
+        if not proposal.entry_price:
+            raise LiveExecutionError('approved_entry_price_drift')
+        deviation = entry / proposal.entry_price - 1
+        if abs(deviation) > self.max_drift:
+            raise LiveExecutionError('approved_entry_price_drift', price_drift=dict(
+                stage='preflight', planned=proposal.entry_price, observed=entry,
+                deviation=deviation, tolerance=self.max_drift))
         sl,tp=proposal.stop_loss.price,proposal.take_profit_price
         if sl is None or tp is None or not (sl<entry<tp if proposal.side.value=='long' else tp<entry<sl):
             raise LiveExecutionError('native_stop_and_target_required')
@@ -209,6 +216,9 @@ class ApprovedLiveExecutor(PositionManagementMixin):
         available=readiness.available
         if proposal.metadata.get('runner_id')=='runner3':
             policy=proposal.metadata.get('runner3_allocation') or {}
+            if policy.get('risk_boost_applied') and any(
+                    row['side'] == (1 if proposal.side.value == 'long' else 2) for row in snapshot['positions']):
+                raise LiveExecutionError('runner3_boost_same_side_exposure')
             expires=policy.get('evidence_expires_at')
             if expires is not None and expires<=time():
                 raise LiveExecutionError('runner3_evidence_expired')
