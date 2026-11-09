@@ -294,6 +294,11 @@ class TelegramController:
             text += f"Sağlayıcı denemesi: {len(attempts)}\n"
             if not attempts:text+='Bu değerlendirmede sağlayıcı isteği kaydedilmemiş; kota, bekleme veya durdurma nedeniyle olabilir.\n'
             sent=[a for a in attempts if a.get('generation_requests',0) or a.get('count_requests',0)]
+            skipped=[a for a in attempts if a.get('status')=='quota_skipped']
+            if skipped and not sent:
+                from collections import Counter
+                reasons=Counter(a.get('error_category') or 'bilinmiyor' for a in skipped)
+                text+='Atlanan rotalar: '+', '.join(f'{name} {count}' for name,count in sorted(reasons.items()))+'\n'
             for attempt in (sent or attempts)[-2:]:
                 text += (f"• {attempt.get('provider','?')} / {attempt.get('model','?')} | {attempt.get('status','?')}"
                          f" | {attempt.get('latency_ms',0):.0f} ms\n")
@@ -309,7 +314,18 @@ class TelegramController:
                 if attempt.get('credential_id'):
                     text+=f"Erişim: {attempt['credential_id']} | Kota grubu: {attempt.get('quota_group','?')}\n"
                 incoming,outgoing=attempt.get('input_tokens'),attempt.get('output_tokens')
-                if incoming is not None or outgoing is not None:
+                if attempt.get('status')=='quota_skipped':
+                    text+=f"Atlama nedeni: {attempt.get('error_category') or 'bilinmiyor'}"
+                    if attempt.get('estimated_input_tokens') is not None:
+                        text+=f" | tahmini token {attempt['estimated_input_tokens']}"
+                    if attempt.get('token_budget'):
+                        text+=f" | model TPM {attempt['token_budget']}"
+                    daily=attempt.get('requests_daily_remaining')
+                    minute=attempt.get('requests_minute_remaining')
+                    if daily is not None or minute is not None:
+                        text+=f" | kalan günlük {daily if daily is not None else '-'} | kalan dk {minute if minute is not None else '-'}"
+                    text+='\n'
+                elif incoming is not None or outgoing is not None:
                     text+=f"Token girdi/çıktı: {incoming if incoming is not None else '?'} / {outgoing if outgoing is not None else '?'}\n"
                 estimate=attempt.get('estimated_cost_usd')
                 text += (f"Yanıt kullanımından tahmini maliyet: ${estimate:.6f}\n" if estimate is not None else 'İstek maliyeti doğrulanmadı / hesaplanmadı.\n')

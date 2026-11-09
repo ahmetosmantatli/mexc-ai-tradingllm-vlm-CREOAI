@@ -124,7 +124,9 @@ class GeminiClient:
         except httpx.HTTPStatusError as exc:
             attempt.update(**safe_error(exc.response))
             self.last_status='rejected'
-            if exc.response.status_code!=429:
+            if exc.response.status_code==413 or attempt.get('error_category')=='request_token_budget':
+                attempt['error_category']='does-not-fit'
+            elif exc.response.status_code!=429:
                 self._cooldown(key)
             return None
         except Exception as exc:

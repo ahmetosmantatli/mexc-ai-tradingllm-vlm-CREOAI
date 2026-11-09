@@ -182,7 +182,10 @@ class ProviderRouter:
         except httpx.HTTPStatusError as exc:
             attempt.update(status='rejected',**safe_error(exc.response))
             self.last_fallback_reason='groq_http_'+str(exc.response.status_code)
-            if exc.response.status_code!=429:
+            if exc.response.status_code==413 or attempt.get('error_category')=='request_token_budget':
+                # The packet does not fit this model. That is not a window hold.
+                attempt['error_category']='does-not-fit'
+            elif exc.response.status_code!=429:
                 self._cooldown(model,60)
         except Exception as exc:
             attempt.update(status='failed',error_category='network_timeout' if isinstance(exc,httpx.TimeoutException) else 'network_error' if isinstance(exc,httpx.TransportError) else 'invalid_output_or_local_validation')

@@ -149,6 +149,10 @@ def provider_result(attempt):
             'minute_tokens':'dakikalık yerel token kotasında yer yok; yeni istek gönderilmedi',
             'provider_cooldown':'sağlayıcı bekleme süresinde; yeni istek gönderilmedi',
             'reservation_race':'kapasite yeniden kontrol edilecek; yeni istek gönderilmedi',
+            'does-not-fit':'istek bu modelin token sınırına sığmıyor; gönderilmedi, diğer rotalar kapatılmadı',
+            'window-full':'bu anahtarın dakika penceresi dolu; yalnızca bu anahtar bekliyor',
+            'daily-full':'bu anahtarın günlük kotası dolu; diğer hesap denenebilir',
+            'request_too_large':'istek bu modelin token sınırına sığmıyor; gönderilmedi, diğer rotalar kapatılmadı',
         }
         if category in reasons:return reasons[category]
         return 'analiz bu modelin token bütçesine sığmadığı için istek gönderilmedi'
