@@ -147,6 +147,7 @@ class ContextEvaluator:
     """
     def __init__(self, llm, store, public, settings):
         self.llm, self.store, self.public, self.cfg = llm, store, public, settings
+        self.on_live_review = None
         if hasattr(llm, 'response_validator'):
             llm.response_validator = ModelDecision.model_validate
         if hasattr(llm, 'decision_schema'):
@@ -262,6 +263,8 @@ class ContextEvaluator:
         if runner2:
             trace['strategy_cohort']=runner3_policy.COHORT if runner3 else 'runner2-multihorizon-ict-v1'
         publish_progress(self.store,trace)
+        if live_account is not None and self.on_live_review is not None:
+            self.on_live_review(trace)
         self.store.put('stage','model_evaluation')
         if hasattr(self.llm,'deadline'):
             self.llm.deadline=started+self.cfg.decision_ttl_seconds
@@ -474,3 +477,5 @@ class ContextEvaluator:
             history.sort(key=lambda row:(row.get('started_at',0),row['id']))
             self.store.put('analysis_history',history[-30:])
             self.store.put('stage','model_'+trace['status'])
+        if trace.get('mode') == 'LIVE' and self.on_live_review is not None:
+            self.on_live_review(trace)

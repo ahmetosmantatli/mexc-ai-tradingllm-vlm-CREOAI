@@ -400,9 +400,9 @@ class LiveFleet:
                 delayed.append(dict(kind=kind,age_seconds=now-began))
         snapshot['worker_health']=dict(observed_at=now,delayed_jobs=delayed)
         self.control_store.put(f'account:{ident}:status',snapshot)
-        from trading.control.activity import publish_activity
-        publish_activity(self.controller,self.control_store,ident,snapshot,self.cfg,now)
+        self._publish_live_gate(ident, snapshot)
         if runner is not None:
+            self._publish_review_notices(ident, runner)
             self._publish_entry_rejections(ident, runner)
         executor=getattr(runner,'executor',None)
         if executor is not None and callable(getattr(executor,'intents',None)):
@@ -417,6 +417,91 @@ class LiveFleet:
                         +"\nMEXC durumunu aşağıdaki düğmeyle kontrol et. Yeniden Başlat kararı sende.",
                         event_id=f"live-halt-review:{row['binding_id']}:{row['intent_id']}",buttons=True)
         return snapshot
+
+    def _publish_live_gate(self, ident, snapshot):
+        control = snapshot.get('control') or {}
+        enabled = control.get('enabled') and not control.get('stopped')
+        entry_status = snapshot.get('entry_status') or {}
+        entry = entry_status.get('reason')
+        delayed = (snapshot.get('worker_health') or {}).get('delayed_jobs') or []
+        reasons = {
+            'HOLD_LIVE_LOSS_CIRCUIT_BREAKER': 'Kayıp/düşüş sınırı yeni girişleri bekletiyor.',
+            'HOLD_LIVE_NO_FUNDS': 'Kullanılabilir bakiye yetersiz; yeni girişler bekliyor.',
+            'HOLD_LIVE_START_REQUIRED': 'Başlat izni bekleniyor.',
+            'HOLD_LIVE_RECONCILIATION': 'Borsa durumu doğrulanana kadar yeni girişler bekliyor.',
+            'HOLD_LIVE_EXECUTOR_DISABLED': 'Canlı emir yürütücüsü etkin değil.',
+        }
+        if delayed:
+            labels = {'analysis':'AI analizi','scan':'piyasa taraması','monitor':'borsa uzlaştırması',
+                      'management':'pozisyon yönetimi'}
+            job = delayed[0]
+            gate = 'delayed:' + job['kind']
+            explanation = f"Geciken görev: {labels[job['kind']]} ({job['age_seconds']:.0f} sn)."
+        elif snapshot.get('live_halt'):
+            gate = 'halt'
+            explanation = 'Hesapta teknik giriş engeli var; yeni emirler bekliyor.'
+        elif enabled:
+            gate = 'HOLD_LIVE_RECONCILIATION' if snapshot.get('reason') == 'HOLD_LIVE_RECONCILIATION' else entry
+            explanation = reasons.get(gate)
+            if gate == 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER':
+                labels = {'daily_loss_pct':'Günlük kayıp','weekly_loss_pct':'Haftalık kayıp','drawdown_pct':'Zirveden düşüş'}
+                for name, value in entry_status.get('risk_blocks', {}).items():
+                    explanation += f"\n{labels[name]} {value['observed']:.2%} | sınır {value['limit']:.2%}."
+            if not explanation:
+                gate = None
+        else:
+            gate, explanation = None, None
+        key = f'account:{ident}:live_gate_notice'
+        previous = self.control_store.get(key, {})
+        if gate == previous.get('gate'):
+            return
+        sequence = previous.get('sequence', 0) + 1
+        if explanation or enabled:
+            text = explanation or 'Önceki giriş beklemesi sona erdi; uygun aday aranıyor.'
+            self.controller.enqueue(ident, f'CANLI | {ident}\n{text} Ayrıntı: /status',
+                                    event_id=f'live-gate:{ident}:{sequence}')
+        self.control_store.put(key, dict(gate=gate, sequence=sequence))
+
+    def _publish_review_notices(self, ident, runner):
+        key = 'live:review_notices'
+        decisions = {
+            'hold': 'AI beklemeyi seçti.',
+            'watch': 'AI takibe aldı.',
+            'cancel_watch': 'AI takip planını iptal etti.',
+            'trade': 'AI işlem önerdi; giriş kontrolleri yapılıyor.',
+        }
+        with runner.store.lock:
+            notices = runner.store.get(key, [])
+            for notice in notices:
+                if notice['binding_id'] != getattr(runner, 'binding_id', None):
+                    continue
+                if notice['phase'] == 'start':
+                    text = ('Takip tetiklendi; parite yeniden inceleniyor.' if notice['triggered']
+                            else 'Aday incelemeye alındı.')
+                elif notice['status'] == 'provider_wait':
+                    text = 'Bu inceleme için uygun AI rotası bekleniyor.'
+                elif notice['status'] == 'completed':
+                    text = decisions.get(notice['action'], 'AI incelemesi tamamlandı.')
+                else:
+                    failed = {
+                        'watch_conflict': 'Öneri mevcut takip planıyla çelişti.',
+                        'watch_revision_changed': 'Takip planı inceleme sırasında değişti.',
+                        'invalid_model_sizing': 'Modelin risk veya kaldıraç önerisi doğrulamayı geçmedi.',
+                        'invalid_model_price_plan': 'Modelin giriş, SL veya TP planı doğrulamayı geçmedi.',
+                        'decision_expired': 'Model kararının geçerlilik süresi doldu.',
+                    }
+                    text = failed.get(notice['status'], 'İnceleme kullanılabilir bir karar üretmedi. Ayrıntı: /diagnostics')
+                if notice['phase'] == 'result':
+                    if notice['status'] == 'completed' and notice['model']:
+                        text += f" Model {notice['model']}."
+                    if notice['requests'] > 1:
+                        text += f" AI üretim isteği: {notice['requests']}."
+                    if notice['status'] == 'completed' and notice['rationale']:
+                        text += f"\n{notice['rationale']}"
+                self.controller.enqueue(ident, f"CANLI | {notice['symbol']} | {text}",
+                    event_id=f"live-review:{notice['binding_id']}:{notice['id']}:{notice['phase']}")
+            if notices:
+                runner.store.put(key, [])
 
     def _publish_entry_rejections(self, ident, runner):
         key = 'live:entry_rejection_notices'

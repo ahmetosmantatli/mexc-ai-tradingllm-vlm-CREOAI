@@ -287,11 +287,24 @@ class LiveRunner:
         finally:
             self._scan_lock.release()
 
+    def _record_review_notice(self, trace):
+        key = 'live:review_notices'
+        phase = 'result' if trace.get('completed_at') else 'start'
+        notice = dict(id=trace['id'], phase=phase, binding_id=self.binding_id, symbol=trace['symbol'],
+                      status=trace['status'], action=trace.get('action'), model=trace.get('model'),
+                      rationale=' '.join((trace.get('rationale') or '').split())[:180],
+                      triggered=trace.get('strategy') == 'watch_review',
+                      requests=sum(attempt.get('generation_requests', 0) for attempt in trace.get('attempts', [])))
+        with self.store.lock:
+            pending = self.store.get(key, [])
+            self.store.put(key, (pending + [notice])[-200:])
+
     def _evaluate(self,candidate,snapshot,control):
         child=self.llm.fork() if callable(getattr(self.llm,'fork',None)) else self.llm
         try:
             child.can_call=lambda:self._enabled() and self._control().get('updated_at')==control.get('updated_at')
             evaluator=ContextEvaluator(child,self.store,self.public,self.cfg) if child is not self.llm else self.graph
+            evaluator.on_live_review=self._record_review_notice
             capital=self._capital(snapshot,control)
             live_context=self._live_context(snapshot,control)
             live_context['runner_id']=control.get('runner_id','baseline-v1')
@@ -523,10 +536,13 @@ class LiveRunner:
             if snapshot['balance']['equity']<=0 or snapshot['balance']['available']<=0:
                 return self.status('HOLD_LIVE_NO_FUNDS')
             risk=observe_risk_reference(self.store,self.binding_id,snapshot['balance']['equity'])
-            if (risk['daily_loss_pct']>=self.risk.preset.daily_loss_halt_pct
-                    or self.risk.preset.weekly_loss_halt_enabled and risk['weekly_loss_pct']>=self.risk.preset.weekly_loss_halt_pct
-                    or risk['drawdown_pct']>=self.risk.preset.max_drawdown_kill_pct):
-                return self.status('HOLD_LIVE_LOSS_CIRCUIT_BREAKER')
+            preset = self.risk.preset
+            limits = {'daily_loss_pct': preset.daily_loss_halt_pct, 'drawdown_pct': preset.max_drawdown_kill_pct}
+            if preset.weekly_loss_halt_enabled:
+                limits['weekly_loss_pct'] = preset.weekly_loss_halt_pct
+            risk_blocks = {key: dict(observed=risk[key], limit=limit) for key, limit in limits.items() if risk[key] >= limit}
+            if risk_blocks:
+                return self.status('HOLD_LIVE_LOSS_CIRCUIT_BREAKER', risk_blocks=risk_blocks)
             if not self.external_scan:
                 self.scan_market()
             waiting={row['symbol'] for row in watch_snapshot(self.store) if row['status']=='watching'}
@@ -560,6 +576,9 @@ class LiveRunner:
                         result=future.result()
                         if result.metadata.get('provider_called') is not False:
                             queue.evaluated(candidate)
+                        if getattr(result, 'hold_reason', None) == 'decision_expired' and result.metadata.get('analysis_trace_id'):
+                            self._record_entry_rejection(candidate, result.metadata['analysis_trace_id'],
+                                                         'HOLD_LIVE_DECISION_EXPIRED')
                         outcomes.append(self._apply(candidate,result,control))
                     except sqlite3.Error:
                         raise
@@ -606,10 +625,14 @@ class LiveRunner:
             raise ValueError('one identified managed live position required')
         return self.executor.request_close(intents[0]['intent_id'])
 
-    def status(self,reason):
+    def status(self,reason,*,risk_blocks=None):
         if reason.startswith(('HOLD_LIVE','LIVE_PROTECTED','LIVE_PAUSED')) and reason!='HOLD_LIVE_RECONCILIATION':
             prior=self.store.get('live_entry_status',{})
-            if prior.get('reason')!=reason:self.store.put('live_entry_status',dict(reason=reason,at=time.time()))
+            if prior.get('reason')!=reason or risk_blocks is not None:
+                status = dict(reason=reason, at=time.time())
+                if risk_blocks:
+                    status['risk_blocks'] = risk_blocks
+                self.store.put('live_entry_status',status)
         account=self.store.get(self.reconciler.key,{})
         intents=self._intents()
         positions={}

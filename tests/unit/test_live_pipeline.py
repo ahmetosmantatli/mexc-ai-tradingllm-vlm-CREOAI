@@ -61,6 +61,9 @@ def test_real_software_pipeline_opens_reconciles_native_close_and_reenters_witho
     result=runner.cycle()
     assert result['reason']=='LIVE_PROTECTED', (result,store.get('live_cycle_error'),executor.intents())
     assert len(private.submits)==1 and llm.calls==1
+    notices = store.get('live:review_notices')
+    assert [(row['symbol'], row['phase']) for row in notices] == [('BTC_USDT','start'), ('BTC_USDT','result')]
+    assert notices[0]['id'] == notices[1]['id'] and notices[1]['action'] == 'trade'
     intent=executor.intents()[0]
     assert intent['authorization_type']=='automatic_start_grant' and 'approved_by' not in intent
     assert store.get('paper') is None

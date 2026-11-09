@@ -15,7 +15,7 @@ def _number(value):
     return type(value) in (int,float) and isfinite(value)
 
 
-def performance(traces,intents):
+def performance(traces,intents,management_cards=None):
     """Compare observed cohorts without treating missing or unresolved data as losses."""
     groups=defaultdict(lambda:([],[]))
     for trace in traces:
@@ -57,6 +57,21 @@ def performance(traces,intents):
             entry_slippage_samples=len(slip),mean_adverse_entry_slippage_bps=mean(slip),
             emergency_closes=sum(bool(r.get('emergency_close_attempted')) for r in closed))
 
+    def close_details(row):
+        card = (management_cards or {}).get(row.get('intent_id'), {})
+        proposal = row['proposal']
+        metrics = row.get('entry_metrics') or {}
+        risk, net = metrics.get('initial_stop_risk_usdt'), row.get('net_pnl')
+        return dict(symbol=proposal.get('symbol'), side=proposal.get('side'), closed_at=row.get('closed_at'),
+                    close_reason=row.get('close_reason') or 'UNKNOWN', sampled_mfe_r=card.get('mfe_r'),
+                    sampled_mae_r=card.get('mae_r'), excursion_source=card.get('excursion_source'),
+                    initial_target_price=proposal.get('take_profit_price'), initial_target_r=metrics.get('estimated_target_r'),
+                    confirmed_management=[event['action'] for event in row.get('management_events', [])
+                                          if event.get('status') == 'confirmed'],
+                    gross_pnl_usdt=row.get('gross_pnl'), fee_usdt=row.get('total_fee'), funding_usdt=row.get('funding_signed'),
+                    net_pnl_usdt=net if row.get('realized_complete') else None,
+                    net_r=net/risk if row.get('realized_complete') and _number(net) and _number(risk) and risk>0 else None)
+
     result=[]
     for (runner,cohort,variant),(reviews,rows) in sorted(groups.items()):
         horizons=defaultdict(list)
@@ -72,6 +87,15 @@ def performance(traces,intents):
                 segment=(metadata.get('setup_family'), allocation.get('horizon'), allocation.get('macro_trend'), grade)
                 if all(segment):
                     segments[segment].append(row)
+        horizon_results = {}
+        for horizon, batch in sorted(horizons.items()):
+            close_reasons = defaultdict(list)
+            for row in batch:
+                if row.get('status') == 'closed':
+                    close_reasons[row.get('close_reason') or 'UNKNOWN'].append(row)
+            horizon_results[horizon] = dict(**fills(batch),
+                by_close_reason={reason:fills(closed) for reason,closed in sorted(close_reasons.items())})
+        swing_closed = [close_details(row) for row in horizons.get('swing', []) if row.get('status') == 'closed']
         attempts=[a for t in reviews for a in t.get('attempts',[]) if a.get('generation_requests',0)]
         provider_calls=sum(a['generation_requests'] for a in attempts)
         tokens=[(a.get('input_tokens'),a.get('output_tokens')) for a in attempts]
@@ -86,7 +110,7 @@ def performance(traces,intents):
             token_samples=len(known_tokens),mean_tokens=mean(known_tokens),
             cost_samples=len(costs),known_estimated_ai_cost_usd=sum(costs) if costs else None,
             mean_generation_latency_ms=mean([a['latency_ms'] for a in attempts if _number(a.get('latency_ms'))]),
-            **fills(rows),by_opening_horizon={h:fills(batch) for h,batch in sorted(horizons.items())},
+            **fills(rows),by_opening_horizon=horizon_results,swing_closed_details=swing_closed,
             by_evidence_grade={grade:fills(batch) for grade,batch in sorted(grades.items())},
             by_evidence_segment=[dict(setup_family=family,horizon=horizon,macro_trend=trend,grade=grade,**fills(batch))
                                  for (family,horizon,trend,grade),batch in sorted(segments.items())]))
@@ -125,6 +149,7 @@ def audit(path,*,since=0,now=None,include_performance=False):
             detail.append({key:t.get(key) for key in ('id','symbol','started_at','execution_status','execution_reason','execution_details')})
         watches=Counter(json.loads(value).get('status','unknown') for value, in db.execute("SELECT value FROM state WHERE key LIKE 'watch:%'"))
         grant=next((json.loads(value) for value, in db.execute("SELECT value FROM state WHERE key LIKE 'live:automatic_grant:%'")),{})
+        entry_status=state('live_entry_status',{})
         report=dict(evaluations=len(traces),model_decisions=dict(decisions),analysis_outcomes=dict(outcomes),
             model_trade_proposals=len(proposals),execution_rejections=dict(rejections),unresolved_proposal_records=len(unresolved),
             intent_records=len(intents),entry_attempt_records=sum(bool(r.get('entry_write_attempted')) for r in intents),
@@ -133,10 +158,12 @@ def audit(path,*,since=0,now=None,include_performance=False):
             latest_trade_proposals=detail,candidate_error_types=dict(Counter(r.get('code',r.get('type','unknown')) for r in errors)),
             snapshot_age_seconds=max(0,now-account.get('observed_at',0)) if account.get('observed_at') else None,
             start_grant_present=bool(grant),start_grant_revoked=grant.get('revoked'),start_grant_expired=grant.get('expires_at',0)<=now,
-            halt=bool(state('live:halt')),last_entry_reason=state('live_entry_status',{}).get('reason'),
+            halt=bool(state('live:halt')),last_entry_reason=entry_status.get('reason'), entry_risk_blocks=entry_status.get('risk_blocks',{}),
             limitations='Persisted records only, not a fresh exchange check. Entry attempt record is not proof of a POST/fill. Old unfinalized traces cannot establish a rejection reason.')
         if include_performance:
-            report['performance']=performance(traces,intents)
+            cards = {key.removeprefix('live:management-card:'):json.loads(value)
+                     for key,value in db.execute("SELECT key,value FROM state WHERE key LIKE 'live:management-card:%'")}
+            report['performance']=performance(traces,intents,cards)
         return report
     finally:db.close()
 
@@ -150,6 +177,8 @@ def format_report(report):
             ('Emir yaşam döngüsü','intent_states'),('Takip durumları','watch_states'),('Son aday hata türleri','candidate_error_types'),
             ('Başlat izni süresi dolmuş','start_grant_expired'),('Başlat izni iptal edilmiş','start_grant_revoked'),('Canlı engel kaydı','halt')]:
         text+=f'{label}: {report[key]}\n'
+    if report.get('entry_risk_blocks'):
+        text+=f"Güncel risk engelleri: {report['entry_risk_blocks']}\n"
     for row in report['latest_trade_proposals']:
         stamp=datetime.fromtimestamp(row['started_at'],ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M:%S')
         text+=f"{stamp} | {row['symbol']} | {row['execution_status']} | {row['execution_reason']} | {row.get('execution_details')}\n"
