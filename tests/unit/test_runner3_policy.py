@@ -45,6 +45,60 @@ def test_runner3_countertrend_requires_valid_causal_chain():
     assert not reversal()
 
 
+def test_margin_under_one_usdt_is_rejected_while_equity_is_under_100():
+    from trading.runtime.runner3_policy import leverage_for_choch_loss
+
+    common = dict(notional=.8, entry=100., stop=98., free_margin=50., max_leverage=20,
+                  maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02)
+    with pytest.raises(ValueError, match='runner3_margin_below_minimum'):
+        leverage_for_choch_loss(equity=40., **common)
+    leverage, margin, size = leverage_for_choch_loss(equity=100., **common)
+    assert size == pytest.approx(.8)
+    assert margin < 1
+    assert leverage == 1
+
+
+def test_choch_loss_uses_free_margin_instead_of_a_default_or_maximum_leverage():
+    from trading.runtime.runner3_policy import leverage_for_choch_loss
+
+    leverage, margin, size = leverage_for_choch_loss(
+        notional=20., entry=100., stop=97., free_margin=12., equity=40., max_leverage=20,
+        maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02)
+    assert size == pytest.approx(20.)
+    assert leverage == 2
+    assert margin == pytest.approx(10.)
+    assert leverage not in (10, 20)
+
+
+def test_small_price_drift_inside_the_choch_risk_still_enters():
+    from trading.runtime.runner3_policy import drift_respects_choch_risk, ioc_target_economics
+
+    fee, slip = .0006, .0005
+    quantity = 2.
+    budget = ioc_target_economics(side='long', entry=100.25, stop=98., target=110., fee=fee, slippage=slip)[2] * quantity
+    assert drift_respects_choch_risk(
+        side='long', fresh_entry=100.25, stop=98., target=110., choch_extreme=98.1,
+        quantity=quantity, risk_budget=budget, fee=fee, slippage=slip)
+    short_budget = ioc_target_economics(side='short', entry=99.75, stop=102., target=90., fee=fee, slippage=slip)[2] * quantity
+    assert drift_respects_choch_risk(
+        side='short', fresh_entry=99.75, stop=102., target=90., choch_extreme=101.9,
+        quantity=quantity, risk_budget=short_budget, fee=fee, slippage=slip)
+
+
+def test_drifted_price_that_blows_the_loss_budget_does_not_enter():
+    from trading.runtime.runner3_policy import drift_respects_choch_risk, ioc_target_economics
+
+    fee, slip = .0006, .0005
+    quantity = 2.
+    budget = ioc_target_economics(side='long', entry=100.25, stop=98., target=110., fee=fee, slippage=slip)[2] * quantity
+    assert not drift_respects_choch_risk(
+        side='long', fresh_entry=102.5, stop=98., target=110., choch_extreme=98.1,
+        quantity=quantity, risk_budget=budget, fee=fee, slippage=slip)
+    assert not drift_respects_choch_risk(
+        side='long', fresh_entry=100.1, stop=98., target=110., choch_extreme=97.9,
+        quantity=quantity, risk_budget=budget * 10, fee=fee, slippage=slip)
+
+
 def test_runner3_reserve_rechecks_account_before_sending_ioc(tmp_path):
     from .test_live_execution import approve, proposal, setup
 
@@ -58,6 +112,23 @@ def test_runner3_reserve_rechecks_account_before_sending_ioc(tmp_path):
         'runner3_allocation':{'grade':'strong','horizon':'intraday'}}))
     from trading.brokers.live.execution import LiveExecutionError
     with pytest.raises(LiveExecutionError,match='runner3_margin_reserve'):
+        executor.execute(row['intent_id'])
+    assert not executor.state(row['intent_id'])['entry_write_attempted']
+
+
+def test_margin_under_one_usdt_is_rejected_before_the_order_is_sent(tmp_path):
+    from .test_live_execution import approve, proposal, setup
+    from .test_live_management_execution import ManagementPublic
+
+    executor, private, _ = setup(tmp_path)
+    executor.public = ManagementPublic()
+    private.leverage_value = 10
+    private.submit_ioc = lambda **kw: pytest.fail('order must remain unsent')
+    private.assets = [dict(currency='USDT', equity=11., availableBalance=11., positionMargin=0., unrealized=0.)]
+    row = approve(executor, proposal(notional=8., leverage=10, max_loss_if_stopped=3.,
+        metadata={'runner_id': 'runner3', 'runner3_allocation': {'grade': 'strong', 'horizon': 'swing'}}))
+    from trading.brokers.live.execution import LiveExecutionError
+    with pytest.raises(LiveExecutionError, match='runner3_margin_below_minimum'):
         executor.execute(row['intent_id'])
     assert not executor.state(row['intent_id'])['entry_write_attempted']
 

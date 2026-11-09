@@ -460,23 +460,35 @@ class LiveRunner:
             runner3_policy.validate_evidence(setup,MarketPricePlan.model_validate(result.metadata['price_plan']))
         if result.metadata.get('price_plan') is not None:
             if not self.cfg.live_price_plan_enabled:raise ValueError('live model price planning disabled')
+            fresh_quote=ticker.ask1 if candidate.side.value=='long' else ticker.bid1
+            drift_cap=.005
+            if runner_id=='runner3':
+                raw_plan=result.metadata['price_plan']
+                planned=raw_plan.entry_price if hasattr(raw_plan,'entry_price') else raw_plan['entry_price']
+                planned_stop=raw_plan.stop_loss_price if hasattr(raw_plan,'stop_loss_price') else raw_plan['stop_loss_price']
+                drift_cap=abs(planned-planned_stop)/planned
             planning_candidate=apply_market_price_plan(candidate,result.metadata['price_plan'],result.metadata.get('price_evidence') or {},
-                price_step=rules.price_step,current_price=ticker.ask1 if candidate.side.value=='long' else ticker.bid1,now=time.time())
+                price_step=rules.price_step,current_price=fresh_quote,now=time.time(),max_entry_drift=drift_cap)
         proposal=apply_decision_sizing(planning_candidate,result.metadata.get('sizing_plan'),self._capital(snapshot,control),
             self._risk_fraction(control),self._leverage_cap(control,exchange_cap),exchange_cap)
-        drift_limit = min(planning_candidate.stop_distance_pct / 2, .005)
-        if abs(ticker.last_price / planning_candidate.entry_price - 1) > drift_limit:
-            raise EntryPriceDrift('live entry price drift', stage='planning', planned=planning_candidate.entry_price,
-                                  observed=ticker.last_price, tolerance=drift_limit)
+        if runner_id!='runner3':
+            drift_limit = min(planning_candidate.stop_distance_pct / 2, .005)
+            if abs(ticker.last_price / planning_candidate.entry_price - 1) > drift_limit:
+                raise EntryPriceDrift('live entry price drift', stage='planning', planned=planning_candidate.entry_price,
+                                      observed=ticker.last_price, tolerance=drift_limit)
         entry=ticker.ask1 if candidate.side.value=='long' else ticker.bid1
         slip=self.cfg.paper_slippage_bps/10000;fee=self.cfg.paper_fee_rate
+        planned_entry=planning_candidate.entry_price
         if runner_id == 'runner3':
             fee = getattr(self.executor, 'fee', fee)
             slip = getattr(self.executor, 'slip', slip)
             gross_target, expected_net, unit_loss = runner3_policy.ioc_target_economics(
                 side=candidate.side.value, entry=entry, stop=proposal.stop_loss.price,
                 target=proposal.take_profit_price, fee=fee, slippage=slip)
-            loss_fraction = unit_loss / entry
+            _, _, planned_unit = runner3_policy.ioc_target_economics(
+                side=candidate.side.value, entry=planned_entry, stop=proposal.stop_loss.price,
+                target=proposal.take_profit_price, fee=fee, slippage=slip)
+            loss_fraction = planned_unit / planned_entry
         else:
             worst_entry=entry*(1+slip if candidate.side.value=='long' else 1-slip)
             stop=proposal.stop_loss.price*(1-slip if candidate.side.value=='long' else 1+slip)
@@ -504,20 +516,43 @@ class LiveRunner:
             risk_adjustment = dict(macro_trend=setup['macro_trend'], model_risk_fraction=model_fraction,
                 effective_risk_fraction=effective, risk_ceiling=ceiling,
                 risk_boost_applied=effective > model_fraction, small_account_policy=target_risk is not None)
-        limits=dict(model_stop_budget=proposal.notional,stop_budget_with_costs=proposal.max_loss_if_stopped/loss_fraction,
-                    available_margin=snapshot['balance']['available']/margin_rate*.95)
+        limits=dict(model_stop_budget=proposal.notional,stop_budget_with_costs=proposal.max_loss_if_stopped/loss_fraction)
+        if runner_id!='runner3':
+            limits['available_margin']=snapshot['balance']['available']/margin_rate*.95
         if runner_id=='runner3':
             runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
             allocation=runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
                 snapshot['balance']['available'],grade,setup['horizon'])
-            limits['runner3_margin_policy']=allocation['max_entry_cost_usdt']/margin_rate
-            if limits['runner3_margin_policy']<=0:
+            free_margin=snapshot['balance']['available']-allocation['reserve_usdt']
+            if free_margin<=0:
                 raise ValueError('runner3_margin_reserve')
+        _,notional=rules.size_order(min(limits.values()),planned_entry if runner_id=='runner3' else entry,1 if runner_id=='runner3' else proposal.leverage)
+        proposal.notional=notional
+        if runner_id=='runner3':
+            quantity=notional/planned_entry
+            plan=result.metadata['price_plan']
+            reference=plan.stop_reference if hasattr(plan,'stop_reference') else plan['stop_reference']
+            extreme=runner3_policy.confirming_extreme(reference,result.metadata.get('price_evidence') or {})
+            if not runner3_policy.drift_respects_choch_risk(
+                    side=candidate.side.value,fresh_entry=entry,stop=proposal.stop_loss.price,
+                    target=proposal.take_profit_price,choch_extreme=extreme,quantity=quantity,
+                    risk_budget=proposal.max_loss_if_stopped,fee=fee,slippage=slip):
+                raise EntryPriceDrift('live entry price drift',stage='planning',planned=planned_entry,
+                                      observed=entry,tolerance=abs(entry/planned_entry-1))
+            proposal.notional=quantity*entry
+            proposal.entry_price=entry
+            leverage,margin,sized=runner3_policy.leverage_for_choch_loss(
+                notional=proposal.notional,entry=entry,stop=proposal.stop_loss.price,free_margin=free_margin,
+                equity=snapshot['balance']['equity'],max_leverage=min(self._leverage_cap(control,exchange_cap),exchange_cap),
+                maintenance=max(rules.maintenance,private_risk['maintenance_rate'],private_leverage['maintenance_rate']),
+                initial_rate=private_risk['initial_rate'],fee=fee,liquidation_buffer=self.cfg.liquidation_buffer_pct)
+            if sized<proposal.notional-1e-8:
+                _,proposal.notional=rules.size_order(sized,entry,leverage)
+            proposal.leverage=leverage
             proposal.metadata['runner3_allocation']=dict(allocation,limiting_factor=min(limits,key=limits.get),
+                free_margin_usdt=free_margin,initial_margin_usdt=margin,chosen_leverage=leverage,
                 setup_id=setup['setup_id'],evidence_expires_at=setup['evidence'].get('expires_at'),
                 calibrated_probability=None,expected_target_net_r=expected_net/unit_loss,**risk_adjustment)
-        _,notional=rules.size_order(min(limits.values()),entry,proposal.leverage)
-        proposal.notional=notional
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)
         proposal.metadata.update(price_plan=result.metadata.get('price_plan'),price_source='model' if result.metadata.get('price_plan') else 'quant',
             runner_id=runner_id,

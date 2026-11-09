@@ -34,6 +34,8 @@ class Client:
         return {symbol:[dict(symbol=symbol,positionType=side,level=1,maxVol=1000,maxLeverage=10,mmr=self.mmr,imr=.1) for side in (1,2)]}
     def leverage(self,symbol):
         return [dict(positionType=side,openType=1,leverage=self.leverage_value,maxVol=1000,currentMmr=self.mmr,maxLeverageView=10) for side in (1,2)]
+    def change_leverage(self,**kw):
+        self.leverage_value=kw['leverage']
     def protection_orders(self,symbol=None,page_num=1,page_size=100):
         if self.protection_page2 and page_num==1:return [dict(positionId='unrelated')]*100
         return deepcopy(self.stops)

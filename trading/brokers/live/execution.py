@@ -222,10 +222,12 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             expires=policy.get('evidence_expires_at')
             if expires is not None and expires<=time():
                 raise LiveExecutionError('runner3_evidence_expired')
-            cap=runner3_policy.margin_policy(readiness.equity,readiness.allowed_capital,
-                available,policy.get('grade'),policy.get('horizon'))
-            if readiness.planned_margin+notional*self.fee>cap['max_entry_cost_usdt']+1e-8:
+            reserve=readiness.allowed_capital*runner3_policy.MARGIN_RESERVE_FRACTION
+            if readiness.planned_margin+notional*self.fee>available-reserve+1e-8:
                 raise LiveExecutionError('runner3_margin_reserve')
+            if (0<readiness.equity<runner3_policy.SMALL_ACCOUNT_EQUITY_USDT
+                    and readiness.planned_margin<runner3_policy.MIN_OPEN_MARGIN_USDT):
+                raise LiveExecutionError('runner3_margin_below_minimum')
         if abs(notional-proposal.notional)>max(1e-8,entry*rules.size*rules.step):raise LiveExecutionError('approved_notional_changed')
         quantity=contracts*rules.size
         if proposal.metadata.get('runner_id')=='runner3':

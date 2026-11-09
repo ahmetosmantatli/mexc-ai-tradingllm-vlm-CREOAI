@@ -1,6 +1,6 @@
 """Deterministic Runner 3 allocation and evidence rules."""
 from datetime import datetime, timedelta
-from math import isfinite
+from math import floor, isfinite
 from time import time
 from zoneinfo import ZoneInfo
 
@@ -9,6 +9,7 @@ MARGIN_RESERVE_FRACTION = .15
 MIN_NET_TARGET_R = 1.25
 MAX_COST_SHARE = .30
 SMALL_ACCOUNT_EQUITY_USDT = 100.
+MIN_OPEN_MARGIN_USDT = 1.
 
 
 def uses_fixed_position_limit(runner_id, equity):
@@ -63,6 +64,102 @@ def margin_policy(equity, capital, available, grade, horizon):
     return dict(grade=grade, horizon=horizon, equity_usdt=equity, margin_fraction=fraction,
                 target_margin_usdt=target, reserve_usdt=reserve,
                 max_entry_cost_usdt=max(0., min(target, available - reserve)))
+
+
+def confirming_extreme(reference, evidence):
+    """Wick of the confirming CHoCH/MSS candle. A missing candle fails closed."""
+    if reference is None or not isinstance(evidence, dict):
+        return None
+    timeframe = getattr(reference, 'timeframe', None) or (reference.get('timeframe') if isinstance(reference, dict) else None)
+    open_time = getattr(reference, 'open_time', None)
+    if open_time is None and isinstance(reference, dict):
+        open_time = reference.get('open_time')
+    field = getattr(reference, 'field', None) or (reference.get('field') if isinstance(reference, dict) else None)
+    rows = evidence.get(timeframe) or []
+    matches = [row for row in rows if isinstance(row, (list, tuple)) and len(row) >= 4
+               and type(row[0]) in (int, float) and row[0] == open_time]
+    if len(matches) != 1 or field not in ('low', 'high'):
+        return None
+    wick = matches[0][3] if field == 'low' else matches[0][2]
+    if isinstance(wick, bool) or not isinstance(wick, (int, float)) or not isfinite(wick) or wick <= 0:
+        return None
+    return float(wick)
+
+
+def drift_respects_choch_risk(*, side, fresh_entry, stop, target, choch_extreme, quantity, risk_budget, fee, slippage):
+    """A moved quote still enters only while the CHoCH stop and the planned loss both hold.
+
+    The quantity is the one already sized at the planned entry. A price that has run
+    far enough for that loss to exceed the risk budget is not chased by shrinking it.
+    """
+    values = (fresh_entry, stop, target, choch_extreme, quantity, risk_budget)
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) and value > 0 for value in values):
+        return False
+    if side == 'long':
+        intact = stop <= choch_extreme < fresh_entry < target
+    elif side == 'short':
+        intact = target < fresh_entry < choch_extreme <= stop
+    else:
+        return False
+    if not intact:
+        return False
+    _, _, unit = ioc_target_economics(
+        side=side, entry=fresh_entry, stop=stop, target=target, fee=fee, slippage=slippage)
+    return unit * quantity <= risk_budget + 1e-8
+
+
+def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_leverage,
+                            maintenance, initial_rate, fee, liquidation_buffer):
+    """Leverage that fits the CHoCH-stop loss into free margin, and the notional used.
+
+    The lowest leverage that can post the risk-sized notional is used. The exchange
+    maximum and a fixed default are only the top of that range. If the full loss does
+    not fit, the size is the largest share of free margin still inside the loss cap,
+    never a slice below 1 USDT while equity is under 100.
+    """
+    values = (notional, entry, stop, free_margin, equity, max_leverage, maintenance, initial_rate, fee, liquidation_buffer)
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) for value in values):
+        raise ValueError('runner3_margin_reserve')
+    if min(notional, entry, free_margin, max_leverage) <= 0 or stop <= 0 or stop == entry:
+        raise ValueError('runner3_margin_reserve')
+    cap = floor(max_leverage)
+    if cap < 1 or cap > 100000:
+        raise ValueError('runner3_margin_reserve')
+    long = stop < entry
+
+    def fit(leverage, size):
+        margin_rate = max(1 / leverage, initial_rate)
+        margin = size * margin_rate
+        if margin + size * fee > free_margin + 1e-9:
+            return None
+        distance = 1 / leverage - maintenance - fee
+        if distance <= 0:
+            return None
+        liquidation = entry * (1 - distance if long else 1 + distance)
+        buffer = (stop - liquidation) / entry if long else (liquidation - stop) / entry
+        if buffer + 1e-12 < liquidation_buffer:
+            return None
+        if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and margin < MIN_OPEN_MARGIN_USDT:
+            return None
+        return leverage, margin, size
+
+    for leverage in range(1, cap + 1):
+        selected = fit(leverage, notional)
+        if selected is not None:
+            return selected
+    best = None
+    for leverage in range(1, cap + 1):
+        margin_rate = max(1 / leverage, initial_rate)
+        fitted = min(notional, free_margin / (margin_rate + fee))
+        selected = fit(leverage, fitted)
+        if selected is not None and (best is None or selected[2] > best[2]):
+            best = selected
+    if best is not None:
+        return best
+    full_margin = notional * max(1., initial_rate)
+    if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and min(full_margin, free_margin) < MIN_OPEN_MARGIN_USDT:
+        raise ValueError('runner3_margin_below_minimum')
+    raise ValueError('runner3_margin_reserve')
 
 
 def ioc_target_economics(*, side, entry, stop, target, fee, slippage):
