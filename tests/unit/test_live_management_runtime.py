@@ -27,18 +27,31 @@ class Model:
         if root.fail:return None
         answer=dict(action=root.action,position_id=data['position']['position_id'],reason='Yapı korunuyor; destek teyidi gelene kadar pozisyonu koru.',review_timeframe='15m')
         if root.action=='move_stop':
-            answer.update(stop_price=99.,stop_reference=dict(timeframe='15m',open_time=root.stamp+(1 if root.bad_reference else 0),field='low'))
+            answer.update(stop_price=getattr(root, 'stop_price', 99.),
+                          stop_reference=dict(timeframe='15m', open_time=root.stamp+(1 if root.bad_reference else 0),
+                                              field=getattr(root, 'stop_field', 'low')))
         if root.action in ('reduce','close'):answer['close_fraction']=.5 if root.action=='reduce' else 1.
         return answer
 
 
-def prepare(tmp_path,monkeypatch):
+def prepare(tmp_path,monkeypatch,short=False):
+    from trading.models.domain import Side
     control=dict(enabled=True,stopped=False,updated_at=1,version='text',risk_profile='balanced',
         risk_per_trade_pct=.01,allocation_mode='full')
     executor,_,store=setup(tmp_path,automatic=True,control=control)
     private=ManagementClient();public=ManagementPublic()
     executor.private=private;executor.public=public
-    row=executor.authorize(proposal(),control_revision=1);row=executor.execute(row['intent_id'])
+    if short:
+        submit=private.submit_market
+        def short_submit(**kw):
+            result=submit(**kw)
+            private.positions[0]['liquidatePrice']=120.
+            return result
+        private.submit_market=short_submit
+        plan=proposal(side=Side.SHORT,stop_loss={'price':102.},take_profit_price=96.)
+    else:
+        plan=proposal()
+    row=executor.authorize(plan,control_revision=1);row=executor.execute(row['intent_id'])
     assert row['status']=='protected'
     cfg=Settings(_env_file=None,broker_mode='live',live_position_management_enabled=True,
         runtime_db_path=str(tmp_path/'runtime'),kill_switch_path=str(tmp_path/'kill'),analysis_chart_dir=str(tmp_path/'charts'))
@@ -69,6 +82,24 @@ def test_hold_deduplicates_closed_event_and_records_token_usage(tmp_path,monkeyp
     assert data['account']['current_equity']==500
     assert data['position']['original_thesis']==row['proposal']['rationale']
     assert runner.store.db.execute('SELECT count(*) FROM ai_usage_events').fetchone()[0]==2
+
+
+@pytest.mark.parametrize('short', [False, True])
+def test_management_cannot_widen_past_the_initial_invalidation(tmp_path, monkeypatch, short):
+    runner, private, executor, control, llm, market, row = prepare(tmp_path, monkeypatch, short=short)
+    if short:
+        llm.stop_price = 103.
+        llm.stop_field = 'high'
+        wider = 104.
+    else:
+        llm.stop_price = 97.
+        wider = 96.
+    row['current_protection'] = dict(stop=wider, target=row['proposal']['take_profit_price'])
+    executor._save(row)
+    llm.action = 'move_stop'
+    runner.manage_positions()
+    assert private.modifies == []
+    assert executor.state(row['intent_id']).get('current_protection', {}).get('stop') == wider
 
 
 def test_stop_model_action_is_written_and_ui_uses_current_stop(tmp_path,monkeypatch):

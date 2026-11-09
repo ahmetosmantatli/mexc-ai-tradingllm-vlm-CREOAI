@@ -274,9 +274,8 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     touch = None
     if ready:
         touch = prior_touches[-1]
-        stop_segment = [row for row in subsequent if row[0] >= touch[0]]
-        anchor = (min(stop_segment, key=lambda row: row[3]) if long
-                  else max(stop_segment, key=lambda row: row[2]))
+        # The initial stop is the confirming CHoCH/MSS candle, not another wick.
+        anchor = next(row for row in lower['rows'] if row[0] == shift['at'])
         trigger = condition = None
     elif touches:
         touch = touches[-1]
@@ -342,6 +341,9 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
 def build_htf_zone_setups(market_context, *, current_price, price_step=0):
     """Use a confirmed HTF block, a subsequent closed LTF touch, then a later closed CHoCH/MSS.
 
+    A ready long stops just beyond the low of that CHoCH candle. A ready short
+    stops just beyond its high. Swing uses the 15m candle; intraday uses the 5m
+    candle. The target remains the opposing higher-timeframe level.
     A touch or a future level can produce a watch. The LTF trigger must close
     after the touch candle, so same-candle intrabar ordering is never inferred.
     BTC/ETH context stays independent of the symbol's executable evidence.

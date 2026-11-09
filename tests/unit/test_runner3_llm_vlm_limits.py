@@ -132,8 +132,8 @@ def test_vlm_timeout_keeps_the_text_decision_and_labels_it_text(tmp_path, monkey
     assert result.metadata['decision_ai']['review_mode'] == 'text'
     assert result.metadata['decision_ai']['model'] == 'text-model'
     assert result.metadata['rationale'].startswith('Metin modeli')
-    assert '15m wick' in model.calls[0]['system']
-    assert '5m wick' in model.calls[0]['system']
+    assert '15m CHoCH' in model.calls[0]['system']
+    assert '5m CHoCH' in model.calls[0]['system']
     assert 'Do not open a hedge' in model.calls[0]['system']
     assert 'Touch alone is not an entry' in model.calls[0]['system']
     trace = store.get('analysis_trace')

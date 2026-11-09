@@ -253,6 +253,40 @@ def test_htf_zone_touch_then_ltf_shift_keeps_different_entry_stop_and_target_tim
     assert build_htf_zone_setups(ctx, current_price=99. if short else 101., price_step=.01)[0]['setup_id'] == setup['setup_id']
 
 
+@pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
+@pytest.mark.parametrize('short', [False, True])
+def test_confirmed_stop_is_just_beyond_the_choch_candle(context_tf, trigger_tf, short):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context(context_tf, trigger_tf)
+    if short:
+        ctx = mirror(ctx)
+        block = view(ctx, context_tf)['features']['order_block_candidates'][0]
+        block.update(direction='bearish', low=103., high=106.)
+        shift = view(ctx, trigger_tf)['features']['structure_shifts'][0]
+        shift.update(direction='bearish')
+    lower = view(ctx, trigger_tf)
+    choch = lower['recent_ohlcv'][-1]
+    other = lower['recent_ohlcv'][-2]
+    if short:
+        other[2] = choch[2] + 3
+    else:
+        other[3] = choch[3] - 3
+    setup, = build_htf_zone_setups(ctx, current_price=99. if short else 101., price_step=.01)
+    wick = choch[2] if short else choch[3]
+    assert setup['stop_reference'] == dict(
+        timeframe=trigger_tf, open_time=choch[0], field='high' if short else 'low')
+    assert setup['stop_reference']['open_time'] == setup['evidence']['shift']['at']
+    assert setup['target_reference']['timeframe'] == context_tf
+    assert setup['target_reference']['field'] == ('low' if short else 'high')
+    if short:
+        assert wick < setup['stop_loss_price'] < other[2]
+        assert setup['take_profit_price'] < 99 < setup['stop_loss_price']
+    else:
+        assert other[3] < setup['stop_loss_price'] < wick
+        assert setup['stop_loss_price'] < 101 < setup['take_profit_price']
+
+
 def test_htf_zone_requires_a_separate_touch_and_closed_confirmation_and_exposes_watch_stages():
     from trading.quant.structure_setups import build_htf_zone_setups
 
