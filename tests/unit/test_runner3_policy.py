@@ -5,15 +5,22 @@ from trading.quant.structure_setups import build_structure_setups
 from .test_structure_setups import context,view
 
 
-def test_small_equity_uses_majority_margin_target_with_portfolio_reserve():
+def test_small_equity_silent_fallback_is_35_percent_and_standard_stays_20_percent():
     strong=margin_policy(11,11,11,'strong','intraday')
     standard=margin_policy(11,11,11,'standard','intraday')
-    assert strong['target_margin_usdt']==pytest.approx(7.7)
-    assert standard['target_margin_usdt']==pytest.approx(6.05)
+    assert strong['margin_fraction']==.35
+    assert standard['margin_fraction']==.20
+    assert strong['target_margin_usdt']==pytest.approx(11*.35)
+    assert standard['target_margin_usdt']==pytest.approx(11*.20)
+    # The share is equity, not a smaller allocated capital figure.
+    assert margin_policy(50,40,50,'strong','swing')['target_margin_usdt']==pytest.approx(17.5)
+    assert margin_policy(50,40,50,'standard','scalp')['target_margin_usdt']==pytest.approx(10)
     assert margin_policy(100,100,100,'strong','intraday')['margin_fraction']==.2
-    assert margin_policy(99.99,99.99,99.99,'strong','intraday')['margin_fraction']==.70
+    assert margin_policy(100,100,100,'standard','intraday')['margin_fraction']==.1
+    assert margin_policy(99.99,40,99.99,'strong','intraday')['margin_fraction']==.35
+    assert margin_policy(99.99,40,99.99,'standard','intraday')['target_margin_usdt']==pytest.approx(99.99*.20)
     assert margin_policy(11,11,1,'strong','intraday')['max_entry_cost_usdt']==0
-    assert margin_policy(11,11,11,'strong','swing')['margin_fraction']==.60
+    assert margin_policy(11,11,11,'strong','swing')['margin_fraction']==.35
 
 
 def test_runner3_economics_rejects_small_payoff_and_expensive_entry():
@@ -56,6 +63,76 @@ def test_margin_under_one_usdt_is_rejected_while_equity_is_under_100():
     assert size == pytest.approx(.8)
     assert margin < 1
     assert leverage == 1
+
+
+def test_evidence_grade_is_strong_only_for_the_two_confirmed_patterns():
+    from trading.runtime.runner3_policy import evidence_grade
+
+    sweep=dict(evidence=dict(kind='sweep_mss_fvg_retest'), reward_risk=1.1, macro_trend='bearish', side='long')
+    closed_break=dict(evidence=dict(kind='closed_bos'), reward_risk=2, macro_trend='bullish', side='long')
+    short_break=dict(evidence=dict(kind='closed_bos'), reward_risk=2.4, macro_trend='bearish', side='short')
+    zone_break=dict(evidence=dict(kind='htf_zone_choch', context_last_break=dict(direction='bullish')),
+                    reward_risk=2, macro_trend='bullish', side='long')
+    zone_mss=dict(evidence=dict(kind='htf_zone_mss'), reward_risk=3, macro_trend='bullish', side='long')
+    zone_choch=dict(evidence=dict(kind='htf_zone_choch'), reward_risk=3, macro_trend='bullish', side='long')
+    low_payoff=dict(evidence=dict(kind='closed_bos'), reward_risk=1.99, macro_trend='bullish', side='long')
+    opposing=dict(evidence=dict(kind='htf_zone_mss', context_last_break=dict(direction='bearish')),
+                  reward_risk=3, macro_trend='bullish', side='long')
+    counter_break=dict(evidence=dict(kind='closed_bos'), reward_risk=3, macro_trend='bearish', side='long')
+    assert evidence_grade(sweep)=='strong'
+    assert evidence_grade(closed_break)=='strong'
+    assert evidence_grade(short_break)=='strong'
+    assert evidence_grade(zone_break)=='strong'
+    assert evidence_grade(zone_mss)=='standard'
+    assert evidence_grade(zone_choch)=='standard'
+    assert evidence_grade(low_payoff)=='standard'
+    assert evidence_grade(opposing)=='standard'
+    assert evidence_grade(counter_break)=='standard'
+
+
+def test_both_shares_stay_inside_the_margin_target_and_the_choch_loss_ceiling():
+    from trading.runtime.runner3_policy import leverage_for_choch_loss
+
+    common=dict(entry=100., stop=98., free_margin=40., equity=50., max_leverage=20,
+                maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02)
+    standard_leverage, standard_margin, standard_size=leverage_for_choch_loss(
+        notional=20., margin_target=10., **common)
+    strong_leverage, strong_margin, strong_size=leverage_for_choch_loss(
+        notional=30., margin_target=17.5, **common)
+    assert standard_size==pytest.approx(20.)
+    assert standard_leverage==3
+    assert standard_margin==pytest.approx(20./3)
+    assert standard_margin<=10
+    assert strong_size==pytest.approx(30.)
+    assert strong_leverage==2
+    assert strong_margin==pytest.approx(15.)
+    assert strong_margin<=17.5
+    assert strong_size>standard_size
+    assert standard_leverage not in (10, 20)
+    assert strong_leverage not in (10, 20)
+
+
+def test_a_margin_share_that_cannot_hold_the_loss_notional_does_not_use_max_leverage():
+    from trading.runtime.runner3_policy import leverage_for_choch_loss
+
+    leverage, margin, size=leverage_for_choch_loss(
+        notional=100., entry=100., stop=98., free_margin=40., margin_target=2., equity=50.,
+        max_leverage=20, maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02)
+    assert leverage==1
+    assert size==pytest.approx(2/1.0006)
+    assert margin+size*.0006<=2+1e-8
+    assert leverage!=20
+
+
+def test_both_shares_reject_margin_under_one_usdt():
+    from trading.runtime.runner3_policy import leverage_for_choch_loss
+
+    common=dict(notional=8., entry=100., stop=98., free_margin=30., equity=40., max_leverage=20,
+                maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02)
+    for target in (.20*40*.05, .35*40*.05):
+        assert target<1
+        with pytest.raises(ValueError, match='runner3_margin_below_minimum'):
+            leverage_for_choch_loss(margin_target=target, **common)
 
 
 def test_choch_loss_uses_free_margin_instead_of_a_default_or_maximum_leverage():
@@ -177,3 +254,67 @@ def test_price_drift_diagnostics_capture_stage_and_signed_move():
     assert detail['code'] == 'ENTRY_PRICE_DRIFT'
     assert detail['price_drift'] == pytest.approx(dict(
         stage='planning', planned=100., observed=99.6, deviation=-.004, tolerance=.003))
+
+
+def test_text_model_share_replaces_the_guclu_fallback_and_invalid_does_not_grow():
+    from trading.runtime.runner3_policy import apply_guclu_margin_share, margin_policy
+
+    strong = margin_policy(50, 40, 50, 'strong', 'swing')
+    chosen = apply_guclu_margin_share(strong, equity=50, available=50, raw_share=.22)
+    assert chosen['margin_fraction'] == pytest.approx(.22)
+    assert chosen['target_margin_usdt'] == pytest.approx(11)
+    assert chosen['margin_share_source'] == 'model'
+    assert chosen['max_entry_cost_usdt'] == pytest.approx(11)
+    for raw in (None, 'high', True, 0, 1.2, float('nan'), float('inf')):
+        fallback = apply_guclu_margin_share(strong, equity=50, available=50, raw_share=raw)
+        assert fallback['margin_fraction'] == .35
+        assert fallback['target_margin_usdt'] == pytest.approx(17.5)
+        assert fallback['margin_share_source'] == 'fallback_35'
+    standard = apply_guclu_margin_share(
+        margin_policy(50, 50, 50, 'standard', 'intraday'), equity=50, available=50, raw_share=.5)
+    assert standard['margin_fraction'] == .20
+    assert standard['target_margin_usdt'] == pytest.approx(10)
+    assert 'margin_share_source' not in standard
+    large = apply_guclu_margin_share(
+        margin_policy(150, 150, 150, 'strong', 'intraday'), equity=150, available=150, raw_share=.5)
+    assert large['margin_fraction'] == .20
+    assert large['target_margin_usdt'] == pytest.approx(30)
+
+
+def test_guclu_packet_carries_the_label_evidence_and_account_goal():
+    from trading.runtime.runner3_policy import GUCLU_MARGIN_INSTRUCTION, guclu_margin_request
+
+    sweep = dict(evidence=dict(kind='sweep_mss_fvg_retest'), reward_risk=1.1,
+                 macro_trend='bearish', side='long', context_timeframe='4h', horizon='swing')
+    closed = dict(evidence=dict(kind='htf_zone_choch', context_last_break=dict(direction='bearish')),
+                  reward_risk=2.4, macro_trend='bearish', side='short', context_timeframe='1h', horizon='intraday')
+    standard = dict(evidence=dict(kind='htf_zone_mss'), reward_risk=3,
+                    macro_trend='bullish', side='long', context_timeframe='4h', horizon='swing')
+    positions = [dict(symbol='ETH_USDT', side='short')]
+    packet = guclu_margin_request(sweep, equity=11.5, free_margin=8.2, open_positions=positions, loss_ceiling_usdt=0.34)
+    assert packet['label'] == 'Güçlü'
+    assert packet['evidence'] == 'sweep+MSS+FVG retest'
+    assert packet['free_margin_usdt'] == 8.2
+    assert packet['equity_usdt'] == 11.5
+    assert packet['open_positions'] == positions
+    assert packet['open_positions'] is not positions
+    assert packet['choch_loss_ceiling_usdt'] == 0.34
+    assert packet['account_goal'] == 'grow the cash'
+    assert packet['time_horizon'] == '4h swing'
+    intraday = guclu_margin_request(closed, equity=40, free_margin=20, open_positions=[], loss_ceiling_usdt=0.4)
+    assert intraday['evidence'] == 'with-trend closed break and at least 2R'
+    assert intraday['time_horizon'] == '1h intraday'
+    assert guclu_margin_request(standard, equity=40, free_margin=20, open_positions=[], loss_ceiling_usdt=0.4) is None
+    assert '20%' in GUCLU_MARGIN_INSTRUCTION
+    assert '35%' in GUCLU_MARGIN_INSTRUCTION
+    assert 'Güçlü is not a fixed percent' in GUCLU_MARGIN_INSTRUCTION
+    assert '35% for Güçlü' not in GUCLU_MARGIN_INSTRUCTION
+
+
+def test_text_share_wins_over_a_later_sizing_plan():
+    from trading.runtime.runner3_policy import chosen_margin_share
+
+    assert chosen_margin_share({'guclu_margin_share': None, 'sizing_plan': {'margin_share': .9}}) is None
+    assert chosen_margin_share({'guclu_margin_share': .22, 'sizing_plan': {'margin_share': .9}}) == .22
+    assert chosen_margin_share({'sizing_plan': {'margin_share': .22}}) == .22
+    assert chosen_margin_share({'sizing_plan': {}}) is None

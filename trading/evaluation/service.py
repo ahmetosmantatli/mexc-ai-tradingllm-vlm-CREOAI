@@ -58,7 +58,7 @@ def _decision_packet(decision):
                 limit_price=decision.limit_price, release_symbol=decision.release_symbol,
                 thesis_invalidated=bool(decision.thesis_invalidated),
                 price_plan=decision.price_plan.model_dump() if decision.price_plan else None,
-                sizing_plan=decision.sizing_plan.model_dump() if decision.sizing_plan else None,
+                sizing_plan=decision.sizing_plan.model_dump(exclude_none=True) if decision.sizing_plan else None,
                 watch_plan=decision.watch_plan.model_dump() if decision.watch_plan else None)
 
 
@@ -257,7 +257,15 @@ class ContextEvaluator:
                 ceiling=risk_per_trade_pct*(.5 if option['family']=='countertrend_sweep_reclaim' else 1)
                 target_risk=runner3_policy.small_account_risk_target(balance,ceiling,grade)
                 option['allocation']=dict(allocation,
-                    suggested_risk_fraction=target_risk if target_risk is not None else ceiling*(.8 if grade=='strong' else .5))
+                    suggested_risk_fraction=target_risk if target_risk is not None else ceiling*(.8 if grade=='strong' else .5),
+                    **({'margin_fraction_role':'silent_fallback'} if grade=='strong' else {}))
+                choice=runner3_policy.guclu_margin_request(
+                    option, equity=balance,
+                    free_margin=max(0., float(live_account['available_usdt'])-allocation['reserve_usdt']),
+                    open_positions=list(live_account.get('open_position_briefs') or []),
+                    loss_ceiling_usdt=float(equity)*ceiling)
+                if choice is not None:
+                    option['guclu_margin_choice']=choice
             equity_now = live_account.get('current_equity')
             account['capital_allocation']=dict(
                 equity_usdt=equity_now, available_usdt=live_account.get('available_usdt'),
@@ -425,10 +433,13 @@ class ContextEvaluator:
                      'Optional 1m timing evidence never substitutes for the 5m confirmation or supplies price references. '
                      'A zone awaiting touch or confirmation can only be watched. Preserve its supplied trigger and '
                      'invalidation. BTC/ETH structure provides context; an altcoin can diverge if its own closed evidence supports it. '
-                     'There is no separate balance split. Size comes from the setup risk and conviction, and free margin funds it. '
+                     'There is no separate balance split and no numeric confidence score. '
+                     'Güçlü is only a liquidity sweep plus MSS plus an FVG retest, or a closed break in the higher-timeframe direction with at least 2R. Every other valid setup is Standart. '
+                     + runner3_policy.GUCLU_MARGIN_INSTRUCTION +
+                     'A Güçlü setup may use more of the existing per-trade loss ceiling. '
                      'Do not ask for a margin below 1 USDT while equity is under 100. Do not pick 10x because it is a default, '
-                     'and do not pick the exchange maximum. Leverage is only the value that makes the CHoCH-stop loss fit. '
-                     'Do not narrow the structural stop to fit the desired size or to protect a small account. '
+                     'and do not pick the exchange maximum. Leverage is the lowest value that fits that share and the CHoCH stop. '
+                     'Do not narrow or move the CHoCH stop to make the position bigger. '
                      'For a long, the initial stop is just beyond the low of the CHoCH candle that confirmed the entry. '
                      'For a short, it is just beyond that CHoCH candle high. A 4h setup uses the 15m CHoCH. '
                      'A 1h setup uses the 5m CHoCH. Do not use another candle wick on that timeframe. '
@@ -446,6 +457,7 @@ class ContextEvaluator:
                      'limit_price is optional. Omit it or null for a market-now entry. A number is stored locally and is not a resting exchange order.')
         decision_mode = None
         winning_identity = {}
+        share_decision = None
 
         def run_review(mode, *, client=None, prompt_account=None, base_attempts=(), deadline_at=None,
                        publish=True, cancel=None):
@@ -482,6 +494,8 @@ class ContextEvaluator:
                                   'limit_price is stored locally and is not a resting exchange order. '
                                   'Price reaching it only reopens analysis; confirmation is still required. '
                                   'A resting local limit does not reserve margin. '
+                                  'The text model chooses sizing_plan.margin_share for a Güçlü plan. Do not replace that share. '
+                                  'A missing text share stays the 35% fallback. Do not invent a larger share. '
                                   'Chart annotations cannot replace candle references or mandatory price and risk checks. '
                                   'Equity under 100 USDT is not a reason to enter without zone, touch, and closed CHoCH/MSS. Touch alone never places an order.')
             review_account = account if prompt_account is None else prompt_account
@@ -523,6 +537,7 @@ class ContextEvaluator:
                 text_result = failed_review('text')
             provider_called = bool(text_result['called'])
             text_decision = text_result['decision'] if time.time() - started <= self.cfg.decision_ttl_seconds else None
+            share_decision = text_decision
             text_attempts = text_result['attempts']
             decision = text_decision
             decision_mode = 'text' if text_decision is not None else None
@@ -608,6 +623,7 @@ class ContextEvaluator:
                 single = failed_review(mode)
             provider_called = bool(single['called'])
             decision = single['decision']
+            share_decision = decision
             decision_mode = mode if decision is not None else None
             winning_identity = single['identity']
             winning_prompt = single['prompt']
@@ -751,9 +767,12 @@ class ContextEvaluator:
         self.store.put('memory:'+symbol,memory)
         self.store.put('last_analysis',record)
         metadata.update(decision_ai=decision_ai,invalidation=decision.invalidation,rationale=decision.rationale,
-            watch_note=decision.watch_note,sizing_plan=decision.sizing_plan.model_dump() if decision.sizing_plan else None,
+            watch_note=decision.watch_note,sizing_plan=decision.sizing_plan.model_dump(exclude_none=True) if decision.sizing_plan else None,
             release_symbol=decision.release_symbol,
             thesis_invalidated=bool(decision.release_symbol and decision.thesis_invalidated))
+        if runner3:
+            text_plan = getattr(share_decision, 'sizing_plan', None) if share_decision is not None else None
+            metadata['guclu_margin_share'] = None if text_plan is None else text_plan.margin_share
         if local_limit:
             from trading.evaluation.local_limits import save_local_limit
             plan = decision.price_plan

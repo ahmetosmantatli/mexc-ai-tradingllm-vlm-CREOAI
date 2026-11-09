@@ -119,6 +119,18 @@ def test_paper_gate_rejects_liquidation_unsafe_plan_despite_allowed_exchange_lev
     assert not ledger.positions
 
 
+def test_margin_share_does_not_change_size_and_an_unusable_share_stays_empty():
+    kept = size({'leverage': 4, 'risk_per_trade_pct': .005, 'margin_share': .22})
+    assert kept.notional == pytest.approx(250.)
+    assert kept.stop_loss.price == 98
+    assert kept.metadata['sizing_plan']['margin_share'] == pytest.approx(.22)
+    for raw in ('high', 2, True, float('nan'), 0):
+        result = size({'leverage': 4, 'risk_per_trade_pct': .005, 'margin_share': raw})
+        assert result.notional == pytest.approx(250.)
+        assert result.stop_loss.price == 98
+        assert 'margin_share' not in result.metadata['sizing_plan']
+
+
 def test_paper_gate_rejects_tiny_amount_never_increases_to_minimum():
     proposal = size({'leverage': 2, 'risk_per_trade_pct': .00000001})
     ledger = PaperLedger(RuntimeStore(':memory:'), 1000.)

@@ -336,19 +336,21 @@ def test_dynamic_zero_capacity_blocks_provider_work_without_consuming_candidate(
     assert runner.monitor()['entry_status']['reason']=='HOLD_LIVE_AI_CAPACITY'
 
 
-def test_runner3_small_account_sizes_immediately_without_same_side_exposure(tmp_path):
-    runner, private, _, control = prepare(tmp_path)
-    runner.cfg.live_price_plan_enabled = True
-    control['runner_id'] = 'runner3'
-    signal = candidate()
-    decision = result(runner, signal, dict(leverage=5, risk_per_trade_pct=.006))
+def _runner3_decision(runner, signal, kind, *, higher_break=None, margin_share='omit'):
+    plan = dict(leverage=5, risk_per_trade_pct=.006)
+    if margin_share != 'omit':
+        plan['margin_share'] = margin_share
+    decision = result(runner, signal, plan)
     stamp = int(time()) - 1800
     stop_reference = dict(timeframe='15m', open_time=stamp, field='low')
+    evidence = {'kind': kind}
+    if higher_break:
+        evidence['context_last_break'] = dict(direction=higher_break)
     decision.metadata.update(
         setup_selection=dict(setup_id='setup1', family='trend_continuation', horizon='intraday',
                              macro_trend='bullish', side='long', reward_risk=2.,
                              state='ready', context_timeframe='4h', trigger_timeframe='15m',
-                             evidence={'kind': 'htf_zone_mss'}, stop_reference=stop_reference, stop_loss_price=98.,
+                             evidence=evidence, stop_reference=stop_reference, stop_loss_price=98.,
                              target_reference=dict(timeframe='4h', open_time=stamp-14400, field='high')),
         price_plan=dict(entry_type='market', entry_price=100., stop_loss_price=98., take_profit_price=106.,
                         entry_timeframe='15m', stop_reference=stop_reference,
@@ -357,15 +359,100 @@ def test_runner3_small_account_sizes_immediately_without_same_side_exposure(tmp_
         price_evidence={'15m': [[stamp, 100, 106, 98, 101, 1]],
                         '4h': [[stamp-14400, 100, 106, 98, 101, 1]]},
     )
+    return decision
+
+
+def test_runner3_small_account_sizes_both_evidence_shares_without_moving_the_stop(tmp_path):
+    runner, private, _, control = prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled = True
+    control['runner_id'] = 'runner3'
+    signal = candidate()
     private.equity, private.available = 50., 50.
     snapshot = runner._refresh([signal.symbol])
-    boosted = runner._final_proposal(signal, decision, snapshot, control)
-    assert boosted.metadata['runner3_allocation']['risk_boost_applied']
-    assert boosted.metadata['sizing_plan']['risk_per_trade_pct'] == .006
-    assert boosted.max_loss_if_stopped == pytest.approx(.5)
+    standard = runner._final_proposal(signal, _runner3_decision(runner, signal, 'htf_zone_mss'), snapshot, control)
+    strong = runner._final_proposal(
+        signal, _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish'), snapshot, control)
+    assert standard.metadata['runner3_allocation']['grade'] == 'standard'
+    assert strong.metadata['runner3_allocation']['grade'] == 'strong'
+    assert standard.metadata['runner3_allocation']['margin_fraction'] == .20
+    assert strong.metadata['runner3_allocation']['margin_fraction'] == .35
+    assert strong.metadata['runner3_allocation']['margin_share_source'] == 'fallback_35'
+    assert standard.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(10)
+    assert strong.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(17.5)
+    assert standard.metadata['runner3_allocation']['initial_margin_usdt'] <= 10 + 1e-8
+    assert strong.metadata['runner3_allocation']['initial_margin_usdt'] <= 17.5 + 1e-8
+    assert standard.metadata['runner3_allocation']['initial_margin_usdt'] >= 1
+    assert strong.metadata['runner3_allocation']['initial_margin_usdt'] >= 1
+    assert standard.max_loss_if_stopped == pytest.approx(.4)
+    assert strong.max_loss_if_stopped == pytest.approx(.5)
+    assert strong.notional > standard.notional
+    assert standard.leverage not in (10, 20)
+    assert strong.leverage not in (10, 20)
+    assert standard.stop_loss.price == 98
+    assert strong.stop_loss.price == 98
+    assert standard.metadata['sizing_plan']['risk_per_trade_pct'] == .006
     snapshot['positions'] = [{'side': 1}]
-    baseline = runner._final_proposal(signal, decision, snapshot, control)
-    assert not baseline.metadata['runner3_allocation']['risk_boost_applied']
-    assert baseline.max_loss_if_stopped == pytest.approx(.3)
-    assert baseline.notional < boosted.notional
-    assert baseline.stop_loss == boosted.stop_loss
+    unchanged = runner._final_proposal(signal, _runner3_decision(runner, signal, 'htf_zone_choch'), snapshot, control)
+    assert not unchanged.metadata['runner3_allocation']['risk_boost_applied']
+    assert unchanged.max_loss_if_stopped == pytest.approx(.3)
+    assert unchanged.notional < standard.notional
+    assert unchanged.stop_loss.price == 98
+
+
+def test_runner3_guclu_uses_the_text_share_and_falls_back_without_inventing_one(tmp_path):
+    runner, private, _, control = prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled = True
+    control['runner_id'] = 'runner3'
+    signal = candidate()
+    private.equity, private.available = 50., 50.
+    snapshot = runner._refresh([signal.symbol])
+    silent = runner._final_proposal(
+        signal, _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish'), snapshot, control)
+    chosen = runner._final_proposal(
+        signal, _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish', margin_share=.22),
+        snapshot, control)
+    invalid = runner._final_proposal(
+        signal, _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish', margin_share='high'),
+        snapshot, control)
+    wider = runner._final_proposal(
+        signal, _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish', margin_share=.9),
+        snapshot, control)
+    smaller = runner._final_proposal(
+        signal, _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish', margin_share=.022),
+        snapshot, control)
+    standard = runner._final_proposal(
+        signal, _runner3_decision(runner, signal, 'htf_zone_mss', margin_share=.5), snapshot, control)
+    assert chosen.metadata['runner3_allocation']['margin_share_source'] == 'model'
+    assert chosen.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(11)
+    assert chosen.metadata['runner3_allocation']['initial_margin_usdt'] <= 11 + 1e-8
+    assert chosen.notional <= silent.notional + 1e-8
+    assert invalid.metadata['runner3_allocation']['margin_share_source'] == 'fallback_35'
+    assert invalid.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(17.5)
+    assert invalid.notional == pytest.approx(silent.notional)
+    assert wider.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(45)
+    assert wider.metadata['runner3_allocation']['initial_margin_usdt'] <= 42.5 + 1e-8
+    assert wider.notional + 1e-8 >= silent.notional
+    assert wider.metadata['runner3_allocation']['initial_margin_usdt'] <= wider.metadata['runner3_allocation']['free_margin_usdt'] + 1e-8
+    assert wider.stop_loss.price == silent.stop_loss.price == smaller.stop_loss.price == 98
+    assert smaller.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(1.1)
+    assert smaller.metadata['runner3_allocation']['initial_margin_usdt'] <= 1.1 + 1e-8
+    assert smaller.metadata['runner3_allocation']['initial_margin_usdt'] >= 1
+    assert smaller.notional < silent.notional
+    assert standard.metadata['runner3_allocation']['margin_fraction'] == .20
+    assert standard.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(10)
+    for proposal in (chosen, invalid, wider, smaller, standard):
+        assert proposal.leverage not in (10, 20)
+        assert proposal.stop_loss.price == 98
+    held = _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish', margin_share=.9)
+    held.metadata['guclu_margin_share'] = None
+    held_back = runner._final_proposal(signal, held, snapshot, control)
+    assert held_back.metadata['runner3_allocation']['margin_share_source'] == 'fallback_35'
+    assert held_back.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(17.5)
+    named = _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish')
+    named.metadata['guclu_margin_share'] = .22
+    named_size = runner._final_proposal(signal, named, snapshot, control)
+    assert named_size.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(11)
+    with pytest.raises(ValueError, match='runner3_margin_below_minimum'):
+        runner._final_proposal(
+            signal, _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish', margin_share=.01),
+            snapshot, control)

@@ -9,19 +9,43 @@ rejected rather than increased to the exchange minimum.
 from math import isfinite
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from trading.equity.state import EquityState
 from trading.models.domain import Side, StopLossSpec, TradeProposal
 from trading.quant.signals import CandidateSignal
 
 
+def _usable_margin_share(value):
+    """A fraction of equity. Anything else is silence, not a larger share."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not isfinite(value) or not 0 < value <= 1:
+        return None
+    return value
+
+
 class PlanSizing(BaseModel):
-    """Both fields are required when a model supplies a sizing plan."""
+    """Leverage and risk are required when a model supplies a sizing plan.
+
+    margin_share is the text model's Güçlü margin as a fraction of equity.
+    A missing or unusable value stays empty so the engine can fall back to 35%.
+    It does not reject the rest of the plan and it cannot move the stop.
+    """
 
     model_config = ConfigDict(extra='forbid', strict=True, allow_inf_nan=False)
     leverage: int = Field(ge=1)
     risk_per_trade_pct: float = Field(gt=0, le=1, description='Account risk fraction; .01 means 1%.')
+    margin_share: float | None = Field(default=None, description='Güçlü margin as a fraction of equity.')
+
+    @model_validator(mode='before')
+    @classmethod
+    def ignore_unusable_margin_share(cls, value):
+        if isinstance(value, dict) and 'margin_share' in value:
+            value = dict(value)
+            value['margin_share'] = _usable_margin_share(value.get('margin_share'))
+        return value
 
 
 class PlanSizingError(ValueError):
@@ -93,7 +117,7 @@ def apply_decision_sizing(
         metadata=dict(strategy=candidate.strategy.value, signal_id=candidate.signal_id,
                       confidence=candidate.confidence, sized_from_equity=current_equity,
                       sizing_source='model' if plan else 'policy',
-                      sizing_plan=plan.model_dump() if plan else None,
+                      sizing_plan=plan.model_dump(exclude_none=True) if plan else None,
                       risk_per_trade_pct=risk, policy_risk_limit=risk_limit,
                       policy_leverage_limit=leverage_limit, exchange_leverage_limit=exchange_limit),
     )

@@ -651,3 +651,69 @@ def test_a_tighter_stop_is_rejected_for_a_small_account():
     validate_evidence(intraday, exact)
     with pytest.raises(ValueError, match='runner3_structural_stop_too_tight'):
         validate_evidence(intraday, exact.model_copy(update={'stop_loss_price': 92}))
+
+
+def test_text_model_receives_the_guclu_packet_and_keeps_its_share(tmp_path, monkeypatch):
+    import trading.quant.structure_setups as setups
+
+    real = setups.build_htf_zone_setups
+
+    def wrapped(*args, **kwargs):
+        options = real(*args, **kwargs)
+        for option in options:
+            if option.get('state') != 'ready':
+                continue
+            option['macro_trend'] = 'bullish' if option['side'] == 'long' else 'bearish'
+            option['reward_risk'] = 2.5
+            option['evidence'] = dict(option['evidence'], context_last_break=dict(direction=option['macro_trend']))
+        return options
+
+    monkeypatch.setattr(setups, 'build_htf_zone_setups', wrapped)
+
+    def text(packet):
+        option = next(row for row in packet['account']['setup_selection']['options']
+                      if row['family'] == 'pullback' and row['state'] == 'ready')
+        choice = option['guclu_margin_choice']
+        assert choice['label'] == 'Güçlü'
+        assert choice['evidence'] == 'with-trend closed break and at least 2R'
+        assert choice['equity_usdt'] == 11.58
+        assert abs(choice['free_margin_usdt'] - 11.58 * .85) < 1e-9
+        assert choice['open_positions'] == []
+        assert choice['account_goal'] == 'grow the cash'
+        assert choice['time_horizon'] == '4h swing'
+        ceiling = .03 * (.5 if option['family'] == 'countertrend_sweep_reclaim' else 1.)
+        assert abs(choice['choch_loss_ceiling_usdt'] - 11.58 * ceiling) < 1e-9
+        assert option['allocation']['margin_fraction_role'] == 'silent_fallback'
+        plan = dict(leverage=5, risk_per_trade_pct=.001)
+        if text.share is not None:
+            plan['margin_share'] = text.share
+        return ready_answer(packet, sizing_plan=plan, rationale='Metin modeli Güçlü payı seçiyor.')
+
+    def vision(model, packet):
+        seen = packet['account']['text_model_decision']['sizing_plan']
+        if text.share is None:
+            assert 'margin_share' not in (seen or {})
+        else:
+            assert seen['margin_share'] == text.share
+        model.vision_answer = ready_answer(
+            packet, sizing_plan=dict(leverage=5, risk_per_trade_pct=.001, margin_share=.8),
+            rationale='Grafik modeli payı büyütmek istiyor.')
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'success'}]}
+
+    text.share = .22
+    model = DecisionModel(text, vision)
+    run, _store = evaluator(tmp_path / 'chosen', monkeypatch, model)
+    chosen = run()
+    assert 'Güçlü is not a fixed percent' in model.calls[0]['system']
+    assert '35% for Güçlü' not in model.calls[0]['system']
+    assert 'One writer does.' in model.calls[0]['system']
+    assert chosen.metadata['decision_ai']['review_mode'] == 'vlm'
+    assert chosen.metadata['guclu_margin_share'] == .22
+    assert chosen.metadata['sizing_plan']['margin_share'] == .8
+
+    text.share = None
+    model = DecisionModel(text, vision)
+    run, _store = evaluator(tmp_path / 'silent', monkeypatch, model)
+    silent = run()
+    assert silent.metadata['guclu_margin_share'] is None
+    assert silent.metadata['sizing_plan']['margin_share'] == .8
