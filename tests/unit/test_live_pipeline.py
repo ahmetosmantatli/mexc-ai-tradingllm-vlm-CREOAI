@@ -259,6 +259,10 @@ def test_execution_exception_finalizes_exact_trade_trace_with_safe_reason(tmp_pa
     completed=runner.store.get('analysis_trace')
     assert completed['execution_status']=='rejected'
     assert completed['execution_details']['code']=='CONTRACT_QUANTITY_LIMIT'
+    notices=runner.store.get('live:entry_rejection_notices')
+    assert len(notices)==1
+    assert notices[0]['symbol']==signal.symbol
+    assert notices[0]['reason']==result['reason']
 
 
 def test_unrelated_parallel_symbols_do_not_retrigger_same_market_review(tmp_path,monkeypatch):

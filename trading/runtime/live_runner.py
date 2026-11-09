@@ -383,11 +383,23 @@ class LiveRunner:
             decision_ai=result.metadata.get('decision_ai',{}),account_generation=snapshot['generation'])
         return proposal
 
+    def _record_entry_rejection(self, candidate, trace_id, reason, details=None, *, notify=True):
+        if not finalize_trace(self.store, trace_id, 'rejected', reason, details) or not notify:
+            return
+        with self.store.lock:
+            pending = self.store.get('live:entry_rejection_notices', [])
+            pending.append(dict(at=time.time(), binding_id=self.binding_id,
+                                symbol=candidate.symbol, reason=reason, details=details or {}))
+            self.store.put('live:entry_rejection_notices', pending[-100:])
+
     def _apply(self,candidate,result,control):
         trace_id=result.metadata.get('analysis_trace_id')
-        def finish(reason):
-            if trace_id:
-                finalize_trace(self.store,trace_id,'opened' if reason=='LIVE_PROTECTED' else 'rejected',reason)
+        def finish(reason, *, notify=True):
+            if trace_id and result.action.value == 'trade':
+                if reason == 'LIVE_PROTECTED':
+                    finalize_trace(self.store, trace_id, 'opened', reason)
+                else:
+                    self._record_entry_rejection(candidate, trace_id, reason, notify=notify)
             return self.status(reason)
         if result.action.value!='trade':
             return finish('HOLD_LIVE_MODEL')
@@ -467,7 +479,7 @@ class LiveRunner:
             except Exception:
                 pass # Protection is confirmed; failed balance refresh stays explicitly unready.
             return finish('LIVE_PROTECTED')
-        return finish('HOLD_LIVE_'+str(state.get('status','UNKNOWN')).upper())
+        return finish('HOLD_LIVE_'+str(state.get('status','UNKNOWN')).upper(), notify=False)
 
     def cycle(self):
         if not self._cycle_lock.acquire(blocking=False):
@@ -534,7 +546,7 @@ class LiveRunner:
                         reason='HOLD_LIVE_EXECUTION_'+details['code']
                         self.store.put('live_candidate_error:'+candidate.symbol,dict(at=time.time(),**details))
                         if result is not None and result.action.value=='trade':
-                            finalize_trace(self.store,result.metadata.get('analysis_trace_id'),'rejected',reason,details)
+                            self._record_entry_rejection(candidate,result.metadata.get('analysis_trace_id'),reason,details)
                         outcomes.append(self.status(reason))
             return next((row for row in outcomes if row['reason']=='LIVE_PROTECTED'),outcomes[-1])
         except sqlite3.Error:

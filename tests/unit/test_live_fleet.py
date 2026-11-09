@@ -347,3 +347,29 @@ def test_runner3_requires_explicit_enable_structural_setup_and_ioc(tmp_path):
         assert f.available_runner_ids('a')==('baseline-v1',)
     finally:
         f.stop()
+
+
+def test_preflight_rejection_uses_plain_language_and_stable_outbox_id(tmp_path):
+    f = fleet(tmp_path)
+    try:
+        runner = f.runners['a']
+        runner.binding_id = 'generation'
+        key = 'live:entry_rejection_notices'
+        notice = dict(at=3001., binding_id='generation', symbol='JCT_USDT',
+                      reason='HOLD_LIVE_EXECUTION_PRIVATE_PREFLIGHT',
+                      details={'reason_codes': ['INSUFFICIENT_FREE_MARGIN'],
+                               'message': 'private data'})
+        runner.store.put(key, [{**notice, 'binding_id': 'obsolete'}, notice])
+        f.publish(f.accounts[0])
+        messages = [row for row in f.controller.messages if row[1].get('event_id', '').startswith('live-entry-rejection:')]
+        assert len(messages) == 1
+        assert 'JCT_USDT | İşlem önerisi reddedildi.' in messages[0][0][1]
+        assert 'Kullanılabilir teminat yetersiz.' in messages[0][0][1]
+        assert 'private data' not in messages[0][0][1]
+        assert runner.store.get(key) == []
+
+        runner.store.put(key, [{**notice, 'at': 3010.}])
+        f._publish_entry_rejections('a', runner)
+        assert f.controller.messages[-1][1]['event_id'] == messages[0][1]['event_id']
+    finally:
+        f.stop()

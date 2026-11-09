@@ -12,6 +12,7 @@ from pathlib import Path
 import time
 from uuid import uuid4
 
+from trading.agents.telemetry import human_reason
 from trading.control.accounts import load_accounts
 from trading.control.vault import Vault
 from trading.control.connections import ConnectionFlow
@@ -26,6 +27,39 @@ EMERGENCY_REASONS={
     'management_target_protection_failed':'Hedef revizyonu sonrası borsa koruması doğrulanamadı.',
     'management_stop_protection_failed':'Stop revizyonu sonrası borsa koruması doğrulanamadı.',
     'management_remaining_protection_failed':'Kısmi kapanış sonrası kalan pozisyonun koruması doğrulanamadı.',
+}
+
+
+ENTRY_REJECTION_REASONS = {
+    'HOLD_LIVE_POSITION_LIMIT': 'Açık pozisyon sayısı sınırı dolu.',
+    'HOLD_LIVE_SYMBOL_OPEN': 'Bu paritede zaten açık pozisyon var.',
+    'HOLD_LIVE_CANDIDATE_STALE': 'Aday analiz sırasında güncelliğini yitirdi.',
+    'HOLD_LIVE_WATCH_CHANGED': 'Takip planı analiz sırasında değişti.',
+    'HOLD_LIVE_DECISION_EXPIRED': 'Model kararının geçerlilik süresi doldu.',
+    'HOLD_LIVE_CONTROL_CHANGED': 'İşlem arayışı veya ayarlar analiz sırasında değişti.',
+    'HOLD_LIVE_HALT': 'Hesapta teknik giriş engeli var.',
+    'HOLD_LIVE_EXECUTOR_DISABLED': 'Canlı emir yürütücüsü etkin değil.',
+    'HOLD_LIVE_UNVALIDATED_MODEL': 'Model önerisi giriş doğrulamasını geçmedi.',
+    'HOLD_LIVE_EXECUTION_POSITION_LIMIT': 'Açık pozisyon sayısı sınırı dolu.',
+    'HOLD_LIVE_EXECUTION_CONTRACT_RISK_TIER': 'Kontrat adedi desteklenen risk kademesini aşıyor.',
+    'HOLD_LIVE_EXECUTION_INSUFFICIENT_MARGIN': 'Kullanılabilir teminat işlem için yetersiz.',
+    'HOLD_LIVE_EXECUTION_STALE_QUOTE': 'Güncel emir fiyatı doğrulanamadı.',
+    'HOLD_LIVE_EXECUTION_COSTS_EXCEED_RISK': 'Tahmini ücret ve kayma işlem risk bütçesini aşıyor.',
+}
+ENTRY_REJECTION_DETAILS = {
+    'ALLOCATION_EXCEEDS_CURRENT_EQUITY': 'Ayrılan sermaye güncel özkaynağı aşıyor.',
+    'INSUFFICIENT_FREE_MARGIN': 'Kullanılabilir teminat yetersiz.',
+    'EXCHANGE_RISK_VOLUME_CAP': 'Kontrat adedi hesabın borsa sınırını aşıyor.',
+    'LEVERAGE_SETTING_MISMATCH': 'Borsadaki kaldıraç öneriyle eşleşmiyor.',
+    'EXCHANGE_LEVERAGE_CAP': 'Önerilen kaldıraç borsa sınırını aşıyor.',
+    'UNRECONCILED_EXTERNAL_POSITIONS': 'Borsada uzlaştırılmamış açık pozisyon var.',
+    'UNRECONCILED_EXTERNAL_ORDERS': 'Borsada uzlaştırılmamış açık emir var.',
+    'TOTAL_OPEN_RISK_CAP': 'Toplam açık risk sınırı dolu.',
+    'MAX_LOSS_EXCEEDS_CAP': 'Öneri işlem başına risk sınırını aşıyor.',
+    'MAX_CONCURRENT_POSITIONS': 'Açık pozisyon sayısı sınırı dolu.',
+    'DAILY_LOSS_HALT': 'Günlük kayıp sınırına ulaşıldı.',
+    'WEEKLY_LOSS_HALT': 'Haftalık kayıp sınırına ulaşıldı.',
+    'MAX_DRAWDOWN_KILL': 'Zirveden düşüş sınırına ulaşıldı.',
 }
 
 
@@ -367,6 +401,8 @@ class LiveFleet:
         self.control_store.put(f'account:{ident}:status',snapshot)
         from trading.control.activity import publish_activity
         publish_activity(self.controller,self.control_store,ident,snapshot,self.cfg,now)
+        if runner is not None:
+            self._publish_entry_rejections(ident, runner)
         executor=getattr(runner,'executor',None)
         if executor is not None and callable(getattr(executor,'intents',None)):
             halt=snapshot.get('live_halt') or {}
@@ -380,6 +416,32 @@ class LiveFleet:
                         +"\nMEXC durumunu aşağıdaki düğmeyle kontrol et. Yeniden Başlat kararı sende.",
                         event_id=f"live-halt-review:{row['binding_id']}:{row['intent_id']}",buttons=True)
         return snapshot
+
+    def _publish_entry_rejections(self, ident, runner):
+        key = 'live:entry_rejection_notices'
+        with runner.store.lock:
+            notices = runner.store.get(key, [])
+            for notice in notices:
+                if notice['binding_id'] != getattr(runner, 'binding_id', None):
+                    continue
+                reason = notice['reason']
+                details = notice['details']
+                codes = tuple(details.get('reason_codes', ()))
+                explanation = ' '.join(ENTRY_REJECTION_DETAILS[code] for code in codes
+                                       if code in ENTRY_REJECTION_DETAILS)
+                if not explanation:
+                    explanation = ENTRY_REJECTION_REASONS.get(reason) or human_reason(reason)
+                contracts = details.get('contracts', {})
+                if {'quantity', 'minimum', 'maximum'} <= contracts.keys():
+                    explanation += (f" Hesaplanan {contracts['quantity']:g} kontrat, "
+                                    f"izin verilen {contracts['minimum']:g}–{contracts['maximum']:g}.")
+                symbol = notice['symbol']
+                bucket = int(notice['at'] // 300)
+                event_id = f"live-entry-rejection:{notice['binding_id']}:{symbol}:{reason}:{','.join(codes)}:{bucket}"
+                self.controller.enqueue(ident, f"CANLI | {symbol} | İşlem önerisi reddedildi.\n{explanation}",
+                                        event_id=event_id)
+            if notices:
+                runner.store.put(key, [])
 
     def _publish_intent(self, ident, row):
         labels={'protected':'İşlem açıldı; borsada SL/TP koruması doğrulandı.',
