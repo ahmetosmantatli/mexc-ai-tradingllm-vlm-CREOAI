@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from trading.agents.telemetry import human_reason
 from trading.control.accounts import load_accounts
+from trading.control.activity import live_risk_block_lines
 from trading.control.vault import Vault
 from trading.control.connections import ConnectionFlow
 from trading.exchange.errors import ConnectionIssue
@@ -424,6 +425,7 @@ class LiveFleet:
         entry_status = snapshot.get('entry_status') or {}
         entry = entry_status.get('reason')
         delayed = (snapshot.get('worker_health') or {}).get('delayed_jobs') or []
+        risk_keys = []
         reasons = {
             'HOLD_LIVE_LOSS_CIRCUIT_BREAKER': 'Kayıp/düşüş sınırı yeni girişleri bekletiyor.',
             'HOLD_LIVE_NO_FUNDS': 'Kullanılabilir bakiye yetersiz; yeni girişler bekliyor.',
@@ -444,23 +446,24 @@ class LiveFleet:
             gate = 'HOLD_LIVE_RECONCILIATION' if snapshot.get('reason') == 'HOLD_LIVE_RECONCILIATION' else entry
             explanation = reasons.get(gate)
             if gate == 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER':
-                labels = {'daily_loss_pct':'Günlük kayıp','weekly_loss_pct':'Haftalık kayıp','drawdown_pct':'Zirveden düşüş'}
-                for name, value in entry_status.get('risk_blocks', {}).items():
-                    explanation += f"\n{labels[name]} {value['observed']:.2%} | sınır {value['limit']:.2%}."
+                blocks = entry_status.get('risk_blocks') or {}
+                risk_keys = sorted(blocks)
+                for line in live_risk_block_lines(blocks):
+                    explanation += '\n' + line
             if not explanation:
                 gate = None
         else:
             gate, explanation = None, None
         key = f'account:{ident}:live_gate_notice'
         previous = self.control_store.get(key, {})
-        if gate == previous.get('gate'):
+        if gate == previous.get('gate') and (not risk_keys or risk_keys == previous.get('risk_keys')):
             return
         sequence = previous.get('sequence', 0) + 1
         if explanation or enabled:
             text = explanation or 'Önceki giriş beklemesi sona erdi; uygun aday aranıyor.'
             self.controller.enqueue(ident, f'CANLI | {ident}\n{text} Ayrıntı: /status',
                                     event_id=f'live-gate:{ident}:{sequence}')
-        self.control_store.put(key, dict(gate=gate, sequence=sequence))
+        self.control_store.put(key, dict(gate=gate, sequence=sequence, risk_keys=risk_keys))
 
     def _publish_review_notices(self, ident, runner):
         key = 'live:review_notices'
@@ -476,8 +479,20 @@ class LiveFleet:
                 if notice['binding_id'] != getattr(runner, 'binding_id', None):
                     continue
                 if notice['phase'] == 'start':
-                    text = ('Takip tetiklendi; parite yeniden inceleniyor.' if notice['triggered']
-                            else 'Aday incelemeye alındı.')
+                    strategies = {'trend':'trend taraması', 'momentum':'ivme taraması',
+                                  'mean_reversion':'ortalamaya dönüş taraması', 'structure_setup':'yapı taraması'}
+                    if notice.get('review_reason') == 'watch_structure_changed':
+                        text = 'Takip planındaki piyasa yapısı değişti; yeniden inceleniyor.'
+                    elif notice['triggered']:
+                        text = 'Takip tetiklendi; parite yeniden inceleniyor.'
+                    else:
+                        text = 'Aday incelemeye alındı.'
+                        source = strategies.get(notice.get('strategy'))
+                        if source:
+                            text += f" Kaynak {source}."
+                        frame = notice.get('seed_timeframe')
+                        if frame in ('5m', '15m', '4h'):
+                            text += f" Tetik zaman dilimi {frame}."
                 elif notice['status'] == 'provider_wait':
                     text = 'Bu inceleme için uygun AI rotası bekleniyor.'
                 elif notice['status'] == 'completed':

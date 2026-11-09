@@ -382,16 +382,17 @@ def test_live_reports_gate_changes_and_drops_periodic_status(tmp_path):
         f.controller.set_control('a', enabled=True)
         f.publish(account)
         assert not f.controller.messages
-        snapshot = dict(control={'enabled': True}, entry_status=dict(
-            reason='HOLD_LIVE_LOSS_CIRCUIT_BREAKER',
-            risk_blocks={'drawdown_pct': {'observed': .25, 'limit': .225}}))
+        snapshot = dict(control={'enabled': True}, entry_status=dict(reason='HOLD_LIVE_LOSS_CIRCUIT_BREAKER'))
         f._publish_live_gate('a', snapshot)
+        snapshot['entry_status']['risk_blocks'] = {'drawdown_pct': {'observed': .25, 'limit': .225}}
         f._publish_live_gate('a', snapshot)
-        assert len(f.controller.messages) == 1
-        assert 'Zirveden düşüş 25.00% | sınır 22.50%' in f.controller.messages[0][0][1]
-        snapshot['entry_status']['reason'] = 'HOLD_LIVE_MODEL'
+        snapshot['entry_status']['risk_blocks']['drawdown_pct']['observed'] = .26
         f._publish_live_gate('a', snapshot)
         assert len(f.controller.messages) == 2
+        assert 'Zirveden düşüş 25.00% | sınır 22.50%' in f.controller.messages[1][0][1]
+        snapshot['entry_status']['reason'] = 'HOLD_LIVE_MODEL'
+        f._publish_live_gate('a', snapshot)
+        assert len(f.controller.messages) == 3
         assert 'Önceki giriş beklemesi sona erdi' in f.controller.messages[-1][0][1]
     finally:
         f.stop()
@@ -408,13 +409,15 @@ def test_live_review_notices_deliver_start_and_hold_separately(tmp_path):
             dict(notice, phase='start'),
             dict(notice, phase='result', status='completed', action='hold',
                  model='test-model', requests=2, rationale='Yeni kapanış bekleniyor.'),
+            dict(notice, id='scan', phase='start', triggered=False, strategy='structure_setup', seed_timeframe='15m'),
         ])
         f.publish(f.accounts[0])
-        assert len(f.controller.messages) == 2
+        assert len(f.controller.messages) == 3
         assert 'GRAM_USDT | Takip tetiklendi' in f.controller.messages[0][0][1]
         assert 'AI beklemeyi seçti' in f.controller.messages[1][0][1]
         assert 'AI üretim isteği: 2' in f.controller.messages[1][0][1]
+        assert 'Kaynak yapı taraması. Tetik zaman dilimi 15m.' in f.controller.messages[2][0][1]
         f.publish(f.accounts[0])
-        assert len(f.controller.messages) == 2
+        assert len(f.controller.messages) == 3
     finally:
         f.stop()

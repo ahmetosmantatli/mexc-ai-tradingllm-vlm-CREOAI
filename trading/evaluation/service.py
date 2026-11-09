@@ -258,7 +258,8 @@ class ContextEvaluator:
         trace=dict(id=uuid4().hex,mode='LIVE' if live_account is not None else 'PAPER',symbol=symbol,strategy=candidate.strategy.value,confidence=candidate.confidence,
             runner_id=(live_account or {}).get('runner_id','baseline-v1'),
             analysis_version=self.cfg.analysis_version,started_at=started,status='pending',attempts=[],provider='none',model='',
-            why_reconsidered=changes,market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
+            why_reconsidered=changes,seed_timeframe=candidate.features.get('seed_timeframe'),
+            market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))
         if runner2:
             trace['strategy_cohort']=runner3_policy.COHORT if runner3 else 'runner2-multihorizon-ict-v1'

@@ -2,6 +2,12 @@
 import time
 
 
+def live_risk_block_lines(blocks):
+    labels = {'daily_loss_pct':'Günlük kayıp','weekly_loss_pct':'Haftalık kayıp','drawdown_pct':'Zirveden düşüş'}
+    return [f"{label} {blocks[key]['observed']:.2%} | sınır {blocks[key]['limit']:.2%}."
+            for key, label in labels.items() if key in blocks]
+
+
 def activity_summary(snapshot, now=None):
     now=time.time() if now is None else now
     control=snapshot.get('control') or {}

@@ -150,6 +150,8 @@ def audit(path,*,since=0,now=None,include_performance=False):
         watches=Counter(json.loads(value).get('status','unknown') for value, in db.execute("SELECT value FROM state WHERE key LIKE 'watch:%'"))
         grant=next((json.loads(value) for value, in db.execute("SELECT value FROM state WHERE key LIKE 'live:automatic_grant:%'")),{})
         entry_status=state('live_entry_status',{})
+        management=state('management_trace',{})
+        scan=state('scan_summary',{})
         report=dict(evaluations=len(traces),model_decisions=dict(decisions),analysis_outcomes=dict(outcomes),
             model_trade_proposals=len(proposals),execution_rejections=dict(rejections),unresolved_proposal_records=len(unresolved),
             intent_records=len(intents),entry_attempt_records=sum(bool(r.get('entry_write_attempted')) for r in intents),
@@ -159,6 +161,9 @@ def audit(path,*,since=0,now=None,include_performance=False):
             snapshot_age_seconds=max(0,now-account.get('observed_at',0)) if account.get('observed_at') else None,
             start_grant_present=bool(grant),start_grant_revoked=grant.get('revoked'),start_grant_expired=grant.get('expires_at',0)<=now,
             halt=bool(state('live:halt')),last_entry_reason=entry_status.get('reason'), entry_risk_blocks=entry_status.get('risk_blocks',{}),
+            last_scan_at=scan.get('at'),
+            last_entry_review={k:latest.get(k) for k in ('symbol','status','started_at','completed_at')} if latest else None,
+            last_management_review={k:management.get(k) for k in ('symbol','status','started_at','completed_at')} if management else None,
             limitations='Persisted records only, not a fresh exchange check. Entry attempt record is not proof of a POST/fill. Old unfinalized traces cannot establish a rejection reason.')
         if include_performance:
             cards = {key.removeprefix('live:management-card:'):json.loads(value)
@@ -177,11 +182,19 @@ def format_report(report):
             ('Emir yaşam döngüsü','intent_states'),('Takip durumları','watch_states'),('Son aday hata türleri','candidate_error_types'),
             ('Başlat izni süresi dolmuş','start_grant_expired'),('Başlat izni iptal edilmiş','start_grant_revoked'),('Canlı engel kaydı','halt')]:
         text+=f'{label}: {report[key]}\n'
+    text+=f"Son giriş durumu: {report.get('last_entry_reason')}\n"
     if report.get('entry_risk_blocks'):
         text+=f"Güncel risk engelleri: {report['entry_risk_blocks']}\n"
+    def stamp(timestamp):
+        return datetime.fromtimestamp(timestamp,ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M:%S')
+    if report.get('last_scan_at'):
+        text+=f"Son tarama: {stamp(report['last_scan_at'])}\n"
+    for label, key in (('Son giriş incelemesi','last_entry_review'), ('Son pozisyon incelemesi','last_management_review')):
+        review=report.get(key) or {}
+        if review.get('started_at'):
+            text+=f"{label}: {stamp(review['started_at'])} | {review['symbol']} | {review['status']}\n"
     for row in report['latest_trade_proposals']:
-        stamp=datetime.fromtimestamp(row['started_at'],ZoneInfo('Europe/Istanbul')).strftime('%d.%m %H:%M:%S')
-        text+=f"{stamp} | {row['symbol']} | {row['execution_status']} | {row['execution_reason']} | {row.get('execution_details')}\n"
+        text+=f"{stamp(row['started_at'])} | {row['symbol']} | {row['execution_status']} | {row['execution_reason']} | {row.get('execution_details')}\n"
     if report['model_trade_proposals']==0:text+='Bu aralıkta kayıtlı işlem önerisi yok; emir yürütme yolunun çalışıp çalışmadığı bu gözlemle kanıtlanamaz.\n'
     text+='Yalnız kaydedilmiş veriler incelendi; borsaya yeni sorgu gönderilmedi. Emir denemesi kaydı, emrin iletildiğini veya dolduğunu kanıtlamaz. Eski sonuçlanmamış önerilerin ret nedeni bu kayıtlardan çıkarılamaz.\n'
     return text

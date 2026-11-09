@@ -293,6 +293,8 @@ class LiveRunner:
         notice = dict(id=trace['id'], phase=phase, binding_id=self.binding_id, symbol=trace['symbol'],
                       status=trace['status'], action=trace.get('action'), model=trace.get('model'),
                       rationale=' '.join((trace.get('rationale') or '').split())[:180],
+                      strategy=trace.get('strategy'), seed_timeframe=trace.get('seed_timeframe'),
+                      review_reason=(trace.get('why_reconsidered') or {}).get('reason'),
                       triggered=trace.get('strategy') == 'watch_review',
                       requests=sum(attempt.get('generation_requests', 0) for attempt in trace.get('attempts', [])))
         with self.store.lock:

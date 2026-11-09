@@ -2,6 +2,7 @@
 import re
 import time
 from uuid import uuid4
+from trading.control.activity import live_risk_block_lines
 from trading.control.telegram import TelegramController,TRADER_MODES
 from trading.agents.telemetry import human_reason
 from trading.runtime.live_capabilities import management_runner
@@ -199,8 +200,12 @@ class LiveTelegramController(TelegramController):
             'HOLD_LIVE_MODEL':'AI işlem açmadı; son analiz sonucuna bakabilirsin.', 'HOLD_LIVE_START_REQUIRED':'Başlat yetkisi yok veya süresi doldu; yeni analiz yapılmıyor. Yeniden Başlat kullan.', 'HOLD_LIVE_ERROR':'Yeni işlem açılmadı; veri veya yürütme kontrolü bekliyor.',
             'HOLD_LIVE_RECONCILIATION':'Borsa durumu doğrulanamadı; yeni girişler bekliyor.', 'HOLD_LIVE_POSITION_LIMIT':'Açık pozisyon sınırına ulaşıldı.',
             'HOLD_LIVE_WATCH_CHANGED':'Parite planı değişti; eski kararla işlem açılmadı.', 'HOLD_LIVE_CONTROL_CHANGED':'Ayarlar değişti; eski karar uygulanmadı.'}
-        entry_reason=(snapshot.get('entry_status') or {}).get('reason')
+        entry_status=snapshot.get('entry_status') or {}
+        entry_reason=entry_status.get('reason')
         if entry_reason and entry_reason!=reason:text+='İşlem arayışı: '+labels.get(entry_reason,human_reason(entry_reason))+'\n'
+        if entry_reason=='HOLD_LIVE_LOSS_CIRCUIT_BREAKER':
+            for line in live_risk_block_lines(entry_status.get('risk_blocks') or {}):
+                text+=line+'\n'
         text+=f"Son durum: {snapshot.get('message') or labels.get(reason,'Canlı veri ve risk kontrolleri sürüyor; ayrıntı Son analiz ekranında.')}\n"
         if account.get('observed_at'):text+=f"Borsa verisinin yaşı: {max(0,time.time()-account['observed_at']):.0f} sn\n"
         if snapshot.get('halt') or snapshot.get('live_halt'):text+='Yeni işlem engeli var; belirsiz emir/koruma durumunu kontrol et.\n'
