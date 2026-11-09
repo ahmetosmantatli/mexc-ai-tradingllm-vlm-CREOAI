@@ -214,7 +214,9 @@ class LiveTelegramController(TelegramController):
         trace=(self.snapshot_provider(account_id) or {}).get('management_trace') or {}
         if trace:
             text+=f"\nAçık pozisyon AI yönetimi: {trace.get('symbol','?')}\nModel: {trace.get('provider','?')} / {trace.get('model','?')}\n"
-            actions={'hold':'Koru / bekle','move_stop':'Stop taşı','reduce':'Kısmi kapat','close':'Kapat'}
+            if trace.get('management_trigger')=='target_reversal':
+                text+='Tetikleyici: Hedefe yaklaştıktan sonra kârın bir kısmı geri verildi.\n'
+            actions={'hold':'Koru / bekle','move_stop':'Stop taşı','move_target':'Hedef taşı','reduce':'Kısmi kapat','close':'Kapat'}
             text+=f"Karar: {actions.get(trace.get('action'), 'Yanıt veya doğrulama bekleniyor')}\n{trace.get('rationale','')}\n"
             for attempt in trace.get('attempts',[]):
                 text+=f"{attempt.get('provider','?')}: {attempt.get('status','?')} | Girdi/çıktı token: {attempt.get('input_tokens','?')}/{attempt.get('output_tokens','?')}\n"

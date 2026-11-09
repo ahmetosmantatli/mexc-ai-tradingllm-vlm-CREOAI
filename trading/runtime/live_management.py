@@ -89,6 +89,29 @@ class LivePositionManager:
 
     def key(self,intent):return 'live:management-card:'+intent['intent_id']
 
+    @staticmethod
+    def _track_target_reversal(card, *, target, distance, current_r, initial_risk, now):
+        """Remember a sampled approach and a subsequent material giveback."""
+        approach=card.get('target_approach') or {}
+        if approach.get('target')!=target:
+            approach={}
+            card.pop('target_approach',None)
+        if distance<=0:
+            card.pop('target_approach',None)
+            return
+        atr=card.get('review_atr',0)
+        threshold=min(.25*initial_risk,.5*atr) if atr>0 else .25*initial_risk
+        if distance<=threshold and current_r>0 and not approach:
+            approach=dict(target=target,first_at=now,peak_r=current_r)
+        if not approach or approach.get('reversal'):
+            return
+        approach['peak_r']=max(approach['peak_r'],current_r)
+        giveback=approach['peak_r']-current_r
+        if distance>threshold and giveback>=max(.35,.25*approach['peak_r']):
+            approach['reversal']=dict(target=target,at=now,peak_r=approach['peak_r'],
+                observed_r=current_r,giveback_r=giveback)
+        card['target_approach']=approach
+
     def observe(self,intent):
         """Sample quote excursions; never present sampled values as tick-exact MAE/MFE."""
         r=self.runner;row=r.executor.state(intent['intent_id'])
@@ -97,11 +120,21 @@ class LivePositionManager:
         entry=row['entry_fill_price'];initial_stop=row['proposal']['stop_loss']['price']
         initial_risk=abs(entry-initial_stop)
         if initial_risk<=0:return
-        current=(quote.bid1-entry if row['proposal']['side']=='long' else entry-quote.ask1)/initial_risk
+        long=row['proposal']['side']=='long'
+        current=(quote.bid1-entry if long else entry-quote.ask1)/initial_risk
+        opening=(row['proposal'].get('metadata') or {}).get('runner_id','baseline-v1')
+        active=management_runner(opening,r._control().get('runner_id'))
+        now=time.time()
         with r.store.lock:
             card=r.store.get(self.key(row),{})
             card.update(current_r=current,mfe_r=max(0,current,card.get('mfe_r',0)),
-                mae_r=min(0,current,card.get('mae_r',0)),sampled_at=time.time(),excursion_source='sampled executable quotes, not tick-exact')
+                mae_r=min(0,current,card.get('mae_r',0)),sampled_at=now,excursion_source='sampled executable quotes, not tick-exact')
+            if active=='runner3':
+                _,target=r.executor.protection_levels(row)
+                fair=quote.raw['fairPrice']
+                distance=target-max(quote.ask1,fair) if long else min(quote.bid1,fair)-target
+                self._track_target_reversal(card,target=target,distance=distance,current_r=current,
+                                            initial_risk=initial_risk,now=now)
             r.store.put(self.key(row),card)
         return quote
 
@@ -160,14 +193,23 @@ class LivePositionManager:
         revision=intent.get('management_revision',0)
         retry_due=(retry.get('revision')==revision and retry.get('control_revision')==control.get('updated_at')
                    and retry.get('at',0)<=now<retry.get('expires_at',0))
-        # No reason to download three histories again before either trigger can change.
+        reversal=None
+        if runner_id=='runner3' and observed_quote is not None:
+            reversal=(card.get('target_approach') or {}).get('reversal')
+            if reversal and (reversal['target']!=target or (
+                    card.get('last_target_reversal')==reversal['at']
+                    and not (retry_due and previous.get('target_reversal')==reversal))):
+                reversal=None
+        # No reason to download three histories again before a trigger can change.
         if (previous.get('management_runner',opening_runner)==runner_id and previous.get('timeframe')==timeframe and previous.get('favorable_r_milestone')==milestone
-                and now<previous.get('closed_at',0)+TIMEFRAME_SECONDS[timeframe] and not retry_due and not near_target and not horizon_due):return
+                and now<previous.get('closed_at',0)+TIMEFRAME_SECONDS[timeframe] and not retry_due and not near_target and not horizon_due and not reversal):return
         bundle=build_bundle(r.public,symbol)
         market=bundle.to_context(ict=True) if runner2 else bundle.to_context()
         view=next((v for v in market['timeframes'] if v['timeframe']==timeframe),None)
         if view is None:raise ValueError('management entry timeframe evidence missing')
         event=dict(timeframe=timeframe,closed_at=view['closed_at'],favorable_r_milestone=milestone)
+        if reversal:
+            event['target_reversal']=reversal
         if runner_id!=opening_runner:
             event['management_runner']=runner_id
         if horizon_due or (retry_due and due_at is not None and previous.get('horizon_due')==due_at):
@@ -193,6 +235,8 @@ class LivePositionManager:
                     current['last_near_target']=target
             if horizon_due:
                 current['last_horizon_due']=due_at
+            if reversal:
+                current['last_target_reversal']=reversal['at']
             current.pop('provider_retry',None)
             r.store.put(key,current)
             card=current
@@ -215,6 +259,15 @@ class LivePositionManager:
             position_card['trade_horizon']=horizon
             position_card['target_extension_available']=bool(near_target and not intent.get('target_extensions'))
         quote=r.quote(symbol);rules=r.public.get_contract_rules(symbol)
+        if runner_id=='runner3':
+            fee=r.executor.fee
+            slip=r.executor.slip
+            entry=intent['entry_fill_price']
+            # Round-trip fee/slippage estimate on the remaining quantity.
+            # Funding and partial realized PnL are separate.
+            break_even=(entry*(1+fee)/((1-fee)*(1-slip)) if long
+                        else entry*(1-fee)/((1+fee)*(1+slip)))
+            position_card['estimated_break_even_exit_trigger']=break_even
         if runner2:
             from trading.analysis.market import benchmark_context, trade_flow_context
             market['benchmarks']=benchmark_context(r.public,market)
@@ -226,6 +279,7 @@ class LivePositionManager:
         llm=r.management_llm()
         trace=dict(id=uuid4().hex,started_at=now,symbol=symbol,strategy='position_management',mode='LIVE',
             runner_id=runner_id,opening_runner_id=opening_runner,
+            management_trigger='target_reversal' if reversal else 'near_target' if near_target else 'scheduled_or_structure',
             analysis_version=variant,status='pending',attempts=[],prompt_bytes=len(prompt.encode()),input_fingerprint=digest(prompt))
         def archive(update=None):
             if update:trace.update(copy.deepcopy(update))
@@ -280,7 +334,11 @@ class LivePositionManager:
             if runner_id=='runner3':
                 policy+=(' Runner 3 manages the supplied existing position without re-sizing the entry. '
                          'Compare the remaining net payoff, current structural evidence and open portfolio stop risk. '
-                         'The daily objective is reporting context. Do not increase exposure or loosen protection.')
+                         'The daily objective is reporting context. Do not increase exposure or loosen protection. '
+                         'target_reversal is a sampled approach then material giveback. Reassess the current quote and closed '
+                         'structure before deciding. Consider tightening behind a valid closed wick, including profitable '
+                         'territory where executable and estimated costs allow, or reduce/close if the thesis failed. '
+                         'Do not extend TP solely on the basis of a previous approach. A sampled reversal alone is not an order.')
             raw=llm.complete_json(system=policy,user=prompt,max_tokens=850,images=paths or None)
             trace.update(copy.deepcopy(getattr(llm,'last_trace',{})))
             trace.update(completed_at=time.time(),provider=getattr(llm,'last_provider','none'),model=getattr(llm,'last_model',''),

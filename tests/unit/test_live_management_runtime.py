@@ -348,3 +348,53 @@ def test_target_extension_follows_current_runner_even_for_legacy_opening(tmp_pat
     with pytest.raises(LiveExecutionError,match='management_runner_changed'):
         executor.manage_position(row['intent_id'],data,expected_revision=1,decision_id='stale',guard=lambda:True)
     assert len(private.modifies)==1
+
+
+def test_runner3_latches_target_reversal_during_cooldown_and_reviews_once(tmp_path,monkeypatch):
+    runner,private,executor,control,llm,market,row=prepare(tmp_path,monkeypatch)
+    row['proposal']['metadata'].update(runner_id='runner2',analysis_version='text')
+    executor._save(row)
+    control.update(runner_id='runner3')
+    quote=runner.public.get_ticker('BTC_USDT')
+    runner.public.get_ticker=lambda _:quote
+    for view in market['timeframes']:
+        view['closed_at']=int(time())-1
+    runner.manage_positions()
+    assert len(llm.calls)==1
+    target=row['proposal']['take_profit_price']
+
+    def set_price(price):
+        quote.bid1=price-.01
+        quote.ask1=price
+        quote.raw.update(fairPrice=price,timestamp=time()*1000)
+        runner.position_manager.observe(row)
+
+    set_price(target-.1)
+    set_price(target-1.1)
+    runner.manage_positions()
+    assert len(llm.calls)==1  # The quote observer records during AI cooldown.
+    allow_next(runner,row)
+    runner.manage_positions()
+    data,_=llm.calls[-1]
+    assert len(llm.calls)==2
+    assert data['event']['target_reversal']['giveback_r']==pytest.approx(.5)
+    assert not data['position']['target_extension_available']
+    assert data['position']['estimated_break_even_exit_trigger']>row['entry_fill_price']
+    assert runner.store.get('management_trace')['management_trigger']=='target_reversal'
+    allow_next(runner,row)
+    runner.manage_positions()
+    assert len(llm.calls)==2
+    assert not private.modifies and not private.closes
+
+
+def test_target_reversal_ignores_small_giveback_and_resets_when_target_changes():
+    from trading.runtime.live_management import LivePositionManager
+    track=LivePositionManager._track_target_reversal
+    card={}
+    track(card,target=95,distance=.1,current_r=2,initial_risk=2,now=1)
+    track(card,target=95,distance=.6,current_r=1.8,initial_risk=2,now=2)
+    assert 'reversal' not in card['target_approach']
+    track(card,target=95,distance=1.2,current_r=1.4,initial_risk=2,now=3)
+    assert card['target_approach']['reversal']['at']==3
+    track(card,target=93,distance=3,current_r=1.4,initial_risk=2,now=4)
+    assert 'target_approach' not in card
