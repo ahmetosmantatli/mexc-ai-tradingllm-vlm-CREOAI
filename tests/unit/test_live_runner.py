@@ -336,8 +336,8 @@ def test_dynamic_zero_capacity_blocks_provider_work_without_consuming_candidate(
     assert runner.monitor()['entry_status']['reason']=='HOLD_LIVE_AI_CAPACITY'
 
 
-def test_runner3_evidence_bonus_changes_sizing_only_without_same_side_exposure(tmp_path, monkeypatch):
-    runner, _, _, control = prepare(tmp_path)
+def test_runner3_small_account_sizes_immediately_without_same_side_exposure(tmp_path):
+    runner, private, _, control = prepare(tmp_path)
     runner.cfg.live_price_plan_enabled = True
     control['runner_id'] = 'runner3'
     signal = candidate()
@@ -354,17 +354,15 @@ def test_runner3_evidence_bonus_changes_sizing_only_without_same_side_exposure(t
                         reason='Closed wick and structural target.'),
         price_evidence={'15m': [[stamp, 100, 106, 98, 101, 1]]},
     )
+    private.equity, private.available = 50., 50.
     snapshot = runner._refresh([signal.symbol])
-    segment = ('trend_continuation', 'intraday', 'bullish', runner.cfg.analysis_version)
-    monkeypatch.setattr('trading.runtime.runner3_policy.evidence_risk_groups',
-                        lambda *args: {segment: {'eligible': True}})
     boosted = runner._final_proposal(signal, decision, snapshot, control)
     assert boosted.metadata['runner3_allocation']['risk_boost_applied']
     assert boosted.metadata['sizing_plan']['risk_per_trade_pct'] == .006
-    assert boosted.max_loss_if_stopped == pytest.approx(1.5)
+    assert boosted.max_loss_if_stopped == pytest.approx(.5)
     snapshot['positions'] = [{'side': 1}]
     baseline = runner._final_proposal(signal, decision, snapshot, control)
     assert not baseline.metadata['runner3_allocation']['risk_boost_applied']
-    assert baseline.max_loss_if_stopped == pytest.approx(1.2)
+    assert baseline.max_loss_if_stopped == pytest.approx(.3)
     assert baseline.notional < boosted.notional
     assert baseline.stop_loss == boosted.stop_loss

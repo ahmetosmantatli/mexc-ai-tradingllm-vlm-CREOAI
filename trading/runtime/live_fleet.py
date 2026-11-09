@@ -502,8 +502,8 @@ class LiveFleet:
                     text+=(f"Model riski: {allocation['model_risk_fraction']:.2%} | "
                            f"Uygulanan stop bütçesi: {allocation['effective_risk_fraction']:.2%} | "
                            f"İzin verilen tavan: {allocation['risk_ceiling']:.2%}\n")
-                    if allocation.get('risk_boost_applied'):
-                        text+='Güçlü kanıt için geçmiş sonuçlara dayalı sınırlı artış uygulandı.\n'
+                    if allocation.get('risk_boost_applied') and allocation.get('small_account_policy'):
+                        text+='100 USDT altı kasa politikası stop bütçesini profil sınırı içinde yükseltti.\n'
             entry_timeframe=(metadata.get('price_plan') or {}).get('entry_timeframe')
             if entry_timeframe in ('5m','15m','4h'):
                 text+=f"Giriş zaman dilimi: {entry_timeframe}\n"

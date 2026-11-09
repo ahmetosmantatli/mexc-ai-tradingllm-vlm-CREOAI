@@ -61,12 +61,17 @@ def performance(traces,intents):
     for (runner,cohort,variant),(reviews,rows) in sorted(groups.items()):
         horizons=defaultdict(list)
         grades=defaultdict(list)
+        segments=defaultdict(list)
         for row in rows:
             metadata=row.get('proposal',{}).get('metadata') or {}
             horizons[(metadata.get('trade_horizon') or {}).get('style') or 'unknown'].append(row)
             grade=(metadata.get('runner3_allocation') or {}).get('grade')
             if grade:
                 grades[grade].append(row)
+                allocation=metadata['runner3_allocation']
+                segment=(metadata.get('setup_family'), allocation.get('horizon'), allocation.get('macro_trend'), grade)
+                if all(segment):
+                    segments[segment].append(row)
         attempts=[a for t in reviews for a in t.get('attempts',[]) if a.get('generation_requests',0)]
         provider_calls=sum(a['generation_requests'] for a in attempts)
         tokens=[(a.get('input_tokens'),a.get('output_tokens')) for a in attempts]
@@ -82,7 +87,9 @@ def performance(traces,intents):
             cost_samples=len(costs),known_estimated_ai_cost_usd=sum(costs) if costs else None,
             mean_generation_latency_ms=mean([a['latency_ms'] for a in attempts if _number(a.get('latency_ms'))]),
             **fills(rows),by_opening_horizon={h:fills(batch) for h,batch in sorted(horizons.items())},
-            by_evidence_grade={grade:fills(batch) for grade,batch in sorted(grades.items())}))
+            by_evidence_grade={grade:fills(batch) for grade,batch in sorted(grades.items())},
+            by_evidence_segment=[dict(setup_family=family,horizon=horizon,macro_trend=trend,grade=grade,**fills(batch))
+                                 for (family,horizon,trend,grade),batch in sorted(segments.items())]))
     return result
 
 
@@ -110,8 +117,7 @@ def audit(path,*,since=0,now=None,include_performance=False):
         account=next((json.loads(value) for value, in db.execute("SELECT value FROM state WHERE key LIKE 'account:%:live_snapshot'")),{})
         binding=account.get('binding_id')
         intents=[json.loads(value) for value, in db.execute("SELECT value FROM state WHERE key LIKE 'live:intent:%'")]
-        bound_intents=[row for row in intents if not binding or row.get('binding_id')==binding]
-        intents=[row for row in bound_intents if row.get('staged_at',0)>=since]
+        intents=[row for row in intents if row.get('staged_at',0)>=since and (not binding or row.get('binding_id')==binding)]
         errors=[json.loads(value) for value, in db.execute("SELECT value FROM state WHERE key LIKE 'live_candidate_error:%'")]
         errors=[row for row in errors if row.get('at',0)>=since]
         detail=[]
@@ -130,12 +136,7 @@ def audit(path,*,since=0,now=None,include_performance=False):
             halt=bool(state('live:halt')),last_entry_reason=state('live_entry_status',{}).get('reason'),
             limitations='Persisted records only, not a fresh exchange check. Entry attempt record is not proof of a POST/fill. Old unfinalized traces cannot establish a rejection reason.')
         if include_performance:
-            from trading.runtime.runner3_policy import evidence_risk_groups
             report['performance']=performance(traces,intents)
-            report['runner3_evidence_risk']=[
-                dict(setup_family=family, horizon=horizon, macro_trend=trend, variant=variant, **comparison)
-                for (family,horizon,trend,variant), comparison in sorted(evidence_risk_groups(bound_intents,now).items())
-            ]
         return report
     finally:db.close()
 

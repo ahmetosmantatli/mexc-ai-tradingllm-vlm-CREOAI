@@ -219,7 +219,9 @@ class ContextEvaluator:
                 allocation=runner3_policy.margin_policy(balance,equity,live_account['available_usdt'],
                     grade,option['horizon'])
                 ceiling=risk_per_trade_pct*(.5 if option['family']=='countertrend_sweep_reclaim' else 1)
-                option['allocation']=dict(allocation,suggested_risk_fraction=ceiling*(.8 if grade=='strong' else .5))
+                target_risk=runner3_policy.small_account_risk_target(balance,ceiling,grade)
+                option['allocation']=dict(allocation,
+                    suggested_risk_fraction=target_risk if target_risk is not None else ceiling*(.8 if grade=='strong' else .5))
         account['setup_selection']=dict(enabled=selection_enabled,options=options,
             countertrend_max_risk_fraction=risk_per_trade_pct*.5,
             note='Select setup_id and provide a fresh grounded price_plan for TRADE. No hypothesis means no forced trade.')

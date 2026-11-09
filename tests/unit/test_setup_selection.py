@@ -198,4 +198,4 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
         row=executor.intents()[0]
         assert row['entry_submitted_type']==3
         assert row['proposal']['metadata']['runner3_allocation']['equity_usdt']==11
-        assert row['proposal']['metadata']['strategy_cohort']=='runner3-evidence-allocation-v1'
+        assert row['proposal']['metadata']['strategy_cohort']=='runner3-small-account-v2'

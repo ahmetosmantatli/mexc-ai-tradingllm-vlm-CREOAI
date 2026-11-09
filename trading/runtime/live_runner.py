@@ -86,7 +86,10 @@ class LiveRunner:
         requested=control.get('risk_per_trade_pct',self.cfg.risk_per_trade_pct)
         if isinstance(requested,bool) or not isinstance(requested,(int,float)) or not isfinite(requested) or requested<=0:
             raise ValueError('invalid live risk')
-        return min(requested,self.cfg.risk_per_trade_pct,self.risk.preset.risk_per_trade_pct)
+        limit = min(requested, self.cfg.risk_per_trade_pct, self.risk.preset.risk_per_trade_pct)
+        if control.get('runner_id') == 'runner3':
+            limit = min(limit, self.cfg.abs_max_loss_pct, self.risk.preset.abs_max_loss_pct)
+        return limit
 
     def _leverage_cap(self,control,exchange_cap=None):
         if self.cfg.live_leverage_mode=='exchange':
@@ -365,20 +368,18 @@ class LiveRunner:
             grade = runner3_policy.evidence_grade(setup)
             model_fraction = proposal.metadata['risk_per_trade_pct']
             ceiling = self._risk_fraction(control) * (.5 if setup['family'] == 'countertrend_sweep_reclaim' else 1.)
-            segment = (setup['family'], setup['horizon'], setup['macro_trend'], self.cfg.analysis_version)
-            comparison = None
-            if grade == 'strong' and model_fraction < ceiling:
-                comparison = runner3_policy.evidence_risk_groups(self._intents(), time.time()).get(segment)
-            effective = runner3_policy.evidence_risk_budget(model_fraction, ceiling, grade=grade,
-                comparison=comparison, same_side_open=any(row['side'] == side for row in snapshot['positions']))
+            target_risk = runner3_policy.small_account_risk_target(snapshot['balance']['equity'], ceiling, grade)
+            effective = model_fraction
+            if target_risk is not None and not any(row['side'] == side for row in snapshot['positions']):
+                effective = max(model_fraction, target_risk)
             if effective > model_fraction:
                 multiplier = effective / model_fraction
                 proposal.max_loss_if_stopped *= multiplier
                 proposal.notional *= multiplier
                 proposal.metadata['risk_per_trade_pct'] = effective
             risk_adjustment = dict(macro_trend=setup['macro_trend'], model_risk_fraction=model_fraction,
-                effective_risk_fraction=effective, risk_ceiling=ceiling, risk_boost_applied=effective > model_fraction,
-                risk_comparison=comparison)
+                effective_risk_fraction=effective, risk_ceiling=ceiling,
+                risk_boost_applied=effective > model_fraction, small_account_policy=target_risk is not None)
         limits=dict(model_stop_budget=proposal.notional,stop_budget_with_costs=proposal.max_loss_if_stopped/loss_fraction,
                     available_margin=snapshot['balance']['available']/margin_rate*.95)
         if runner_id=='runner3':

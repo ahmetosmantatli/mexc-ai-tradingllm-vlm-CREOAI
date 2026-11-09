@@ -5,15 +5,15 @@ from trading.quant.structure_setups import build_structure_setups
 from .test_structure_setups import context,view
 
 
-def test_small_equity_remains_eligible_and_grade_expands_only_margin_ceiling():
+def test_small_equity_uses_majority_margin_target_with_portfolio_reserve():
     strong=margin_policy(11,11,11,'strong','intraday')
     standard=margin_policy(11,11,11,'standard','intraday')
-    assert strong['target_margin_usdt']==pytest.approx(3.85)
-    assert standard['target_margin_usdt']==pytest.approx(2.2)
+    assert strong['target_margin_usdt']==pytest.approx(7.7)
+    assert standard['target_margin_usdt']==pytest.approx(6.05)
     assert margin_policy(100,100,100,'strong','intraday')['margin_fraction']==.2
-    assert margin_policy(99.99,99.99,99.99,'strong','intraday')['margin_fraction']==pytest.approx(.2,abs=.0001)
+    assert margin_policy(99.99,99.99,99.99,'strong','intraday')['margin_fraction']==.70
     assert margin_policy(11,11,1,'strong','intraday')['max_entry_cost_usdt']==0
-    assert margin_policy(11,11,11,'strong','swing')['margin_fraction']==.25
+    assert margin_policy(11,11,11,'strong','swing')['margin_fraction']==.60
 
 
 def test_runner3_economics_rejects_small_payoff_and_expensive_entry():
@@ -88,38 +88,13 @@ def test_quantity_rejection_preserves_exchange_constraints_for_audit():
     assert detail['contracts'] == {'quantity': 1., 'minimum': 2., 'maximum': 100., 'step': 1.}
 
 
-def test_evidence_risk_requires_repeatable_net_results_and_limits_the_bonus():
-    from trading.runtime.runner3_policy import COHORT, evidence_risk_budget, evidence_risk_groups
+def test_small_account_stop_budget_applies_immediately_below_threshold():
+    from trading.runtime.runner3_policy import small_account_risk_target
 
-    now = 1800000000.
-    rows = []
-    segment = ('trend_continuation', 'intraday', 'bearish', 'text')
-    for age in (10, 40):
-        for grade, pnl in [('strong', .2), ('standard', .1)]:
-            for i in range(10):
-                rows.append(dict(status='closed', realized_complete=True, entry_fill_price=100.,
-                    closed_at=(now-age*86400-i)*1000, net_pnl=pnl,
-                    entry_metrics={'initial_stop_risk_usdt': .2},
-                    proposal={'metadata': dict(runner_id='runner3', strategy_cohort=COHORT,
-                        setup_family=segment[0], analysis_version='text',
-                        runner3_allocation=dict(grade=grade, horizon='intraday', macro_trend='bearish'))}))
-    comparison = evidence_risk_groups(rows, now)[segment]
-    assert comparison['eligible']
-    assert comparison['prior_30_days']['strong_mean_net_r'] == pytest.approx(1.)
-    assert comparison['recent_30_days']['standard_mean_net_r'] == pytest.approx(.5)
-    assert not evidence_risk_groups(rows[:-1], now)[segment]['eligible']
-    rows[-1]['proposal']['metadata']['runner3_allocation']['risk_boost_applied'] = True
-    assert not evidence_risk_groups(rows, now)[segment]['eligible']
-
-    def budget(model=.015, ceiling=.03, grade='strong', same_side=False):
-        return evidence_risk_budget(model, ceiling, grade=grade, comparison=comparison, same_side_open=same_side)
-
-    assert budget() == pytest.approx(.0175)
-    assert budget(model=.004) == pytest.approx(.005)
-    assert budget(ceiling=.016) == pytest.approx(.016)
-    assert budget(grade='standard') == .015
-    assert budget(same_side=True) == .015
-    assert evidence_risk_budget(.015, .03, grade='strong', comparison=None, same_side_open=False) == .015
+    assert small_account_risk_target(9.45, .03, 'strong') == .03
+    assert small_account_risk_target(9.45, .03, 'standard') == pytest.approx(.024)
+    assert small_account_risk_target(99.99, .015, 'strong') == .015
+    assert small_account_risk_target(100., .03, 'strong') is None
 
 
 def test_price_drift_diagnostics_capture_stage_and_signed_move():
