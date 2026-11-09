@@ -53,12 +53,14 @@ def _verify_protected_positions(store, control_store, client, account_id, pendin
     return active
 
 
-def acknowledge(store,control_store,client,account_id,*,allow_protected_positions=False):
+def acknowledge(store,control_store,client,account_id,*,allow_protected_positions=False,expected_intent_id=None):
     def paused():
         control=control_store.get(f'account:{account_id}:control',{})
         return control.get('stopped') is True and control.get('enabled') is False
     if not paused():raise ValueError('telegram_stop_required')
     halt=store.get('live:halt',{})
+    if expected_intent_id is not None and halt.get('intent_id')!=expected_intent_id:
+        raise ValueError('halt_changed')
     if not halt:return dict(status='no_halt',trading_started=False,writes_enabled=False)
     if halt.get('reason')!='emergency_close_requires_review' or halt.get('requires_review') is not True:
         raise ValueError('different_halt_requires_investigation')

@@ -329,3 +329,21 @@ def test_profit_side_stop_reduces_open_risk_and_does_not_trigger_false_emergency
     assert changed['planned_loss']<row['planned_loss']
     assert executor.reconcile(row['intent_id'])['status']=='protected'
     assert not private.closes
+
+
+@pytest.mark.parametrize('short',[False,True])
+def test_confirmed_ioc_stop_can_cross_entry_without_emergency_close(tmp_path,short):
+    executor,private,store,row=prepared(tmp_path,short=short)
+    row=runner2_owned(executor,row)
+    row.update(entry_submitted_type=3,entry_exchange_type=3,entry_limit_price=100.,
+               entry_protection_schema='mexc_create_ioc_attached_v1')
+    executor._save(row)
+    private.order_row['orderType']=3
+    private.stops[0].update(orderId=int(row['exchange_order_id']))
+    price=98. if short else 102.
+    executor.public.get_ticker=lambda symbol:SimpleNamespace(
+        bid1=price-.01,ask1=price,raw={'timestamp':time()*1000,'fairPrice':price})
+    changed=manage(executor,row,decision(stop_price=99. if short else 101.))
+    assert changed['management_events'][-1]['status']=='confirmed'
+    assert executor.reconcile(row['intent_id'])['status']=='protected'
+    assert not private.closes and not store.get('live:halt')

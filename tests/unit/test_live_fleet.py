@@ -305,3 +305,32 @@ def test_three_slow_jobs_do_not_starve_next_monitor_cycle(tmp_path):
         assert runner.calls.count('monitor')==2
     finally:
         release.set();f.stop()
+
+
+@pytest.mark.parametrize('blocked',[False,True])
+def test_telegram_halt_review_checks_exchange_and_keeps_manual_start(tmp_path,monkeypatch,blocked):
+    f=fleet(tmp_path)
+    try:
+        ident='a'
+        runner=f.runners[ident]
+        runner.binding_id=f.control_store.get('account:a:live_binding')
+        intent='a'*32
+        runner.store.put('live:halt',dict(intent_id=intent,requires_review=True,reason='emergency_close_requires_review'))
+        runner.store.put('live:intent:'+intent,dict(status='closed',realized_complete=True,close_reason='EMERGENCY',entry_write_attempted=True))
+        client=SimpleNamespace(open_positions=lambda:[],current_orders=lambda **kw:[{}] if blocked else [],
+                               protection_orders=lambda **kw:[],close=lambda:None)
+        def readonly(key,secret,*,writes_enabled):
+            assert writes_enabled is False
+            return client
+        monkeypatch.setattr('trading.exchange.mexc_private.MexcPrivateClient',readonly)
+        f.controller.set_control(ident,enabled=False,stopped=True)
+        f.control_store.put('account:a:commands',[dict(id='test',intent_id=intent,kind='review_halt',status='pending',
+            control_revision=f.controller.control(ident)['updated_at'])])
+        f.execute_commands(f.accounts[0])
+        assert bool(runner.store.get('live:halt')) is blocked
+        assert f.control_store.get('account:a:commands')[0]['status']==('failed' if blocked else 'done')
+        assert not f.controller.control(ident)['enabled']
+        expected_message='Yeni giriş engeli korunuyor' if blocked else 'Başlat düğmesine bas'
+        assert expected_message in f.controller.messages[-1][0][1]
+    finally:
+        f.stop()

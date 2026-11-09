@@ -18,6 +18,16 @@ from trading.exchange.errors import ConnectionIssue
 from trading.runtime.store import RuntimeStore
 
 
+EMERGENCY_REASONS={
+    'ioc_fill_outside_entry_plan':'Dolum, giriş planı kontrolünden geçmedi.',
+    'native_protection_not_confirmed':'Borsadaki SL/TP koruması doğrulanamadı.',
+    'filled_position_risk_exceeds_plan':'Gerçek dolum sonrası risk/likidasyon kontrolü geçmedi.',
+    'management_target_protection_failed':'Hedef revizyonu sonrası borsa koruması doğrulanamadı.',
+    'management_stop_protection_failed':'Stop revizyonu sonrası borsa koruması doğrulanamadı.',
+    'management_remaining_protection_failed':'Kısmi kapanış sonrası kalan pozisyonun koruması doğrulanamadı.',
+}
+
+
 class LiveFleet:
     def __init__(self, cfg, *, accounts=None, controller_factory=None, runner_factory=None,
                  private_factory=None, public_factory=None, llm_factory=None, executor_factory=None):
@@ -264,6 +274,40 @@ class LiveFleet:
         self.controller.enqueue(ident,'CANLI hesap limiti seçildi. Analiz sürümü ve trader ayarlarını seçip Başlat ile onayla.',
             event_id='live-capital:'+command['id'],buttons=True)
 
+    def review_halt(self,ident,command):
+        from trading.control.live_rearm import acknowledge
+        from trading.exchange.mexc_private import MexcPrivateClient
+
+        runner=self.runners.get(ident)
+        control=self.controller.control(ident)
+        if (ident not in self.allowed or runner is None or control.get('enabled')
+                or not control.get('stopped') or control.get('updated_at')!=command.get('control_revision')):
+            raise ConnectionIssue('Hesap veya ayarlar değişti. Durum ekranından kontrolü yeniden başlat.')
+        credentials=self.vault.get(ident)
+        if not credentials or self.control_store.get(f'account:{ident}:live_binding')!=runner.binding_id:
+            raise ConnectionIssue('MEXC hesap bağlantısı doğrulanamadı. Yeni giriş engeli korunuyor.')
+        client=MexcPrivateClient(credentials.api_key,credentials.api_secret,writes_enabled=False)
+        try:
+            result=acknowledge(runner.store,self.control_store,client,ident,allow_protected_positions=True,
+                               expected_intent_id=command['intent_id'])
+        except ValueError as exc:
+            labels={
+                'halt_changed':'Acil kapanış kaydı değişti.',
+                'emergency_close_not_final':'MEXC kapanış sonucu henüz kesinleşmedi.',
+                'unresolved_intent':'Sonuçlanmamış emir veya işlem kaydı var.',
+                'exchange_orders_present':'MEXC’de bekleyen emir var.',
+                'exchange_positions_not_owned':'MEXC’de yerel kayıtla eşleşmeyen pozisyon var.',
+                'protected_position_not_verified':'Açık pozisyonun borsa koruması doğrulanamadı.',
+            }
+            raise ConnectionIssue(labels.get(str(exc),'MEXC uzlaştırma kontrolü geçmedi.')
+                                  +' Yeni giriş engeli korunuyor.') from None
+        finally:
+            client.close()
+        self.controller.enqueue(ident,
+            f"MEXC kontrolü tamamlandı. Doğrulanmış korumalı açık pozisyon: {result['verified_protected_positions']}. "
+            "Giriş engeli kaldırıldı. Canlı arayışı tekrar başlatmak için Başlat düğmesine bas.",
+            event_id='live-review-halt:'+command['id'],buttons=True)
+
     def execute_commands(self, account):
         ident=account.account_id
         key=f'account:{ident}:commands'
@@ -274,6 +318,8 @@ class LiveFleet:
             try:
                 if command.get('kind')=='capital_reset':
                     self.apply_capital(account,command)
+                elif command.get('kind')=='review_halt':
+                    self.review_halt(ident,command)
                 elif command.get('kind')=='close':
                     runner=self.runners.get(ident)
                     if runner is None or not callable(getattr(runner,'request_close',None)):
@@ -285,7 +331,7 @@ class LiveFleet:
             except Exception as exc:
                 command['status']='failed'
                 self.controller.set_control(ident,enabled=False,capital_pending=None)
-                self.controller.enqueue(ident,str(exc) if isinstance(exc,ConnectionIssue) else 'Canlı komut doğrulanamadı; yeni girişler durduruldu.',event_id='live-command:'+command['id'])
+                self.controller.enqueue(ident,str(exc) if isinstance(exc,ConnectionIssue) else 'Canlı komut doğrulanamadı; yeni girişler durduruldu.',event_id='live-command:'+command['id'],buttons=command.get('kind')=='review_halt')
             self.control_store.put(key,commands)
 
     def publish(self, account):
@@ -319,9 +365,16 @@ class LiveFleet:
         publish_activity(self.controller,self.control_store,ident,snapshot,self.cfg,now)
         executor=getattr(runner,'executor',None)
         if executor is not None and callable(getattr(executor,'intents',None)):
+            halt=snapshot.get('live_halt') or {}
             for row in executor.intents():
                 self._publish_intent(ident,row)
                 self._publish_management(ident,row)
+                if halt.get('requires_review') is True and halt.get('intent_id')==row.get('intent_id'):
+                    self.controller.enqueue(ident,
+                        f"CANLI | {row['proposal']['symbol']} | Yeni girişler durduruldu.\n"
+                        +EMERGENCY_REASONS.get(row.get('halt_reason'),'Acil kapanış teknik kontrol gerektiriyor.')
+                        +"\nMEXC durumunu aşağıdaki düğmeyle kontrol et. Yeniden Başlat kararı sende.",
+                        event_id=f"live-halt-review:{row['binding_id']}:{row['intent_id']}",buttons=True)
         return snapshot
 
     def _publish_intent(self, ident, row):
@@ -378,9 +431,7 @@ class LiveFleet:
         if state=='closed':
             text+=f"Kapanış nedeni: {row.get('close_reason','borsa kaydı')}\n"
             if row.get('close_reason')=='EMERGENCY':
-                reasons={'native_protection_not_confirmed':'Borsadaki SL/TP koruması doğrulanamadı.',
-                    'filled_position_risk_exceeds_plan':'Gerçek dolum sonrası risk/likidasyon kontrolü geçmedi.'}
-                text+=reasons.get(row.get('halt_reason'),'Acil kapanışın teknik ayrıntıları denetim kaydında.')+'\n'
+                text+=EMERGENCY_REASONS.get(row.get('halt_reason'),'Acil kapanışın teknik ayrıntıları denetim kaydında.')+'\n'
                 text+='Acil kapanış sonrası yeni giriş engeli kaldırılmaz; teknik inceleme gerekir.\n'
             if row.get('realized_complete') is True and isinstance(row.get('net_pnl'),(int,float)):
                 text+=f"MEXC net sonuç: {row['net_pnl']:+.4f} USDT\n"

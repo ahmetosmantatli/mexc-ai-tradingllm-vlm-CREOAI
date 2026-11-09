@@ -480,7 +480,10 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             self._save(row)
             fill_price=row['entry_fill_price']
             if ioc:
-                stop,target=self.protection_levels(row)
+                # Validate the immutable opening plan. A confirmed trailing
+                # stop may cross the fill and is checked as current protection.
+                stop=row['proposal']['stop_loss']['price']
+                target=row['proposal']['take_profit_price']
                 limit=row['entry_limit_price']
                 long=row['proposal']['side']=='long'
                 if not (stop<fill_price<target and fill_price<=limit if long

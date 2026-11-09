@@ -92,3 +92,10 @@ def test_protected_review_rejects_incomplete_ownership_or_protection(tmp_path,fa
         acknowledge(store,control,client,'friend',allow_protected_positions=True)
     assert store.get('live:halt')
     assert not client.closes
+
+
+def test_review_button_cannot_clear_a_different_emergency():
+    store,control,client=setup()
+    with pytest.raises(ValueError,match='halt_changed'):
+        acknowledge(store,control,client,'friend',expected_intent_id='stale')
+    assert store.get('live:halt')['intent_id']=='a'

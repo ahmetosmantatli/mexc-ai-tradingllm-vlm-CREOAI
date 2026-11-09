@@ -1,4 +1,5 @@
 """LIVE control presentation; never submits exchange orders in the poller."""
+import re
 import time
 from uuid import uuid4
 from trading.control.telegram import TelegramController,TRADER_MODES
@@ -41,6 +42,7 @@ class LiveTelegramController(TelegramController):
         state=self.control(account_id)
         snapshot=self.snapshot_provider(account_id) or {}
         grant=snapshot.get('automatic_grant') or {}
+        halt=snapshot.get('live_halt') or {}
         runners=self.runner_options(snapshot)
         expired=bool(grant.get('expires_at') and grant['expires_at']<=time.time())
         rows=[]
@@ -56,8 +58,15 @@ class LiveTelegramController(TelegramController):
         elif not state.get('profile_chosen'):
             rows.extend([[{'text':v['label'],'callback_data':'control:'+k}] for k,v in TRADER_MODES.items()])
         else:
-            rows.append([{'text':'✓ Canlı arayış açık' if state.get('enabled') and not expired else '▶ Canlı arayışı başlat',
-                          'callback_data':'control:status' if state.get('enabled') and not expired else 'control:start'}])
+            intent_id=halt.get('intent_id')
+            if halt.get('requires_review') is True and re.fullmatch(r'[0-9a-f]{32}',str(intent_id)):
+                rows.append([{'text':'Acil kapanışı incele ve engeli kontrol et',
+                              'callback_data':f'control:reviewhalt:{intent_id}'}])
+            elif halt:
+                rows.append([{'text':'Yeni girişler engelli','callback_data':'control:status'}])
+            else:
+                rows.append([{'text':'✓ Canlı arayış açık' if state.get('enabled') and not expired else '▶ Canlı arayışı başlat',
+                              'callback_data':'control:status' if state.get('enabled') and not expired else 'control:start'}])
             rows.append([{'text':'Yeni işlem arayışını durdur','callback_data':'control:pause'},
                          {'text':'Bot / AI durdur','callback_data':'control:stop'}])
             rows.append([{'text':'Ayarları değiştir','callback_data':'control:settings'}])
@@ -172,8 +181,11 @@ class LiveTelegramController(TelegramController):
         if snapshot.get('position_management_enabled'):
             text+='Açık pozisyon AI yönetimi etkin (olay bazlı).\n'
             if management:text+=f"Son yönetim: {management.get('symbol','?')} · {management.get('reason','henüz değerlendirme yok')}\n"
-        text+=('Yeni AI/işlem arayışı açık.\n' if state.get('enabled') and not state.get('stopped') else
-               'Yeni AI/işlem arayışı kapalı; açık pozisyon uzlaştırması sürer.\n')
+        if snapshot.get('live_halt') or snapshot.get('halt'):
+            text+='Yeni girişler teknik kontrol nedeniyle durduruldu; açık pozisyon uzlaştırması sürer.\n'
+        else:
+            text+=('Yeni AI/işlem arayışı açık.\n' if state.get('enabled') and not state.get('stopped') else
+                   'Yeni AI/işlem arayışı kapalı; açık pozisyon uzlaştırması sürer.\n')
         reason=snapshot.get('reason','')
         labels={'HOLD_LIVE_AI_CAPACITY':'AI kapasitesi/kota bekleniyor; yeni istek gönderilmiyor.', 'LIVE_RECONCILED':'Hesap ve işlemler borsayla uzlaştırıldı.', 'LIVE_PROTECTED':'Gerçek işlem açıldı; borsa SL/TP koruması doğrulandı.',
             'LIVE_PAUSED':'Yeni girişler kapalı; uzlaştırma devam ediyor.', 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER':'Kayıp/düşüş sınırı aşıldı; yeni giriş ve analiz bekliyor.', 'HOLD_LIVE_NO_FUNDS':'Kullanılabilir gerçek bakiye bekleniyor.', 'HOLD_LIVE_NO_CANDIDATE':'Güncel uygun aday bekleniyor.',
@@ -231,7 +243,27 @@ class LiveTelegramController(TelegramController):
         if command in ('capital_demo','capital_amount') or command.startswith('demo_amount:'):
             self.send(account_id,'Bu LIVE panelinde yalnız güncel MEXC kasası kullanılır.',buttons=True);return
         state=self.control(account_id)
-        runners=self.runner_options(self.snapshot_provider(account_id) or {})
+        snapshot=self.snapshot_provider(account_id) or {}
+        runners=self.runner_options(snapshot)
+        halt=snapshot.get('live_halt') or {}
+        if command.startswith('reviewhalt:'):
+            intent_id=command.split(':',1)[1]
+            if not self.linked(account_id) or not re.fullmatch(r'[0-9a-f]{32}',intent_id) or (
+                    halt.get('intent_id')!=intent_id or halt.get('requires_review') is not True):
+                self.send(account_id,'Bu acil kapanış bildirimi güncel değil. Durum ekranını yenile.',buttons=True)
+                return
+            key=f'account:{account_id}:commands'
+            queue=self.store.get(key,[])
+            if any(item.get('kind')=='review_halt' and item.get('intent_id')==intent_id
+                   and item.get('status')=='pending' for item in queue):
+                self.send(account_id,'MEXC kontrolü zaten sırada.')
+                return
+            paused=self.set_control(account_id,enabled=False,stopped=True)
+            queue.append(dict(id=uuid4().hex,kind='review_halt',intent_id=intent_id,status='pending',
+                              created_at=time.time(),control_revision=paused['updated_at']))
+            self.store.put(key,queue)
+            self.send(account_id,'MEXC kapanışı ve varsa açık pozisyonların koruması kontrol edilecek. Yeni girişler kapalı.',buttons=True)
+            return
         runner_pending=self.runner_selection_pending(state,runners)
         if command.startswith('runner:'):
             runner_id=command.split(':',1)[1]
@@ -241,6 +273,9 @@ class LiveTelegramController(TelegramController):
                              enabled=False,version_chosen=False,profile_chosen=False)
             text=self.settings_text(account_id)
         elif command in ('start','run'):
+            if halt:
+                self.send(account_id,'Yeni girişler teknik kontrol bekliyor. Durum ekranından acil kapanış kontrolünü aç.',buttons=True)
+                return
             if not (self.capital_ready(account_id) and not runner_pending and state.get('version_chosen') and state.get('profile_chosen')):
                 self.send(account_id,self.settings_text(account_id),buttons=True);return
             self.set_control(account_id,enabled=True,stopped=False)

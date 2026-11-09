@@ -131,3 +131,23 @@ def test_unavailable_runner2_blocks_start_and_offers_baseline_recovery(tmp_path)
     ctl._command('a','runner:baseline-v1')
     assert ctl.control('a')['runner_id']=='baseline-v1'
     assert ctl.control('a')['enabled'] is False
+
+
+def test_live_emergency_button_pauses_and_queues_exact_review_without_start(tmp_path):
+    intent='a'*32
+    snapshot={'live_halt':dict(intent_id=intent,requires_review=True)}
+    ctl,calls=setup(tmp_path,{'a':snapshot});ready(ctl)
+    assert ctl.keyboard('a')['inline_keyboard'][0][0]['callback_data']==f'control:reviewhalt:{intent}'
+    ctl._command('a','start')
+    assert not ctl.control('a')['enabled']
+    ctl._command('a','reviewhalt:'+'b'*32)
+    assert not ctl.store.get('account:a:commands')
+    ctl.set_control('a',enabled=True)
+    ctl._command('a','reviewhalt:'+intent)
+    ctl._command('a','reviewhalt:'+intent)
+    queue=ctl.store.get('account:a:commands')
+    assert len(queue)==1 and queue[0]['intent_id']==intent
+    assert ctl.control('a')['stopped'] and not ctl.control('a')['enabled']
+    snapshot.clear()
+    ctl._command('a','start')
+    assert ctl.control('a')['enabled']
