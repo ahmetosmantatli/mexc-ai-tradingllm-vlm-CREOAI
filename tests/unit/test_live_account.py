@@ -172,14 +172,22 @@ def test_requested_position_mode_requires_exact_integer(tmp_path,mode):
     assert preflight(reconciler,position_mode=mode).reasons==('UNKNOWN_REQUESTED_POSITION_MODE',)
 
 
-def test_risk_peak_observation_while_paused_is_not_lost_before_next_entry(tmp_path):
+def test_equity_high_water_is_not_kept_as_an_entry_latch(tmp_path):
     from trading.runtime.live_account import observe_risk_reference
     store=RuntimeStore(str(tmp_path/'risk'))
     start=1794080000
     observe_risk_reference(store,'binding',500,now=start)
     observe_risk_reference(store,'binding',600,now=start+1)
+    key='live:risk_reference:binding'
+    planted=store.get(key)
+    planted['peak']=600
+    store.put(key,planted)
     result=observe_risk_reference(store,'binding',510,now=start+2)
-    assert result['initial']==500 and result['peak']==600
-    assert result['drawdown_pct']==pytest.approx(.15)
+    assert result['initial']==500 and result['drawdown_pct']==0
+    assert result['daily_loss_pct']==0
+    assert 'peak' not in store.get(key)
     again=observe_risk_reference(RuntimeStore(str(tmp_path/'risk')),'binding',510,now=start+3)
-    assert again['peak']==600 and again['drawdown_pct']==pytest.approx(.15)
+    assert 'peak' not in store.get(key) and again['drawdown_pct']==0
+    lost=observe_risk_reference(store,'binding',400,now=start+4)
+    assert lost['daily_loss_pct']==pytest.approx(.2)
+    assert lost['drawdown_pct']==0 and 'peak' not in store.get(key)

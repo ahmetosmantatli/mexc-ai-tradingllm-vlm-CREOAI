@@ -118,17 +118,66 @@ def test_expired_live_start_grant_blocks_ai_before_provider_call(tmp_path):
     assert executor.entry_ready() is False
 
 
-def test_loss_circuit_breaker_blocks_model_but_monitor_keeps_reading(tmp_path):
-    from .test_live_runner import prepare
+def test_equity_drop_from_high_does_not_block_later_entry(tmp_path):
+    from .test_live_runner import prepare,result
     runner,private,executor,control=prepare(tmp_path)
     runner.monitor()
     private.equity=600.;runner.monitor()
-    private.equity=510.;runner.monitor()
-    runner.candidate_queue().refresh([candidate()])
-    runner._evaluate=lambda *a,**kw:(_ for _ in ()).throw(AssertionError('No AI after loss breaker'))
-    assert runner.cycle()['reason']=='HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
-    assert not executor.calls
+    private.equity=510.;private.available=400.
+    key='live:risk_reference:'+runner.binding_id
+    planted=runner.store.get(key)
+    planted['peak']=600
+    runner.store.put(key,planted)
+    signal=candidate()
+    runner.candidate_queue().refresh([signal])
+    runner._evaluate=lambda *a,**kw:result(runner,signal,dict(leverage=2,risk_per_trade_pct=.005))
+    assert runner.cycle()['reason']=='LIVE_PROTECTED'
+    assert [call[0] for call in executor.calls]==['authorize','execute']
+    assert 'peak' not in runner.store.get(key)
     assert runner.monitor()['reason']=='LIVE_RECONCILED'
+    private.equity=400.;private.available=400.
+    calls=[]
+    runner._evaluate=lambda *a,**kw:calls.append('model')
+    runner.candidate_queue().refresh([candidate('ETH_USDT')])
+    assert runner.cycle()['reason']=='HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
+    blocks=runner.store.get('live_entry_status')['risk_blocks']
+    assert 'daily_loss_pct' in blocks and 'drawdown_pct' not in blocks
+    assert not calls
+
+
+def test_planted_peak_does_not_block_exchange_entry(tmp_path, monkeypatch):
+    cfg=Settings(_env_file=None,broker_mode='live',live_trading_enabled=True,live_automatic_enabled=True,
+        live_allowed_accounts=('ahmet',),risk_profile='balanced',risk_per_trade_pct=.01,default_target_leverage=5,
+        kill_switch_path=str(tmp_path/'kill'),analysis_chart_dir=str(tmp_path/'charts'))
+    store=RuntimeStore(str(tmp_path/'live'))
+    private,public,llm=Client(),QuotePublic(),Model()
+    control=dict(enabled=True,stopped=False,updated_at=1,version='text',risk_profile='balanced',
+        risk_per_trade_pct=.01,max_leverage=5,max_positions=2,allocation_mode='full')
+    executor=AutomaticLiveExecutor(AutomaticLivePolicy(True,('ahmet',),('7',),2),
+        LiveExecutionGates(True,'live',('7',),True),store,private,public,RiskEngine(settings=cfg),
+        control_provider=lambda:dict(control),account_id='ahmet',binding_id='binding-1',
+        can_execute=lambda:control['enabled'])
+    runner=LiveRunner(cfg,store=store,account_id='ahmet',binding_id='binding-1',private=private,public=public,
+        llm=llm,external_control=lambda:dict(control),executor=executor)
+    monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='closed',to_context=lambda:{'timeframes':[]}))
+    monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
+    private.assets[0]['equity']=500.;private.assets[0]['availableBalance']=500.
+    runner.monitor()
+    private.assets[0]['equity']=600.;private.assets[0]['availableBalance']=600.
+    runner.monitor()
+    key='live:risk_reference:binding-1'
+    planted=store.get(key);planted['peak']=600;store.put(key,planted)
+    private.assets[0]['equity']=510.;private.assets[0]['availableBalance']=510.
+    executor.grant_start('7',1)
+    runner.candidate_queue().refresh([candidate()])
+    result=runner.cycle()
+    assert result['reason']=='LIVE_PROTECTED', (result,store.get('live_cycle_error'),executor.intents())
+    assert len(private.submits)==1 and 'peak' not in store.get(key)
+    private.assets[0]['equity']=400.;private.assets[0]['availableBalance']=400.
+    assert runner.cycle()['reason']=='HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
+    assert 'daily_loss_pct' in store.get('live_entry_status')['risk_blocks']
+    assert 'drawdown_pct' not in store.get('live_entry_status')['risk_blocks']
+    assert len(private.submits)==1
 
 
 def test_live_aggressive_daily_limit_override_reaches_entry_and_executor(tmp_path, monkeypatch):
@@ -147,7 +196,7 @@ def test_live_aggressive_daily_limit_override_reaches_entry_and_executor(tmp_pat
     assert status['entry_risk_policy']['daily_loss_limit_pct'] == .20
     assert executor.risk.preset.daily_loss_halt_pct == .20
     assert executor.risk.preset.weekly_loss_halt_pct == .135
-    assert executor.risk.preset.max_drawdown_kill_pct == .225
+    assert 'drawdown_limit_pct' not in status['entry_risk_policy']
 
     private.equity = 11.5854 * .85
     assert runner.cycle()['reason'] == 'HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
@@ -168,14 +217,16 @@ def test_live_aggressive_daily_limit_override_reaches_entry_and_executor(tmp_pat
     from trading.config import RiskProfile
     proposal=_proposal(max_loss_if_stopped=5.)
     context=RiskContext(equity=700.,starting_capital=700.,capital_floor=0.,
-                        daily_loss_pct=.15,weekly_loss_pct=.15,drawdown_pct=.15)
+                        daily_loss_pct=.15,weekly_loss_pct=.15,drawdown_pct=.90)
     assert executor.risk.evaluate(proposal,context).accepted
+    assert 'MAX_DRAWDOWN_KILL' not in executor.risk.evaluate(proposal,context).reason_codes
     context.daily_loss_pct=.50
     assert 'DAILY_LOSS_HALT' in executor.risk.evaluate(proposal,context).reason_codes
     assert get_preset(RiskProfile.AGGRESSIVE_GROWTH).weekly_loss_halt_enabled
     assert get_preset(RiskProfile.AGGRESSIVE_GROWTH).daily_loss_halt_pct==.055
     private.equity=11.5854*.77
-    assert runner.cycle()['reason']=='HOLD_LIVE_LOSS_CIRCUIT_BREAKER'
+    assert runner.cycle()['reason']=='HOLD_LIVE_NO_CANDIDATE'
+    assert 'drawdown_pct' not in (runner.store.get('live_entry_status') or {}).get('risk_blocks',{})
 
     control['risk_profile'] = 'balanced'
     private.equity = 10.87804108
