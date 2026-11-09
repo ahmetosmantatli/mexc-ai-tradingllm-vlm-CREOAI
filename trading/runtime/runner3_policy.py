@@ -17,11 +17,26 @@ def uses_fixed_position_limit(runner_id, equity):
 
 
 def evidence_grade(setup):
-    kind = setup['evidence']['kind']
-    return 'strong' if kind in ('sweep_mss_fvg_retest', 'htf_zone_mss') or (
-        kind == 'closed_bos' and setup['reward_risk'] >= 2 and
-        setup['macro_trend'] == ('bullish' if setup['side']=='long' else 'bearish')
-    ) else 'standard'
+    """Güçlü only when the evidence itself says so. There is no confidence score.
+
+    That is a liquidity sweep plus MSS plus an FVG retest, or a closed break
+    in the higher-timeframe direction with at least 2R to the opposing level.
+    Every other valid setup stays Standart.
+    """
+    evidence = setup['evidence']
+    kind = evidence['kind']
+    with_higher_timeframe = setup['macro_trend'] == ('bullish' if setup['side']=='long' else 'bearish')
+    try:
+        payoff = float(setup.get('reward_risk'))
+    except (TypeError, ValueError):
+        payoff = 0.
+    closed_break = kind == 'closed_bos'
+    higher_break = evidence.get('context_last_break')
+    if not closed_break and isinstance(higher_break, dict):
+        closed_break = higher_break.get('direction') == setup.get('macro_trend')
+    strong = kind == 'sweep_mss_fvg_retest' or (
+        closed_break and payoff >= 2 and with_higher_timeframe)
+    return 'strong' if strong else 'standard'
 
 
 def validate_evidence(setup, plan, now=None):
@@ -54,13 +69,13 @@ def margin_policy(equity, capital, available, grade, horizon):
         raise ValueError('runner3_invalid_margin_context')
     small_account = 0 < equity < SMALL_ACCOUNT_EQUITY_USDT
     if small_account:
-        fraction = .70 if grade == 'strong' else .55
-        if horizon == 'swing':
-            fraction = min(fraction, .60)
+        # Share of equity. Güçlü is the larger share; Standart stays smaller.
+        fraction = .35 if grade == 'strong' else .20
+        target = equity * fraction
     else:
         fraction = .20 if grade == 'strong' else .10
+        target = capital * fraction
     reserve = capital * MARGIN_RESERVE_FRACTION
-    target = capital * fraction
     return dict(grade=grade, horizon=horizon, equity_usdt=equity, margin_fraction=fraction,
                 target_margin_usdt=target, reserve_usdt=reserve,
                 max_entry_cost_usdt=max(0., min(target, available - reserve)))
@@ -109,19 +124,30 @@ def drift_respects_choch_risk(*, side, fresh_entry, stop, target, choch_extreme,
 
 
 def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_leverage,
-                            maintenance, initial_rate, fee, liquidation_buffer):
-    """Leverage that fits the CHoCH-stop loss into free margin, and the notional used.
+                            maintenance, initial_rate, fee, liquidation_buffer, margin_target=None):
+    """Lowest leverage that posts the tightest of the loss budget, margin target, and free margin.
 
-    The lowest leverage that can post the risk-sized notional is used. The exchange
-    maximum and a fixed default are only the top of that range. If the full loss does
-    not fit, the size is the largest share of free margin still inside the loss cap,
-    never a slice below 1 USDT while equity is under 100.
+    ``notional`` is the CHoCH stop-loss budget. It is a ceiling, not a reason to
+    move the stop. ``margin_target`` is the evidence share of equity. The size
+    cannot exceed either of those or free margin. Leverage is only raised far
+    enough to post the loss-sized notional inside that margin cap. It is not
+    10x and it is not the exchange maximum. A share under 1 USDT is rejected
+    while equity is under 100.
     """
     values = (notional, entry, stop, free_margin, equity, max_leverage, maintenance, initial_rate, fee, liquidation_buffer)
     if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) for value in values):
         raise ValueError('runner3_margin_reserve')
     if min(notional, entry, free_margin, max_leverage) <= 0 or stop <= 0 or stop == entry:
         raise ValueError('runner3_margin_reserve')
+    margin_cap = free_margin
+    if margin_target is not None:
+        if isinstance(margin_target, bool) or not isinstance(margin_target, (int, float)) or not isfinite(margin_target):
+            raise ValueError('runner3_margin_reserve')
+        margin_cap = min(free_margin, margin_target)
+    if margin_cap <= 0:
+        raise ValueError('runner3_margin_reserve')
+    if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and margin_cap < MIN_OPEN_MARGIN_USDT:
+        raise ValueError('runner3_margin_below_minimum')
     cap = floor(max_leverage)
     if cap < 1 or cap > 100000:
         raise ValueError('runner3_margin_reserve')
@@ -130,7 +156,7 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
     def fit(leverage, size):
         margin_rate = max(1 / leverage, initial_rate)
         margin = size * margin_rate
-        if margin + size * fee > free_margin + 1e-9:
+        if margin + size * fee > margin_cap + 1e-9:
             return None
         distance = 1 / leverage - maintenance - fee
         if distance <= 0:
@@ -147,17 +173,15 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
         selected = fit(leverage, notional)
         if selected is not None:
             return selected
-    best = None
+    # The loss-sized notional does not fit. Keep the stop and take the margin
+    # cap at the lowest safe leverage instead of the exchange maximum.
     for leverage in range(1, cap + 1):
         margin_rate = max(1 / leverage, initial_rate)
-        fitted = min(notional, free_margin / (margin_rate + fee))
+        fitted = min(notional, margin_cap / (margin_rate + fee))
         selected = fit(leverage, fitted)
-        if selected is not None and (best is None or selected[2] > best[2]):
-            best = selected
-    if best is not None:
-        return best
-    full_margin = notional * max(1., initial_rate)
-    if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and min(full_margin, free_margin) < MIN_OPEN_MARGIN_USDT:
+        if selected is not None:
+            return selected
+    if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and min(notional, margin_cap) <= MIN_OPEN_MARGIN_USDT:
         raise ValueError('runner3_margin_below_minimum')
     raise ValueError('runner3_margin_reserve')
 
@@ -179,6 +203,7 @@ def validate_economics(gross, net, loss):
         raise ValueError('runner3_cost_share_too_high')
 
 def small_account_risk_target(equity, ceiling, grade):
+    """Güçlü may use the whole per-trade loss ceiling. Standart stays at 80% of it."""
     if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT:
         return ceiling if grade == 'strong' else ceiling * .80
     return None
@@ -214,7 +239,7 @@ def thesis_invalidated(position, price):
 def rank_confirmed_plans(plans):
     """Stronger evidence and payoff first. Ties stay on symbol and setup id."""
     def key(plan):
-        grade = 1 if plan.get('grade') == 'strong' or plan.get('evidence_kind') == 'htf_zone_mss' else 0
+        grade = 1 if plan.get('grade') == 'strong' else 0
         try:
             reward = float(plan.get('capital_rank') if plan.get('capital_rank') is not None else plan.get('reward_risk') or 0)
         except (TypeError, ValueError):

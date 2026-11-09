@@ -541,15 +541,22 @@ class LiveRunner:
                                       observed=entry,tolerance=abs(entry/planned_entry-1))
             proposal.notional=quantity*entry
             proposal.entry_price=entry
+            requested_notional=proposal.notional
             leverage,margin,sized=runner3_policy.leverage_for_choch_loss(
                 notional=proposal.notional,entry=entry,stop=proposal.stop_loss.price,free_margin=free_margin,
+                margin_target=allocation['target_margin_usdt'],
                 equity=snapshot['balance']['equity'],max_leverage=min(self._leverage_cap(control,exchange_cap),exchange_cap),
                 maintenance=max(rules.maintenance,private_risk['maintenance_rate'],private_leverage['maintenance_rate']),
                 initial_rate=private_risk['initial_rate'],fee=fee,liquidation_buffer=self.cfg.liquidation_buffer_pct)
             if sized<proposal.notional-1e-8:
                 _,proposal.notional=rules.size_order(sized,entry,leverage)
             proposal.leverage=leverage
-            proposal.metadata['runner3_allocation']=dict(allocation,limiting_factor=min(limits,key=limits.get),
+            if sized<requested_notional-1e-6:
+                limiting_factor=('runner3_margin_policy' if allocation['target_margin_usdt']<=free_margin+1e-8
+                                 else 'available_margin')
+            else:
+                limiting_factor=min(limits,key=limits.get)
+            proposal.metadata['runner3_allocation']=dict(allocation,limiting_factor=limiting_factor,
                 free_margin_usdt=free_margin,initial_margin_usdt=margin,chosen_leverage=leverage,
                 setup_id=setup['setup_id'],evidence_expires_at=setup['evidence'].get('expires_at'),
                 calibrated_probability=None,expected_target_net_r=expected_net/unit_loss,**risk_adjustment)
