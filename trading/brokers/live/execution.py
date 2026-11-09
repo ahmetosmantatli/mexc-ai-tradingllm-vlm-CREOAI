@@ -77,6 +77,9 @@ class ApprovedLiveExecutor(PositionManagementMixin):
     def _managed(self):
         return []
 
+    def _enforce_position_limit(self, proposal, equity, managed):
+        return True
+
     def intents(self):
         with self.store.lock:
             rows=[json.loads(payload) for _,payload in self.store.db.execute("SELECT key,value FROM state WHERE key LIKE 'live:intent:%'")]
@@ -196,6 +199,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             # can lead to a partial fill or cancellation.
             row['entry_limit_price']=entry
         managed=self._managed()
+        enforce_position_limit=self._enforce_position_limit(proposal,equity,managed)
         managed_positions=[r['position_id'] for r in managed if r.get('position_id')]
         managed_orders=[r['exchange_order_id'] for r in managed if r.get('exchange_order_id')]
         readiness=self.reconciler.preflight(symbol=proposal.symbol,side=1 if proposal.side.value=='long' else 2,
@@ -236,7 +240,8 @@ class ApprovedLiveExecutor(PositionManagementMixin):
         context=RiskContext(equity=equity,starting_capital=state['initial'],capital_floor=0,
             exchange_max_leverage=verified_leverage_cap,
             open_positions=len(snapshot['positions']),open_risk=sum(r.get('planned_loss',r['proposal']['max_loss_if_stopped']) for r in managed),
-            daily_loss_pct=state['daily_loss_pct'],weekly_loss_pct=state['weekly_loss_pct'],drawdown_pct=state['drawdown_pct'])
+            daily_loss_pct=state['daily_loss_pct'],weekly_loss_pct=state['weekly_loss_pct'],drawdown_pct=state['drawdown_pct'],
+            enforce_position_limit=enforce_position_limit)
         decision=self.risk.evaluate(proposal,context)
         if not decision.accepted:raise LiveExecutionError('deterministic_risk_rejected',reason_codes=getattr(decision,'reason_codes',()))
         row['entry_executable_quote']=entry

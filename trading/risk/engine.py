@@ -24,6 +24,7 @@ class RiskContext:
     floor_activated: bool = False
     always_on_scan: bool = True
     halt_new_risk: bool = False
+    enforce_position_limit: bool = True
 
 
 @dataclass
@@ -111,7 +112,7 @@ class RiskEngine:
         if context.halt_new_risk:
             reasons.append("HALT_NEW_RISK")
 
-        if context.open_positions >= preset.max_concurrent_positions:
+        if context.enforce_position_limit and context.open_positions >= preset.max_concurrent_positions:
             reasons.append("MAX_CONCURRENT_POSITIONS")
 
         if context.open_risk + proposal.max_loss_if_stopped > equity * preset.total_open_risk_pct + 1e-9:

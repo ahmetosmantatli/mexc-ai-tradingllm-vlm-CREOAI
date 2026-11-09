@@ -8,6 +8,11 @@ COHORT = 'runner3-evidence-allocation-v1'
 MARGIN_RESERVE_FRACTION = .15
 MIN_NET_TARGET_R = 1.25
 MAX_COST_SHARE = .30
+SMALL_ACCOUNT_EQUITY_USDT = 100.
+
+
+def uses_fixed_position_limit(runner_id, equity):
+    return not (runner_id == 'runner3' and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT)
 
 
 def evidence_grade(setup):
@@ -37,7 +42,7 @@ def margin_policy(equity, capital, available, grade, horizon):
         raise ValueError('runner3_invalid_margin_context')
     if grade not in ('standard','strong') or horizon not in ('scalp','intraday','swing'):
         raise ValueError('runner3_invalid_margin_context')
-    blend = min(1., max(0., (100. - equity) / 20.))
+    blend = min(1., max(0., (SMALL_ACCOUNT_EQUITY_USDT - equity) / 20.))
     large, small = (.20, .35) if grade == 'strong' else (.10, .20)
     fraction = large + (small - large) * blend
     if horizon == 'swing':

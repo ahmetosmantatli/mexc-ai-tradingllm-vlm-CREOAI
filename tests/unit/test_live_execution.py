@@ -611,3 +611,42 @@ def test_matching_protection_does_not_hide_a_second_reversing_order(tmp_path):
     result=executor.reconcile(intent['intent_id'])
     assert result['status']=='close_write_unknown'
     assert len(private.closes)==1 and len(private.protects)==1
+
+
+@pytest.mark.parametrize(('runner_id','equity','existing_stop_risk','expected'), [
+    ('runner3', 50., .1, None),
+    ('runner3', 100., .1, 'automatic_position_cap'),
+    ('runner2', 50., .1, 'automatic_position_cap'),
+    ('runner3', 50., 1.25, 'deterministic_risk_rejected'),
+])
+def test_automatic_position_count_exemption_uses_fresh_equity_and_keeps_total_risk(
+        tmp_path, runner_id, equity, existing_stop_risk, expected):
+    from trading.config import Settings
+    from trading.risk.engine import RiskEngine
+
+    control = {'enabled': True, 'updated_at': 1, 'runner_id': runner_id}
+    executor, private, _ = setup(tmp_path, automatic=True, control=control)
+    executor.risk = RiskEngine(Settings(_env_file=None, broker_mode='live',
+                                        risk_profile='aggressive_growth', risk_per_trade_pct=.03))
+    private.assets[0].update(equity=equity, availableBalance=equity-4, positionMargin=4.)
+    for i, symbol in enumerate(('ETH_USDT', 'XRP_USDT', 'SOL_USDT', 'DOT_USDT'), start=1):
+        private.positions.append(dict(symbol=symbol, positionId=i, positionType=1, holdVol=1.,
+                                      state=1, openType=1, autoAddIm=0, leverage=5,
+                                      holdAvgPrice=100., im=1., unRealizedPnl=0., liquidatePrice=80.))
+        executor._save(dict(intent_id=str(i), binding_id=executor.binding_id, status='protected',
+                            position_id=str(i), planned_loss=existing_stop_risk,
+                            proposal={'max_loss_if_stopped': existing_stop_risk}))
+    executor.public.get_ticker = lambda symbol: SimpleNamespace(
+        bid1=99.99, ask1=100., raw={'timestamp': time()*1000, 'fairPrice': 100.})
+    private.submit_ioc = lambda **kwargs: pytest.fail('Preflight must not submit an order')
+    row = executor.authorize(proposal(notional=10., max_loss_if_stopped=.3, metadata={
+        'runner_id': runner_id, 'runner3_allocation': {'grade': 'standard', 'horizon': 'intraday'},
+    }), control_revision=1)
+
+    if expected is None:
+        assert executor._preflight(row)[1] == 100
+    else:
+        with pytest.raises(LiveExecutionError, match=expected) as error:
+            executor._preflight(row)
+        if expected == 'deterministic_risk_rejected':
+            assert error.value.reason_codes == ('TOTAL_OPEN_RISK_CAP',)

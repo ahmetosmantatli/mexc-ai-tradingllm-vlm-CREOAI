@@ -407,7 +407,10 @@ class LiveRunner:
         snapshot=self._refresh([candidate.symbol])
         if candidate.symbol in self._positions(snapshot):
             return finish('HOLD_LIVE_SYMBOL_OPEN')
-        if len(snapshot['positions'])>=min(control.get('max_positions',getattr(self.cfg,'live_max_positions',4)),getattr(self.cfg,'live_max_positions',4),self.risk.preset.max_concurrent_positions):
+        position_limit = min(control.get('max_positions', self.cfg.live_max_positions),
+                             self.cfg.live_max_positions, self.risk.preset.max_concurrent_positions)
+        if (runner3_policy.uses_fixed_position_limit(control.get('runner_id'), snapshot['balance']['equity'])
+                and len(snapshot['positions']) >= position_limit):
             return finish('HOLD_LIVE_POSITION_LIMIT')
         selected=result.selected_signal
         if selected.symbol!=candidate.symbol:

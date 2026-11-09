@@ -8,6 +8,7 @@ from time import time
 from math import isfinite
 
 from trading.brokers.live.execution import ApprovedLiveExecutor,LiveExecutionError
+from trading.runtime.runner3_policy import uses_fixed_position_limit
 
 
 @dataclass(frozen=True)
@@ -104,5 +105,10 @@ class AutomaticLiveExecutor(ApprovedLiveExecutor):
 
     def _preflight(self,row):
         self._current_grant()
-        if len(self._managed())>=self.policy.max_positions:raise LiveExecutionError('automatic_position_cap')
         return super()._preflight(row)
+
+    def _enforce_position_limit(self, proposal, equity, managed):
+        limited = uses_fixed_position_limit(proposal.metadata.get('runner_id'), equity)
+        if limited and len(managed) >= self.policy.max_positions:
+            raise LiveExecutionError('automatic_position_cap')
+        return limited
