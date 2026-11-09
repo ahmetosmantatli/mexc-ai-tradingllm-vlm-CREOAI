@@ -169,6 +169,8 @@ def audit(path,*,since=0,now=None,include_performance=False):
             cards = {key.removeprefix('live:management-card:'):json.loads(value)
                      for key,value in db.execute("SELECT key,value FROM state WHERE key LIKE 'live:management-card:%'")}
             report['performance']=performance(traces,intents,cards)
+            report['recent_htf_zone_events']=[row for row in state('htf_zone_events', [])
+                                              if row.get('at', 0) >= since][-20:]
         return report
     finally:db.close()
 

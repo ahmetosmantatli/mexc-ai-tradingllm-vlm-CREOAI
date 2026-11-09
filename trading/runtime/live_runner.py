@@ -249,7 +249,7 @@ class LiveRunner:
             runner_id=self._control().get('runner_id')
             runner2=runner_id in STRUCTURAL_IOC_RUNNERS
             scan=MarketScanner(self.public,liquidity=LiquidityFilter(self.cfg.scanner_min_quote_volume_24h,
-                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True,structure_setups_enabled=self.cfg.live_structure_setups_enabled and self.cfg.live_price_plan_enabled, multihorizon=runner2,strict_ict=runner_id=='runner3').scan()
+                self.cfg.scanner_max_spread_bps,require_complete=True),max_symbols=self.cfg.scanner_max_symbols,rotation_store=self.store,bulk_tickers=True,structure_setups_enabled=self.cfg.live_structure_setups_enabled and self.cfg.live_price_plan_enabled, multihorizon=runner2,htf_zone_entries=runner_id=='runner3').scan()
             errors=dict(scan.errors)
             quant_count=len(scan.candidates)
             try:
@@ -292,6 +292,7 @@ class LiveRunner:
         phase = 'result' if trace.get('completed_at') else 'start'
         notice = dict(id=trace['id'], phase=phase, binding_id=self.binding_id, symbol=trace['symbol'],
                       status=trace['status'], action=trace.get('action'), model=trace.get('model'),
+                      decision_mode=trace.get('decision_mode'),
                       rationale=' '.join((trace.get('rationale') or '').split())[:180],
                       strategy=trace.get('strategy'), seed_timeframe=trace.get('seed_timeframe'),
                       review_reason=(trace.get('why_reconsidered') or {}).get('reason'),
@@ -348,6 +349,8 @@ class LiveRunner:
             raise ValueError('Structural IOC runner requires a candle-grounded price plan')
         setup=result.metadata.get('setup_selection')
         if runner_id=='runner3':
+            if not setup or not setup.get('context_timeframe'):
+                raise ValueError('runner3_requires_verified_setup')
             runner3_policy.validate_evidence(setup,MarketPricePlan.model_validate(result.metadata['price_plan']))
         if result.metadata.get('price_plan') is not None:
             if not self.cfg.live_price_plan_enabled:raise ValueError('live model price planning disabled')
@@ -419,6 +422,9 @@ class LiveRunner:
             analysis_trace_id=result.metadata.get('analysis_trace_id'),
             contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
             decision_ai=result.metadata.get('decision_ai',{}),account_generation=snapshot['generation'])
+        if runner_id == 'runner3':
+            proposal.metadata['htf_setup'] = {key: copy.deepcopy(setup[key]) for key in
+                ('context_timeframe','trigger_timeframe','evidence')}
         return proposal
 
     def _record_entry_rejection(self, candidate, trace_id, reason, details=None, *, notify=True):
@@ -547,7 +553,10 @@ class LiveRunner:
                 return self.status('HOLD_LIVE_LOSS_CIRCUIT_BREAKER', risk_blocks=risk_blocks)
             if not self.external_scan:
                 self.scan_market()
-            waiting={row['symbol'] for row in watch_snapshot(self.store) if row['status']=='watching'}
+            htf_zone_entries = control.get('runner_id') == 'runner3'
+            waiting = set() if htf_zone_entries else {
+                row['symbol'] for row in watch_snapshot(self.store) if row['status']=='watching'}
+
             count=min(8,getattr(self.cfg,'ai_parallel_candidates',1)) if callable(getattr(self.llm,'fork',None)) else 1
             if self.cfg.ai_dynamic_parallel_enabled and callable(getattr(self.llm,'analysis_capacity',None)):
                 history=self.store.get('analysis_history',[])[-10:]
@@ -561,7 +570,8 @@ class LiveRunner:
             queue=self.candidate_queue()
             for _ in range(count):
                 candidate=queue.next(open_symbols=set(self._positions(snapshot))|waiting|{c.symbol for c in selected},
-                    seen=self.store.get('live_seen',[]),lease_seconds=self.cfg.decision_ttl_seconds+60)
+                    seen=self.store.get('live_seen',[]),lease_seconds=self.cfg.decision_ttl_seconds+60,
+                    htf_zone_entries=htf_zone_entries)
                 if candidate is None:
                     break
                 selected.append(candidate)
@@ -663,6 +673,7 @@ class LiveRunner:
             management_status=self.store.get('management_status',{}),management_trace=self.store.get('management_trace',{}),
             analysis_trace=self.store.get('analysis_trace',{}),analysis_history=self.store.get('analysis_history',[]),
             watchlist=watch_snapshot(self.store),leverage_mode=self.cfg.live_leverage_mode,analysis_version=self.cfg.analysis_version,
+            htf_zone_scan=self.store.get('htf_zone_scan', {}) if self.runner_id == 'runner3' else {},
             runner_id=self.runner_id,
             entry_risk_policy=dict(profile=self.risk.preset.profile.value,daily_loss_limit_pct=self.risk.preset.daily_loss_halt_pct,
                 weekly_loss_limit_enabled=self.risk.preset.weekly_loss_halt_enabled,

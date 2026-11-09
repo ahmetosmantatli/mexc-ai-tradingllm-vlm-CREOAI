@@ -40,12 +40,15 @@ class CandidateQueue:
             self.store.put('candidate_queue',rows)
             return len(rows)
 
-    def next(self, *, now=None, open_symbols=(), seen=(), lease_seconds=0):
+    def next(self, *, now=None, open_symbols=(), seen=(), lease_seconds=0, htf_zone_entries=None):
         now=time() if now is None else now
         with self.store.lock:
             rows=[r for r in self.store.get('candidate_queue',[]) if r['expires_at']>now]
             self.store.put('candidate_queue',rows)
             eligible=[r for r in rows if r.get('lease_until',0)<=now and r['signal']['symbol'] not in open_symbols and r['signal'].get('features',{}).get('dedup_key') not in seen]
+            if htf_zone_entries is not None:
+                eligible = [r for r in eligible if r['signal']['features'].get('watch_review')
+                            or bool(r['signal']['features'].get('htf_zone_seed')) == htf_zone_entries]
             if not eligible:
                 return None
             row=min(eligible,key=lambda r:(not bool(r['signal'].get('features',{}).get('watch_review')),r['last_considered_at'],r['first_seen'],-r['signal']['confidence'],r['key']))

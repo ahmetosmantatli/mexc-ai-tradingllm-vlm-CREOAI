@@ -17,6 +17,7 @@ from time import time
 import httpx
 
 TIMEFRAMES = {'4h': ('Hour4', 14400), '15m': ('Min15', 900), '5m': ('Min5', 300)}
+HOURLY_TIMEFRAME = ('Min60', 3600)
 FEATURE_VERSION = 'pa-closed-v1'
 
 
@@ -168,11 +169,12 @@ class TimeframeView:
         material = json.dumps([c.row() for c in self.candles], separators=(',', ':'), allow_nan=False)
         return sha256(material.encode()).hexdigest()
 
-    def to_context(self, *, ict=False):
+    def to_context(self, *, ict=False, htf_history=False):
         features={**self.features, **ict_features(self.candles,self.features)} if ict else self.features
+        context_bars = 48 if htf_history and self.label in ('4h', '1h') else 12
         return dict(timeframe=self.label, closed_at=self.closed_at, history_bars=len(self.candles),
                     fingerprint=self.fingerprint, features=features,
-                    recent_ohlcv=[c.row() for c in self.candles[-12:]])
+                    recent_ohlcv=[c.row() for c in self.candles[-context_bars:]])
 
 
 @dataclass(frozen=True)
@@ -187,11 +189,11 @@ class AnalysisBundle:
     def fingerprint(self):
         return sha256((self.symbol+':'+':'.join(v.fingerprint for v in self.views)).encode()).hexdigest()
 
-    def to_context(self, *, ict=False):
+    def to_context(self, *, ict=False, htf_history=False):
         return dict(symbol=self.symbol, exchange=self.exchange, instrument=self.instrument,
                     observed_at=self.observed_at, fingerprint=self.fingerprint,
                     feature_version=FEATURE_VERSION,
-                    timeframes=[v.to_context(ict=ict) for v in self.views])
+                    timeframes=[v.to_context(ict=ict, htf_history=htf_history) for v in self.views])
 
 
 def trade_flow_context(client, symbol):
@@ -224,7 +226,7 @@ def trade_flow_context(client, symbol):
         return None
 
 
-def benchmark_context(client, market):
+def benchmark_context(client, market, *, include_structure=False):
     """Compare returns across identical closed intervals, using shared public caches."""
     result={}
     fetch=getattr(client,'get_klines',None)
@@ -237,7 +239,10 @@ def benchmark_context(client, market):
         frames={}
         for view in market.get('timeframes',[]):
             tf=view['timeframe']
-            interval,seconds=TIMEFRAMES[tf]
+            resolution = HOURLY_TIMEFRAME if tf == '1h' else TIMEFRAMES.get(tf)
+            if resolution is None:
+                continue
+            interval, seconds = resolution
             rows=view.get('recent_ohlcv',[])
             if len(rows)<7 or observed is None:
                 continue
@@ -251,19 +256,57 @@ def benchmark_context(client, market):
                     raise ValueError('benchmark bars not aligned')
                 benchmark=candles[-1].close/candles[-7].close-1
                 relative=rows[-1][4]/rows[-7][4]-1-benchmark
-                frames[tf]=dict(closed_at=end+seconds,trend=structure_features(candles)['trend'],
-                    return_6_bars=benchmark,relative_return_6_bars=relative)
+                features = structure_features(candles)
+                comparison = dict(closed_at=end+seconds, trend=features['trend'],
+                                  return_6_bars=benchmark, relative_return_6_bars=relative)
+                if include_structure:
+                    ict = ict_features(candles, features)
+                    comparison.update(last_break=features['breaks'][-1] if features['breaks'] else None,
+                                      structure_shifts=ict['structure_shifts'][-2:],
+                                      order_block_candidates=[block for block in ict['order_block_candidates']
+                                                              if block['status'] != 'invalidated'][-2:],
+                                      historical_fvgs=features['fvgs'][-2:])
+                frames[tf] = comparison
             except (ValueError, KeyError, TypeError, OSError, RuntimeError, httpx.HTTPError):
                 frames[tf]=None
         result[symbol]=frames
     return result
 
 
-def build_bundle(client, symbol, *, now=None, limit=120):
-    """Fetch only MEXC contract klines; reject invalid/missing/stale timeframes.
+def entry_refinement_context(client, market):
+    """Optional closed 1m timing context after a higher-level setup is ready."""
+    fetch = getattr(client, 'get_klines', None)
+    symbol = market.get('symbol')
+    observed = market.get('observed_at')
+    if (not callable(fetch) or not isinstance(symbol, str)
+            or not re.fullmatch(r'[A-Z0-9]+_USDT', symbol)
+            or type(observed) not in (int, float) or not isfinite(observed) or observed <= 0):
+        return None
+    seconds = 60
+    try:
+        payload = fetch(symbol, interval='Min1', limit=41)
+        if payload.get('symbol') != symbol or payload.get('interval') != 'Min1':
+            return None
+        candles = closed_candles(payload['candles'], seconds, observed)
+        closed_at = candles[-1].timestamp + seconds
+        if closed_at != int(observed // seconds) * seconds:
+            return None
+        features = structure_features(candles)
+        ict = ict_features(candles, features)
+        return dict(timeframe='1m', closed_at=closed_at, trend=features['trend'],
+                    last_break=features['breaks'][-1] if features['breaks'] else None,
+                    structure_shifts=ict['structure_shifts'][-2:],
+                    recent_ohlcv=[candle.row() for candle in candles[-6:]])
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError, httpx.HTTPError):
+        return None
+
+
+def build_bundle(client, symbol, *, now=None, limit=120, include_hourly=False):
+    """Fetch MEXC contract klines with strict validation of each closed series.
 
     Caller must verify contract rules settleCoin=USDT and active status before
-    acting; naming alone does not prove a tradable instrument.
+    acting; naming alone does not prove a tradable instrument. A missing optional
+    1h series disables the hourly setup lane while leaving 4h context available.
     """
     if not re.fullmatch(r'[A-Z0-9]+_USDT', symbol):
         raise ValueError('expected MEXC USDT perpetual symbol, e.g. BTC_USDT')
@@ -271,10 +314,16 @@ def build_bundle(client, symbol, *, now=None, limit=120):
         raise ValueError('chart history limit must be 30..240')
     observed = time() if now is None else float(now)
     views = []
-    for label, (interval, seconds) in TIMEFRAMES.items():
-        payload = client.get_klines(symbol, interval=interval, limit=limit+1)
-        if payload.get('symbol') != symbol or payload.get('interval') != interval:
-            raise ValueError('market response symbol/interval mismatch')
-        candles = closed_candles(payload.get('candles', []), seconds, observed)[-limit:]
+    frames = {**TIMEFRAMES, '1h': HOURLY_TIMEFRAME} if include_hourly else TIMEFRAMES
+    for label, (interval, seconds) in frames.items():
+        try:
+            payload = client.get_klines(symbol, interval=interval, limit=limit+1)
+            if payload.get('symbol') != symbol or payload.get('interval') != interval:
+                raise ValueError('market response symbol/interval mismatch')
+            candles = closed_candles(payload.get('candles', []), seconds, observed)[-limit:]
+        except (ValueError, KeyError, TypeError, OSError, RuntimeError, httpx.HTTPError):
+            if label != '1h':
+                raise
+            continue
         views.append(TimeframeView(label, seconds, candles, structure_features(candles)))
     return AnalysisBundle(symbol, observed, tuple(views))

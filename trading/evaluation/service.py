@@ -171,12 +171,14 @@ class ContextEvaluator:
         if runner2:
             scope=live_account['runner_id']+':'+scope
         self.store.put('stage','fetching_multitimeframe_context')
-        bundle = build_bundle(self.public, symbol)
-        chart_context = bundle.to_context(ict=True) if runner2 else bundle.to_context()
+        bundle = build_bundle(self.public, symbol, include_hourly=True) if runner3 else build_bundle(self.public, symbol)
+        chart_context = (bundle.to_context(ict=True, htf_history=True) if runner3
+                         else bundle.to_context(ict=True) if runner2 else bundle.to_context())
         fingerprint = bundle.fingerprint
         if runner2:
             from trading.analysis.market import benchmark_context
-            chart_context['benchmarks']=benchmark_context(self.public,chart_context)
+            chart_context['benchmarks'] = (benchmark_context(self.public,chart_context,include_structure=True)
+                                           if runner3 else benchmark_context(self.public,chart_context))
         key = f'memory:{symbol}:{scope}'
         legacy = self.store.get('memory:'+symbol, {})
         memory = self.store.get(key)
@@ -209,10 +211,13 @@ class ContextEvaluator:
         account['canonical_watch']=canonical_watch_card(prior_watch)
         options=[]
         if selection_enabled:
-            from trading.quant.structure_setups import build_structure_setups
-            frames=('5m','15m','4h') if runner2 else (None,)
-            options=[setup for frame in frames for setup in build_structure_setups(chart_context,
-                current_price=candidate.entry_price,price_step=price_rules.price_step,trigger_timeframe=frame,strict_ict=runner3)]
+            from trading.quant.structure_setups import build_htf_zone_setups, build_structure_setups
+            if runner3:
+                options=build_htf_zone_setups(chart_context,current_price=candidate.entry_price,price_step=price_rules.price_step)
+            else:
+                frames=('5m','15m','4h') if runner2 else (None,)
+                options=[setup for frame in frames for setup in build_structure_setups(chart_context,
+                    current_price=candidate.entry_price,price_step=price_rules.price_step,trigger_timeframe=frame)]
         if runner3:
             balance=live_account['current_equity']
             for option in options:
@@ -230,7 +235,8 @@ class ContextEvaluator:
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
         if runner2:
             economic_basis['benchmarks']=chart_context['benchmarks']
-        evaluation_key=digest(dict(policy=POLICY_VERSION,market=fingerprint,scope=scope,economic_basis=economic_basis))
+        policy_version=runner3_policy.COHORT if runner3 else POLICY_VERSION
+        evaluation_key=digest(dict(policy=policy_version,market=fingerprint,scope=scope,economic_basis=economic_basis))
         if memory.get('last_evaluation_key')==evaluation_key:
             self.store.put('stage','unchanged_closed_candles')
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='unchanged_closed_candles',
@@ -251,8 +257,16 @@ class ContextEvaluator:
         if runner2:
             from trading.analysis.market import trade_flow_context
             chart_context['recent_trade_flow']=trade_flow_context(self.public,symbol)
+        if runner3 and any(option['state']=='ready' and option.get('context_timeframe')=='1h' for option in options):
+            from trading.analysis.market import entry_refinement_context
+            chart_context['entry_refinement_1m'] = entry_refinement_context(self.public,chart_context)
         prompt=build_prompt(candidate,chart_context,memory,positions,account,self.cfg.analysis_version,changes)
-        charts=render_bundle(bundle,Path(self.cfg.analysis_chart_dir)/symbol/fingerprint[:16])
+        try:
+            charts=render_bundle(bundle,Path(self.cfg.analysis_chart_dir)/symbol/fingerprint[:16])
+        except (OSError, ValueError, RuntimeError):
+            if not runner3 or self.cfg.analysis_version != 'text':
+                raise
+            charts=[]
         paths=[str(c.path) for c in charts]
         started=time.time()
         trace=dict(id=uuid4().hex,mode='LIVE' if live_account is not None else 'PAPER',symbol=symbol,strategy=candidate.strategy.value,confidence=candidate.confidence,
@@ -267,10 +281,7 @@ class ContextEvaluator:
         if live_account is not None and self.on_live_review is not None:
             self.on_live_review(trace)
         self.store.put('stage','model_evaluation')
-        if hasattr(self.llm,'deadline'):
-            self.llm.deadline=started+self.cfg.decision_ttl_seconds
-        if hasattr(self.llm,'on_trace'):
-            self.llm.on_trace=lambda update:publish_progress(self.store,{**trace,**copy.deepcopy(update)})
+        deadline=started+self.cfg.decision_ttl_seconds
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
             from trading.evaluation.setup_selection import validate_selection
@@ -294,7 +305,7 @@ class ContextEvaluator:
             if decision.price_plan is not None:
                 if not price_planning or decision.action!='trade':
                     raise ValueError('price planning disabled or not trade')
-                if option and option.get('horizon')=='swing' and (
+                if option and option.get('horizon')=='swing' and not option.get('context_timeframe') and (
                         decision.price_plan.stop_reference.timeframe!='4h'
                         or decision.price_plan.target_reference.timeframe!='4h'):
                     raise ValueError('swing requires 4h stop and target references')
@@ -304,6 +315,22 @@ class ContextEvaluator:
                 raise ValueError('unknown signal')
             if decision.watch_plan is not None and decision.action!='watch':
                 raise ValueError('watch plan only allowed for watch action')
+            if (runner3 and decision.action == 'watch' and option and option.get('context_timeframe')
+                    and option['state'] == 'watch'):
+                trigger = option.get('trigger_condition')
+                if trigger is not None:
+                    expected = dict(trigger_condition=trigger, trigger_price=option['trigger'],
+                                    invalidation_condition=option['invalidation_condition'],
+                                    invalidation_price=option['invalidation_price'])
+                    if trigger.startswith('closed_candle'):
+                        expected['timeframe'] = option['trigger_timeframe']
+                    if decision.watch_plan is None:
+                        from trading.evaluation.watch import WatchPlan
+                        decision.watch_plan = WatchPlan(expires_at=time.time()+86400, **expected)
+                    elif any(getattr(decision.watch_plan, field) != value for field, value in expected.items()):
+                        raise ValueError('HTF watch plan differs from supplied trigger or invalidation')
+                elif decision.watch_plan is not None:
+                    raise ValueError('HTF watch has no supplied executable trigger')
             if decision.watch_plan is not None and decision.watch_plan.trigger_condition in ('price_above','price_below'):
                 price=decision.watch_plan.trigger_price
                 already_met=(price<=candidate.entry_price if decision.watch_plan.trigger_condition=='price_above' else price>=candidate.entry_price)
@@ -316,31 +343,77 @@ class ContextEvaluator:
             self.llm.response_validator=validate
         policy=SYSTEM_POLICY+(' Runner 2 trade requires a grounded price_plan. Use market as the reference entry_type; '
                               'execution independently enforces a fresh IOC price limit. Compare scalp, intraday, and swing as separate theses; '
-                              'a swing uses 4h stop and target candle references even if execution uses a finer entry. '
+                              'a swing uses the supplied timeframe and candle references. '
                               'CHoCH is an opposite closed swing break; MSS adds recent sweep and displacement. '
                               'Order block candidates are opposing candles before displacement and may be retested or invalidated. '
                               'Use visible wick references for levels and confirmed structure for invalidation. '
                               'BTC/ETH relative returns and recent_trade_flow are optional context, never an automatic veto. The flow is a bounded exchange trade-side sample; null means unavailable.' if runner2 else '')
         if runner3:
-            policy+=(' Runner 3 requires the selected READY setup ID and its exact stop_reference. '
+            policy+=(' Runner 3 requires the selected READY setup ID and its exact stop and target references. '
+                     'Use the selected 4h→15m or 1h→5m lane. Require the valid HTF zone, a closed LTF touch, '
+                     'and a later closed LTF CHoCH/MSS; use the supplied LTF stop and HTF target. '
+                     'Optional 1m timing evidence never substitutes for the 5m confirmation or supplies price references. '
+                     'A zone awaiting touch or confirmation can only be watched. Preserve its supplied trigger and '
+                     'invalidation. BTC/ETH structure provides context; an altcoin can diverge if its own closed evidence supports it. '
                      'Use allocation as a margin target ceiling, separate from stop risk. '
                      'Use the suggested risk fraction as a starting point; adjust down for portfolio risk, liquidity, and weak payoff. Choose leverage from current account and price evidence. '
                      'Do not narrow the structural stop to fit the desired size.')
-        payload=self.llm.complete_json(system=policy,user=prompt,max_tokens=1100 if price_planning else 700,
-            images=paths if self.cfg.analysis_version=='vlm' else None)
-        provider_trace=copy.deepcopy(getattr(self.llm,'last_trace',{}) or {})
-        trace.update(provider_trace)
-        attempts=provider_trace.get('attempts')
-        provider_called=(any(a.get('generation_requests',0) or a.get('count_requests',0) for a in attempts)
-                         if attempts is not None else True)
+        previous_attempts = []
+        decision_mode = None
+
+        def run_review(mode, *, probe=False):
+            nonlocal provider_called, decision_mode
+            limit = min(deadline, time.time()+min(8., self.cfg.decision_ttl_seconds/3)) if probe else deadline
+            if hasattr(self.llm,'deadline'):
+                self.llm.deadline = limit
+            def review_trace(update):
+                combined = copy.deepcopy(update)
+                combined['attempts'] = previous_attempts + [
+                    dict(attempt, review_mode=mode) for attempt in combined.get('attempts', [])
+                ]
+                return combined
+            if hasattr(self.llm,'on_trace'):
+                self.llm.on_trace=lambda update:publish_progress(self.store,{**trace,**review_trace(update)})
+            review_policy = policy
+            if mode == 'vlm':
+                review_policy += (' Review the supplied chart images against the timestamped closed-candle data, '
+                                  'the proposed zone and structure sequence, and the existing watch rationale. '
+                                  'You may confirm a valid setup, select another supplied READY setup, or hold/watch. '
+                                  'Chart annotations cannot replace candle references or mandatory price/risk checks.')
+            review_prompt = prompt if mode == self.cfg.analysis_version else build_prompt(
+                candidate,chart_context,memory,positions,account,mode,changes)
+            complete = getattr(self.llm, 'complete_vision_probe', self.llm.complete_json) if probe else self.llm.complete_json
+            payload = complete(system=review_policy,user=review_prompt,max_tokens=1100 if price_planning else 700,
+                               images=paths if mode == 'vlm' else None)
+            raw_trace = getattr(self.llm,'last_trace',{}) or {}
+            provider_called = provider_called or ('attempts' not in raw_trace or any(
+                a.get('generation_requests',0) or a.get('count_requests',0) for a in raw_trace['attempts']))
+            provider_trace = review_trace(raw_trace)
+            previous_attempts[:] = provider_trace['attempts']
+            trace.update(provider_trace)
+            if probe and time.time() >= limit:
+                return None
+            try:
+                decision = validate(payload)
+            except (ValueError, TypeError):
+                return None
+            decision_mode = mode
+            trace.update(decision_mode=mode, input_fingerprint=digest(review_prompt),
+                         prompt_bytes=len(review_prompt.encode()))
+            return decision
+
+        provider_called = False
+        prefer_vision = runner3 and self.cfg.analysis_version == 'text' and bool(paths)
+        decision = run_review('vlm', probe=True) if prefer_vision else None
+        if decision is None and (not prefer_vision or time.time() < deadline):
+            decision = run_review('vlm' if self.cfg.analysis_version == 'vlm' and paths else 'text')
+        attempts=trace['attempts']
         trace['completed_at']=time.time()
         metadata=dict(charts=paths,analysis_version=self.cfg.analysis_version,provider_called=provider_called,analysis_trace_id=trace['id'],
             decision_created_at=time.time(),decision_started_at=started,fingerprint=fingerprint,
             input_fingerprint=trace['input_fingerprint'],context_policy=POLICY_VERSION,
             why_reconsidered=changes,prompt_bytes=trace['prompt_bytes'],strategy_cohort=trace.get('strategy_cohort'))
-        try:
-            decision=validate(payload)
-        except Exception:
+        if decision is None:
             metadata['provider_busy']=getattr(self.llm,'last_status','')=='paid_in_flight'
             wait_statuses={'cooldown_skipped','quota_skipped','paid_in_flight','stopped','missing_key','budget_exhausted','budget_or_interval_hold'}
             waiting_only=(attempts is not None and not provider_called and (not attempts or all(a.get('status') in wait_statuses for a in attempts)))
@@ -356,6 +429,7 @@ class ContextEvaluator:
                 self.store.put(key,memory)
                 metadata['retry_at']=memory['last_failure']['retry_at']
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_or_unavailable_model',metadata=metadata)
+        metadata['decision_mode']=decision_mode
         trace['model_action']=decision.action
         source_candidate=candidate
         from trading.evaluation.setup_selection import validate_selection
@@ -364,9 +438,14 @@ class ContextEvaluator:
         metadata['setup_selection']=copy.deepcopy(selection)
         if runner3 and selection:
             trace['evidence_grade']=runner3_policy.evidence_grade(selection)
+            if selection.get('context_timeframe'):
+                trace['htf_evidence']={key:copy.deepcopy(selection[key])
+                    for key in ('context_timeframe','trigger_timeframe','evidence')}
         if runner2 and decision.price_plan:
             from trading.quant.structure_setups import trade_horizon
             frame=selection['trigger_timeframe'] if selection else decision.price_plan.entry_timeframe
+            if runner3 and selection and selection.get('context_timeframe'):
+                frame={'swing':'4h','intraday':'15m'}[selection['horizon']]
             metadata['trade_horizon']=trade_horizon(frame,time.time())
             trace['trade_horizon']=metadata['trade_horizon']['style']
         shadow_plan=None
@@ -428,7 +507,7 @@ class ContextEvaluator:
         economic_basis['account']['canonical_watch']=watch_review_key(current_watch)
         if runner2:
             economic_basis['benchmarks']=chart_context['benchmarks']
-        evaluation_key=digest(dict(policy=POLICY_VERSION,market=fingerprint,scope=scope,economic_basis=economic_basis))
+        evaluation_key=digest(dict(policy=policy_version,market=fingerprint,scope=scope,economic_basis=economic_basis))
         trace.update(status='completed',action=decision.action,rationale=decision.rationale,
             invalidation=decision.invalidation,watch_note=decision.watch_note,
             execution_status='awaiting_risk' if decision.action=='trade' else 'not_opened')
@@ -439,6 +518,8 @@ class ContextEvaluator:
         decision_ai=dict(provider=getattr(self.llm,'last_provider','unknown'),model=getattr(self.llm,'last_model','unknown'),
             fallback_reason=getattr(self.llm,'last_fallback_reason',''),
             credential_id=getattr(self.llm,'last_credential_id',''),quota_group=getattr(self.llm,'last_quota_group',''))
+        if runner3:
+            decision_ai['review_mode']=decision_mode
         record=dict(at=time.time(),action=decision.action,rationale=decision.rationale,decision_ai=decision_ai,
             invalidation=decision.invalidation,price_plan=metadata.get('price_plan'),charts=paths,fingerprint=fingerprint)
         card=setup_card(memory)

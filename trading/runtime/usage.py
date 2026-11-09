@@ -2,11 +2,11 @@
 import json
 
 TRACE_FIELDS=('id','mode','analysis_version','symbol','strategy','confidence','side','setup_id','setup_family','started_at','completed_at','status','action','model_action','provider','model','fallback_reason','execution_status','execution_reason','execution_details','rationale','invalidation','watch_note','why_reconsidered','market_fingerprint','input_fingerprint','context_policy','prompt_bytes')
-TRACE_FIELDS += ('runner_id','account_id','task','queued_at','strategy_cohort','trade_horizon','evidence_grade','opening_runner_id','management_trigger')
+TRACE_FIELDS += ('runner_id','account_id','task','queued_at','strategy_cohort','trade_horizon','evidence_grade','opening_runner_id','management_trigger','decision_mode','htf_evidence')
 ATTEMPT_FIELDS=('provider','model','provider_reported','status','phase','http_status','error_category','error_code','error_param','latency_ms','generation_requests','count_requests','input_tokens','output_tokens','estimated_cost_usd','pending_usd','estimated_input_tokens','token_budget','completion_token_limit','output_stop_reason','validation_issues','credential_id','quota_group','retry_number','retry_after_seconds','daily_quota_exhausted')
 
 
-ATTEMPT_FIELDS += ('neuron_reserved_estimate',)
+ATTEMPT_FIELDS += ('neuron_reserved_estimate','review_mode')
 
 
 def usage_task(trace):

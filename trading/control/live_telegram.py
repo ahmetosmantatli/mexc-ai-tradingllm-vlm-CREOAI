@@ -212,7 +212,27 @@ class LiveTelegramController(TelegramController):
         return text+self.progress_text({**snapshot,'control':state})
 
     def watchlist_text(self,account_id):
-        return super().watchlist_text(account_id).replace('Takip listesi · PAPER','Takip listesi · LIVE',1)
+        text=super().watchlist_text(account_id).replace('Takip listesi · PAPER','Takip listesi · LIVE',1)
+        snapshot=self.snapshot_provider(account_id) or {}
+        tracking=snapshot.get('htf_zone_scan') or {}
+        if not tracking:
+            return text
+        stages={'awaiting_touch':'Bölge teması bekleniyor',
+                'awaiting_confirmation':'Temas var, kapanış teyidi bekleniyor',
+                'confirmed':'Kapanış teyidi görüldü'}
+        recent=sorted(tracking.items(),key=lambda item:item[1]['last_scanned_at'],reverse=True)
+        lines=[]
+        now=time.time()
+        for symbol, row in recent[:6]:
+            for setup in row['setups'][:2]:
+                evidence=setup['evidence']
+                zone=evidence['zone']
+                stage=stages[evidence['stage']]
+                if evidence.get('expires_at',now+1)<=now:
+                    stage='Son teyidin süresi doldu'
+                lines.append(f"{symbol} {setup['side']} · {setup['context_timeframe']} → {setup['trigger_timeframe']}"
+                             f" · {zone['low']:g}–{zone['high']:g} · {stage}")
+        return text[:2600]+'\n\nAlgoritmanın son bölge gözlemleri\n'+'\n'.join(lines)
 
     def diagnostics_text(self,account_id):
         text=super().diagnostics_text(account_id).replace('PAPER','LIVE')

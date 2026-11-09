@@ -347,12 +347,15 @@ def test_runner3_small_account_sizes_immediately_without_same_side_exposure(tmp_
     decision.metadata.update(
         setup_selection=dict(setup_id='setup1', family='trend_continuation', horizon='intraday',
                              macro_trend='bullish', side='long', reward_risk=2.,
-                             evidence={'kind': 'closed_bos'}, stop_reference=stop_reference, stop_loss_price=98.),
+                             state='ready', context_timeframe='4h', trigger_timeframe='15m',
+                             evidence={'kind': 'htf_zone_mss'}, stop_reference=stop_reference, stop_loss_price=98.,
+                             target_reference=dict(timeframe='4h', open_time=stamp-14400, field='high')),
         price_plan=dict(entry_type='market', entry_price=100., stop_loss_price=98., take_profit_price=106.,
                         entry_timeframe='15m', stop_reference=stop_reference,
-                        target_reference=dict(timeframe='15m', open_time=stamp, field='high'),
+                        target_reference=dict(timeframe='4h', open_time=stamp-14400, field='high'),
                         reason='Closed wick and structural target.'),
-        price_evidence={'15m': [[stamp, 100, 106, 98, 101, 1]]},
+        price_evidence={'15m': [[stamp, 100, 106, 98, 101, 1]],
+                        '4h': [[stamp-14400, 100, 106, 98, 101, 1]]},
     )
     private.equity, private.available = 50., 50.
     snapshot = runner._refresh([signal.symbol])

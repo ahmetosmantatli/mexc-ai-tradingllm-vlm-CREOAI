@@ -480,3 +480,21 @@ def test_user_facing_skip_messages_distinguish_contention_and_daily_quota():
     daily=provider_result(dict(status='quota_skipped',error_category='rolling_daily_requests',generation_requests=0))
     assert 'başka analizi' in busy and 'sığmadığı' not in busy
     assert '24 saatlik' in daily and 'sığmadığı' not in daily
+
+
+def test_opportunistic_vision_probe_is_one_free_attempt_without_paid_fallback(tmp_path):
+    calls=[]
+    def fail(request):
+        calls.append(request)
+        return httpx.Response(503,json={'error':{'message':'temporary'}})
+
+    p,_=pool(tmp_path,settings(groq_api_key_2='private-groq-key-2',groq_quota_group_2='distinct',
+        anthropic_api_key='private-paid-key',ai_claude_fallback_enabled=True, ai_pool_max_retry_attempts=1),fail)
+    p.claude.complete_json=lambda **kw:pytest.fail('opportunistic vision must never fall back to paid')
+    chart=tmp_path/'chart.png'
+    chart.write_bytes(b'small-chart')
+    p.deadline=time.time()+8
+    assert p.complete_vision_probe(system='instructions',user='same content',max_tokens=600,images=[str(chart)]) is None
+    assert len(calls)==1
+    assert p.last_trace['attempts'][0]['generation_requests']==1
+    assert calls[0].extensions['timeout']['read']<=8

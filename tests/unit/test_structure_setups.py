@@ -190,3 +190,104 @@ def test_benchmark_only_uses_aligned_closed_bars():
     assert results['BTC_USDT']['15m']['closed_at']==NOW
     assert results['BTC_USDT']['15m']['relative_return_6_bars']==pytest.approx(101/98-1)
     assert results['ETH_USDT']['15m'] is None
+
+
+def htf_zone_context(context_tf, trigger_tf):
+    ctx = context()
+    if context_tf == '1h':
+        hourly = deepcopy(view(ctx, '4h'))
+        hourly['timeframe'] = '1h'
+        old_times = [row[0] for row in hourly['recent_ohlcv']]
+        new_times = [NOW - 3600 * (12 - i) for i in range(12)]
+        timestamps = dict(zip(old_times, new_times))
+        for row in hourly['recent_ohlcv']:
+            row[0] = timestamps[row[0]]
+        for swing in hourly['features']['swings']:
+            swing['pivot_at'] = timestamps[swing['pivot_at']]
+            swing['confirmed_at'] = swing['pivot_at'] + 3 * 3600
+        ctx['timeframes'].append(hourly)
+
+    higher = view(ctx, context_tf)
+    origin, confirmation = higher['recent_ohlcv'][-4:-2]
+    origin[1:5] = [96., 97., 94., 95.]
+    confirmation[1:5] = [95., 102., 95., 101.]
+    higher['features']['order_block_candidates'] = [dict(
+        direction='bullish', open_time=origin[0], confirmed_by=confirmation[0],
+        low=94., high=97., status='retested')]
+    lower = view(ctx, trigger_tf)
+    for row in lower['recent_ohlcv']:
+        row[1:5] = [99., 100., 98., 99.]
+    low_swing = lower['features']['last_swing_low']
+    low_swing['price'] = 98.
+    high_swing = lower['features']['last_swing_high']
+    high_swing['price'] = 100.
+    lower['recent_ohlcv'][-3][3] = 96.
+    latest = lower['recent_ohlcv'][-1]
+    latest[1:5] = [99., 102., 98., 101.]
+    lower['features']['structure_shifts'] = [dict(at=latest[0], direction='bullish', level=100., kind='mss')]
+    return ctx
+
+
+@pytest.mark.parametrize('context_tf,trigger_tf,horizon', [('4h','15m','swing'), ('1h','5m','intraday')])
+@pytest.mark.parametrize('short', [False, True])
+def test_htf_zone_touch_then_ltf_shift_keeps_different_entry_stop_and_target_timeframes(
+        context_tf, trigger_tf, horizon, short):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context(context_tf, trigger_tf)
+    if short:
+        ctx = mirror(ctx)
+        block = view(ctx, context_tf)['features']['order_block_candidates'][0]
+        block.update(direction='bearish', low=103., high=106.)
+        shift = view(ctx, trigger_tf)['features']['structure_shifts'][0]
+        shift.update(direction='bearish')
+    setup, = build_htf_zone_setups(ctx, current_price=99. if short else 101., price_step=.01)
+    assert setup['state'] == 'ready'
+    assert (setup['context_timeframe'], setup['trigger_timeframe'], setup['horizon']) == (context_tf, trigger_tf, horizon)
+    assert setup['side'] == ('short' if short else 'long')
+    assert setup['stop_reference']['timeframe'] == trigger_tf
+    assert setup['target_reference']['timeframe'] == context_tf
+    assert setup['evidence']['zone']['confirmed_at'] < setup['evidence']['touch_at'] < setup['evidence']['confirmation_at']
+    assert setup['evidence']['kind'] == 'htf_zone_mss'
+    ctx['benchmarks'] = {'BTC_USDT': {'trend': 'bullish' if short else 'bearish'}}
+    assert build_htf_zone_setups(ctx, current_price=99. if short else 101., price_step=.01)[0]['setup_id'] == setup['setup_id']
+
+
+def test_htf_zone_requires_a_separate_touch_and_closed_confirmation_and_exposes_watch_stages():
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context('4h', '15m')
+    lower = view(ctx, '15m')
+    lower['recent_ohlcv'][-3][3] = 98.
+    lower['recent_ohlcv'][-1][3] = 96.
+    assert not any(row['state'] == 'ready' for row in build_htf_zone_setups(ctx, current_price=101.))
+    lower['recent_ohlcv'][-1][3] = 98.
+    untouched, = build_htf_zone_setups(ctx, current_price=101.)
+    assert untouched['state'] == 'watch'
+    assert untouched['evidence']['stage'] == 'awaiting_touch'
+    assert untouched['trigger_condition'] == 'price_below'
+    assert untouched['trigger'] == 97.
+
+    lower['recent_ohlcv'][-3][3] = 96.
+    lower['recent_ohlcv'][-1][4] = 99.
+    waiting, = build_htf_zone_setups(ctx, current_price=99.)
+    assert waiting['state'] == 'watch'
+    assert waiting['evidence']['stage'] == 'awaiting_confirmation'
+    assert waiting['trigger_condition'] == 'closed_candle_cross_above'
+    assert waiting['trigger'] == 100.
+
+    block = view(ctx, '4h')['features']['order_block_candidates'][0]
+    block['status'] = 'invalidated'
+    assert build_htf_zone_setups(ctx, current_price=99.) == []
+
+
+def test_htf_zone_rejects_open_confirmation_and_distal_close_invalidation():
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context('4h', '15m')
+    ctx['observed_at'] = NOW - 1
+    assert build_htf_zone_setups(ctx, current_price=101.) == []
+    ctx['observed_at'] = NOW
+    row = view(ctx, '15m')['recent_ohlcv'][-2]
+    row[3:5] = [92., 93.]
+    assert build_htf_zone_setups(ctx, current_price=101.) == []

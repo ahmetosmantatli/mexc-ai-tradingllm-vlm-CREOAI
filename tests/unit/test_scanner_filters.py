@@ -135,3 +135,38 @@ def test_runner2_swing_scan_does_not_need_a_15m_signal(monkeypatch):
     assert set(calls)=={'Min5','Min15','Hour4'}
     assert [c.features.get('seed_timeframe') for c in scan.candidates]==['4h']
     assert scan.candidates[0].features['source_closed_at']==now
+
+
+def test_runner3_scanner_records_touch_without_enqueuing_until_confirmation(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from trading.runtime.store import RuntimeStore
+    from .test_structure_setups import NOW, htf_zone_context, view
+
+    market=htf_zone_context('4h','15m')
+    market['symbol']='BTC_USDT'
+    trigger=view(market,'15m')
+    shifts=trigger['features'].pop('structure_shifts')
+    ticker=TickerSnapshot('BTC_USDT',101.,100.99,101.01,10_000_000.)
+    client=SimpleNamespace(list_fee_free_candidates=lambda:[], list_contract_symbols=lambda:['BTC_USDT'],
+                           get_ticker=lambda symbol:ticker, get_contract_rules=lambda symbol:SimpleNamespace(price_step=.01))
+    calls=[]
+
+    def build(client, symbol, *, include_hourly):
+        calls.append((symbol,include_hourly))
+        return SimpleNamespace(to_context=lambda **kw:deepcopy(market))
+
+    monkeypatch.setattr('trading.analysis.market.build_bundle',build)
+    monkeypatch.setattr('trading.quant.scanner.time.time',lambda:NOW)
+    store=RuntimeStore(str(tmp_path/'state'))
+    scanner=MarketScanner(client, rotation_store=store, htf_zone_entries=True)
+    assert scanner.scan().candidates == []
+    assert store.get('htf_zone_scan')['BTC_USDT']['priority_until'] > NOW
+    assert store.get('htf_zone_events')[-1]['evidence']['stage'] == 'awaiting_confirmation'
+    trigger['features']['structure_shifts']=shifts
+    candidate,=scanner.scan().candidates
+    assert candidate.features['htf_zone_seed'] and candidate.features['seed_timeframe']=='15m'
+    assert candidate.features['source_closed_at']==NOW
+    assert store.get('htf_zone_events')[-1]['evidence']['stage']=='confirmed'
+    assert calls==[('BTC_USDT',True),('BTC_USDT',True)]

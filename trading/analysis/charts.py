@@ -27,7 +27,7 @@ class ChartArtifact:
 
 
 def render_bundle(bundle, output_dir):
-    """Render three PNGs (one per timeframe), returning immutable hashed assets.
+    """Render one PNG per timeframe, returning immutable hashed assets.
 
     Each title includes source, symbol, timeframe and last closed bar. Filenames
     are content-addressed, preventing a newer chart overwriting trade evidence.
@@ -52,7 +52,7 @@ def _render(bundle, output_dir):
 
     result = []
     for view in bundle.views:
-        if view.label not in ('4h', '15m', '5m'):
+        if view.label not in ('4h', '1h', '15m', '5m'):
             raise ValueError('invalid chart timeframe')
         path = root/f'{bundle.symbol}-{view.label}-{view.fingerprint[:20]}.png'
         if not path.exists():

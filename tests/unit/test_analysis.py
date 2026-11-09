@@ -88,3 +88,93 @@ def test_chart_artifacts_are_content_addressed_pngs(tmp_path):
         assert Path(a.path).read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
         assert len(a.sha256)==64 and Path(a.path).is_absolute()
     assert render_bundle(bundle,tmp_path)==artifacts
+
+
+def test_runner3_hourly_bundle_uses_closed_min60_and_degrades_by_lane(tmp_path):
+    now = 1_800_000_010
+
+    class HourlyClient(Client):
+        def get_klines(self, symbol, interval, limit):
+            if interval == 'Min60':
+                data = rows(count=60, seconds=3600)
+                data.append([1_800_000_000, None, None, None, None, None])
+                return dict(symbol=symbol, interval=interval, candles=data)
+            seconds = next(v[1] for v in TIMEFRAMES.values() if v[0] == interval)
+            return dict(symbol=symbol, interval=interval, candles=rows(count=60, seconds=seconds))
+
+    class MissingHourlyClient(HourlyClient):
+        def get_klines(self, symbol, interval, limit):
+            if interval == 'Min60':
+                raise ValueError('hourly unavailable')
+            return super().get_klines(symbol, interval, limit)
+
+    bundle = build_bundle(HourlyClient(), 'TEST_USDT', now=now, include_hourly=True)
+    context = bundle.to_context(ict=True, htf_history=True)
+    frames = {view['timeframe']: view for view in context['timeframes']}
+    assert {frame: len(view['recent_ohlcv']) for frame, view in frames.items()} == {
+        '4h': 48, '1h': 48, '15m': 12, '5m': 12,
+    }
+    assert frames['1h']['closed_at'] == 1_800_000_000
+    assert frames['1h']['recent_ohlcv'][-1][0] == 1_799_996_400
+    assert 'structure_shifts' in frames['1h']['features']
+    degraded = build_bundle(MissingHourlyClient(), 'TEST_USDT', now=now, include_hourly=True)
+    assert {view.label for view in degraded.views} == {'4h', '15m', '5m'}
+
+    pytest.importorskip('matplotlib')
+    assert {chart.timeframe for chart in render_bundle(bundle, tmp_path)} == set(frames)
+
+
+def test_hourly_benchmark_keeps_closed_relative_returns_and_structure():
+    from trading.analysis.market import benchmark_context
+
+    step = 3600
+    end = 1_800_000_000
+    raw = [[end - (45 - i) * step, 100, 102, 99, 100, 1] for i in range(45)]
+    # Establish pivots followed by opposing closes with displacement.
+    raw[30][2] = 110
+    raw[31][3] = 90
+    raw[33][1:5] = [101, 104, 99, 100]
+    raw[34][1:5] = [100, 116, 98, 115]
+    raw[39][1:5] = [101, 103, 101, 102]
+    raw[40][1:5] = [100, 101, 82, 84]
+    # A currently forming hourly candle is deliberately invalid and excluded.
+    raw.append([end, None, None, None, None, None])
+
+    class Benchmarks:
+        def get_klines(self, symbol, interval, limit):
+            assert interval == 'Min60'
+            return dict(symbol=symbol, interval=interval,
+                        candles=raw if symbol == 'BTC_USDT' else raw[:-2])
+
+    frame = dict(timeframe='1h', recent_ohlcv=rows(count=12, seconds=step, end=end))
+    market = dict(symbol='TEST_USDT', observed_at=end + 10, timeframes=[frame])
+    benchmarks = benchmark_context(Benchmarks(), market, include_structure=True)
+    btc = benchmarks['BTC_USDT']['1h']
+    assert btc['closed_at'] == end
+    assert btc['last_break']['direction'] == 'bearish'
+    assert btc['structure_shifts'][-1]['kind'] == 'choch'
+    assert btc['order_block_candidates'][-1]['direction'] == 'bearish'
+    assert btc['relative_return_6_bars'] == pytest.approx(112 / 106 - 1)
+    assert benchmarks['ETH_USDT']['1h'] is None
+
+
+def test_one_minute_refinement_requires_the_latest_closed_aligned_candle():
+    from trading.analysis.market import entry_refinement_context
+
+    end = 1_800_000_000
+    data = rows(seconds=60, end=end)
+
+    class MinuteClient:
+        def get_klines(self, symbol, interval, limit):
+            assert (symbol, interval, limit) == ('TEST_USDT', 'Min1', 41)
+            forming = [end, None, None, None, None, None]
+            return dict(symbol=symbol, interval=interval, candles=[*data, forming])
+
+    market = dict(symbol='TEST_USDT', observed_at=end + 1)
+    context = entry_refinement_context(MinuteClient(), market)
+    assert context['timeframe'] == '1m'
+    assert context['closed_at'] == end
+    assert context['recent_ohlcv'] == data[-6:]
+    assert context['structure_shifts'] == []
+    data.pop()
+    assert entry_refinement_context(MinuteClient(), market) is None

@@ -4,7 +4,7 @@ from math import isfinite
 from time import time
 from zoneinfo import ZoneInfo
 
-COHORT = 'runner3-small-account-v2'
+COHORT = 'runner3-htf-zone-v3'
 MARGIN_RESERVE_FRACTION = .15
 MIN_NET_TARGET_R = 1.25
 MAX_COST_SHARE = .30
@@ -17,7 +17,7 @@ def uses_fixed_position_limit(runner_id, equity):
 
 def evidence_grade(setup):
     kind = setup['evidence']['kind']
-    return 'strong' if kind == 'sweep_mss_fvg_retest' or (
+    return 'strong' if kind in ('sweep_mss_fvg_retest', 'htf_zone_mss') or (
         kind == 'closed_bos' and setup['reward_risk'] >= 2 and
         setup['macro_trend'] == ('bullish' if setup['side']=='long' else 'bearish')
     ) else 'standard'
@@ -30,6 +30,13 @@ def validate_evidence(setup, plan, now=None):
     evidence = setup['evidence']
     if evidence.get('expires_at', float('inf')) <= now:
         raise ValueError('runner3_evidence_expired')
+    if setup.get('context_timeframe'):
+        if setup.get('state') != 'ready' or evidence.get('kind') not in ('htf_zone_choch', 'htf_zone_mss'):
+            raise ValueError('runner3_requires_verified_setup')
+        if plan.entry_timeframe != setup['trigger_timeframe']:
+            raise ValueError('runner3_trigger_timeframe_mismatch')
+        if plan.target_reference.model_dump() != setup['target_reference']:
+            raise ValueError('runner3_target_reference_mismatch')
     if plan.stop_reference.model_dump() != setup['stop_reference']:
         raise ValueError('runner3_stop_reference_mismatch')
     if (plan.stop_loss_price > setup['stop_loss_price'] if setup['side']=='long'

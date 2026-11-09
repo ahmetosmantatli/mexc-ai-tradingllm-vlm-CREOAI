@@ -108,7 +108,7 @@ class ProviderRouter:
         self._trace()
         return result
 
-    def _groq(self, system, user, max_tokens, images):
+    def _groq(self, system, user, max_tokens, images, *, request_timeout=None):
         self.last_provider='groq'
         model=self.settings.groq_vision_model if images else self.settings.groq_text_model
         self.last_model=model
@@ -151,7 +151,8 @@ class ProviderRouter:
             attempt.update(status='requesting',generation_requests=1)
             self._trace()
             response=self.client.post('https://api.groq.com/openai/v1/chat/completions',
-                headers={'Authorization':'Bearer '+self.settings.groq_api_key},json=payload)
+                headers={'Authorization':'Bearer '+self.settings.groq_api_key},json=payload,
+                **({'timeout':request_timeout} if request_timeout is not None else {}))
             from trading.agents.provider_limits import read_groq_headers
             attempt['provider_reported']=read_groq_headers(response.headers)
             if response.status_code==429:
@@ -192,7 +193,10 @@ class ProviderRouter:
             self._trace()
         return None
 
-    def complete_json(self, *, system, user, max_tokens=800, images=None):
+    def complete_vision_probe(self, *, system, user, max_tokens, images):
+        return self.complete_json(system=system,user=user,max_tokens=max_tokens,images=images,vision_probe=True)
+
+    def complete_json(self, *, system, user, max_tokens=800, images=None, vision_probe=False):
         self.last_trace={'attempts':[],'status':'pending'}
         self.last_fallback_reason=''
         self.last_provider='none'
@@ -202,13 +206,16 @@ class ProviderRouter:
             self.last_status='stopped'
             return self._finish(None)
         primary=self._primary(images)
+        if primary=='anthropic' and vision_probe:
+            primary='gemini'
         order=[] if primary=='anthropic' else [primary, 'gemini' if primary=='groq' else 'groq']
+        request_timeout = max(.01, self.deadline-time.time()) if vision_probe and self.deadline is not None else None
         for provider in order:
             if not self._allowed():
                 self.last_status='stopped'
                 return self._finish(None)
             if provider=='groq' and self.settings.groq_api_key:
-                result=self._groq(system,user,max_tokens,images)
+                result=self._groq(system,user,max_tokens,images,request_timeout=request_timeout)
             elif provider=='gemini' and self.settings.gemini_api_key:
                 self.last_provider='gemini'
                 self.last_model=self.settings.gemini_vision_model if images else self.settings.gemini_text_model
@@ -217,7 +224,8 @@ class ProviderRouter:
                 self.gemini.decision_schema=copy.deepcopy(self.decision_schema)
                 self.last_trace['attempts'].append(dict(provider='gemini',model=self.last_model,status='requesting',generation_requests=0,count_requests=0,latency_ms=0))
                 self._trace()
-                result=self.gemini.complete_json(system=system,user=user,max_tokens=max_tokens,images=images)
+                result=self.gemini.complete_json(system=system,user=user,max_tokens=max_tokens,images=images,
+                    **({'request_timeout':request_timeout} if request_timeout is not None else {}))
                 self.last_trace['attempts'][-1]=copy.deepcopy(self.gemini.last_attempt)
                 self.last_status=self.gemini.last_status
                 if result is not None:
@@ -229,8 +237,10 @@ class ProviderRouter:
                 continue
             if result is not None:
                 return self._finish(result)
-            if self.last_status=='stopped':
+            if self.last_status=='stopped' or vision_probe and any(a.get('generation_requests') for a in self.last_trace['attempts']):
                 return self._finish(None)
+        if vision_probe:
+            return self._finish(None)
         if not self._allowed():
             self.last_status='stopped'
             return self._finish(None)

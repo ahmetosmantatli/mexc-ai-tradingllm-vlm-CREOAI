@@ -11,6 +11,9 @@ class EntryPriceDrift(ValueError):
 
 
 CODES={
+    'runner3_requires_verified_setup':'RUNNER3_HTF_SETUP_REQUIRED',
+    'runner3_trigger_timeframe_mismatch':'RUNNER3_HTF_TRIGGER_TIMEFRAME',
+    'runner3_target_reference_mismatch':'RUNNER3_HTF_TARGET_REFERENCE',
     'runner3_net_target_r_too_low':'RUNNER3_NET_TARGET_R',
     'runner3_cost_share_too_high':'RUNNER3_COST_SHARE',
     'runner3_margin_reserve':'RUNNER3_MARGIN_RESERVE',

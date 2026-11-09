@@ -508,7 +508,8 @@ class LiveFleet:
                     text = failed.get(notice['status'], 'İnceleme kullanılabilir bir karar üretmedi. Ayrıntı: /diagnostics')
                 if notice['phase'] == 'result':
                     if notice['status'] == 'completed' and notice['model']:
-                        text += f" Model {notice['model']}."
+                        mode = {'vlm':'VLM', 'text':'görselsiz'}.get(notice.get('decision_mode'))
+                        text += f" Model {notice['model']}" + (f" · {mode}." if mode else '.')
                     if notice['requests'] > 1:
                         text += f" AI üretim isteği: {notice['requests']}."
                     if notice['status'] == 'completed' and notice['rationale']:
@@ -611,8 +612,13 @@ class LiveFleet:
             text+=f'Giriş/SL/TP kaynağı: {source}\n'
             if metadata.get('price_plan'):
                 text+='Plan gerekçesi: '+str(metadata['price_plan'].get('reason',''))[:600]+'\n'
+            setup=metadata.get('htf_setup') or {}
+            if setup:
+                text+=f"Kurulum: {setup['context_timeframe']} bölgesi → {setup['trigger_timeframe']} kapanış teyidi\n"
             ai=metadata.get('decision_ai') or {}
-            text+=f"Kararı veren AI: {ai.get('provider','kayıtlı değil')} / {ai.get('model','kayıtlı değil')}\n"
+            modality={'vlm':'VLM · grafik + sayısal veri','text':'Görselsiz · sayısal veri'}.get(ai.get('review_mode'))
+            text+=f"Kararı veren AI: {ai.get('provider','kayıtlı değil')} / {ai.get('model','kayıtlı değil')}"
+            text+=(f" | {modality}" if modality else '')+'\n'
         if state=='closed':
             text+=f"Kapanış nedeni: {row.get('close_reason','borsa kaydı')}\n"
             if row.get('close_reason')=='EMERGENCY':

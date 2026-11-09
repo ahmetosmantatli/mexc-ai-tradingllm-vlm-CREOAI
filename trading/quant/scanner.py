@@ -68,6 +68,7 @@ class MarketScanner:
     structure_setups_enabled: bool = False
     multihorizon: bool = False
     strict_ict: bool = False
+    htf_zone_entries: bool = False
 
     def scan(self, symbols: Sequence[str] | None = None) -> ScanResult:
         started=time.monotonic()
@@ -93,7 +94,12 @@ class MarketScanner:
             universe = preferred + others
         if self.rotation_store is not None and symbols is None:
             from trading.runtime.universe import select_universe
-            universe=select_universe(self.rotation_store,universe,self.max_symbols)
+            priority = []
+            if self.htf_zone_entries:
+                tracked = self.rotation_store.get('htf_zone_scan', {})
+                priority = sorted((symbol for symbol, row in tracked.items() if row.get('priority_until', 0) > time.time()),
+                                  key=lambda symbol: tracked[symbol]['last_scanned_at'])
+            universe=select_universe(self.rotation_store,universe,self.max_symbols,priority=priority)
         else:
             universe = universe[: self.max_symbols]
 
@@ -109,23 +115,28 @@ class MarketScanner:
         filtered_out: dict[str, str] = {}
         candidates: list[CandidateSignal] = []
         kept = 0
+        htf_tracking = self.rotation_store.get('htf_zone_scan', {}) if self.htf_zone_entries and self.rotation_store else {}
+        htf_events = []
 
         def inspect(symbol):
             sym=symbol.upper()
             passed=False
             try:
-                if tickers is not None and sym not in tickers:return sym,False,[],'NO_TICKER',None
+                if tickers is not None and sym not in tickers:return sym,False,[],'NO_TICKER',None,None
                 ticker=tickers[sym] if tickers is not None else self.client.get_ticker(sym)
                 ok,reason=self.liquidity.passes(ticker)
                 if not ok:
-                    return sym,False,[],reason,None
+                    return sym,False,[],reason,None,None
                 passed=True
+                if self.htf_zone_entries:
+                    signals,tracking=self._htf_candidates(sym,ticker,fee_free)
+                    return sym,passed,signals,None,None,tracking
                 klines=self.client.get_klines(sym,interval=self.kline_interval,limit=self.kline_limit)
                 candles=klines.get('candles') or []
                 if not getattr(self.client,'use_fixtures',False):
                     candles=[c for c in candles if isinstance(c,list) and len(c)>=5 and float(c[0])+900<=time.time()]
                     if not candles or time.time()-(float(candles[-1][0])+900)>1200:
-                        return sym,passed,[],'STALE_OR_MISSING_CANDLES',None
+                        return sym,passed,[],'STALE_OR_MISSING_CANDLES',None,None
                 ctx=StrategyContext(symbol=sym,last_price=float(ticker.last_price or 0),klines=candles,
                     fee_free_pair=sym in fee_free or bool(ticker.fee_free),quote_volume_24h=ticker.quote_volume_24h)
                 produced=run_strategies(ctx,self.strategies)
@@ -135,7 +146,7 @@ class MarketScanner:
                     candidate.features['observed_spread_bps']=ticker.spread_bps
                     if candles:
                         candidate.features.update(source_open_at=candles[-1][0],source_closed_at=float(candles[-1][0])+900)
-                return sym,passed,produced,None,None
+                return sym,passed,produced,None,None,None
             except sqlite3.Error:
                 raise
             except Exception as exc:
@@ -143,12 +154,12 @@ class MarketScanner:
                     else 'HTTP_'+str(exc.response.status_code) if isinstance(exc,httpx.HTTPStatusError)
                     else 'TIMEOUT' if isinstance(exc,httpx.TimeoutException) else 'NETWORK_ERROR' if isinstance(exc,httpx.TransportError)
                     else 'DATA_FORMAT' if isinstance(exc,(ValueError,TypeError,KeyError,IndexError)) else type(exc).__name__)
-                return sym,passed,[],'SYMBOL_DATA_ERROR',category
+                return sym,passed,[],'SYMBOL_DATA_ERROR',category,None
 
         def inspect_horizons(symbol):
-            sym,passed,produced,reason,error=inspect(symbol)
+            sym,passed,produced,reason,error,tracking=inspect(symbol)
             horizon_errors={}
-            if passed and self.multihorizon and self.structure_setups_enabled:
+            if passed and self.multihorizon and self.structure_setups_enabled and not self.htf_zone_entries:
                 from trading.analysis.market import TIMEFRAMES
                 ticker=tickers[sym] if tickers is not None else None
                 for tf in ('5m','4h'):
@@ -165,12 +176,19 @@ class MarketScanner:
                     except Exception as exc:
                         horizon_errors[f'{sym}:{tf}']=('MEXC_CODE_'+str(exc.public_error_code)
                             if isinstance(exc,PublicMarketError) else type(exc).__name__)
-            return sym,passed,produced,reason,error,horizon_errors
+            return sym,passed,produced,reason,error,horizon_errors,tracking
 
         # httpx clients may be shared between threads. Metadata calls above have
         # initialized the dedicated scan client's connection pool before workers.
         with ThreadPoolExecutor(max_workers=max(1,min(self.max_workers,4)),thread_name_prefix='market-scan') as pool:
-            for sym,passed,produced,reason,error,horizon_errors in pool.map(inspect_horizons,universe):
+            for sym,passed,produced,reason,error,horizon_errors,tracking in pool.map(inspect_horizons,universe):
+                if tracking is not None:
+                    previous = htf_tracking.get(sym, {}).get('setups', [])
+                    htf_events.extend(dict(symbol=sym, at=tracking['last_scanned_at'], **setup)
+                                      for setup in tracking['setups'] if setup not in previous)
+                    htf_tracking[sym] = tracking
+                elif self.htf_zone_entries and not passed and not error:
+                    htf_tracking.pop(sym, None)
                 errors.update(horizon_errors)
                 kept+=int(passed)
                 candidates.extend(produced)
@@ -179,6 +197,12 @@ class MarketScanner:
                 if error:
                     errors[sym]=error
 
+        if self.htf_zone_entries and self.rotation_store:
+            cutoff=time.time()-3600
+            self.rotation_store.put('htf_zone_scan', {symbol: row for symbol,row in htf_tracking.items()
+                if row['last_scanned_at'] >= cutoff and row['setups']})
+            if htf_events:
+                self.rotation_store.put('htf_zone_events', (self.rotation_store.get('htf_zone_events', []) + htf_events)[-200:])
         candidates.sort(key=lambda c: c.confidence, reverse=True)
         return ScanResult(
             scanned=len(universe),
@@ -186,6 +210,35 @@ class MarketScanner:
             filtered_out=filtered_out,
             candidates=candidates, errors=errors, duration_seconds=time.monotonic()-started,
         )
+
+    def _htf_candidates(self,symbol,ticker,fee_free):
+        from trading.analysis.market import build_bundle
+        from trading.quant.structure_setups import SECONDS, build_htf_zone_setups
+
+        bundle=build_bundle(self.client,symbol,include_hourly=True)
+        market=bundle.to_context(ict=True,htf_history=True)
+        rules=self.client.get_contract_rules(symbol)
+        options=build_htf_zone_setups(market,current_price=float(ticker.last_price),price_step=rules.price_step)
+        signals=[]
+        for setup in options:
+            if setup['state'] != 'ready':
+                continue
+            frame=setup['trigger_timeframe']
+            closed_at=setup['source_closed_at']
+            signals.append(CandidateSignal(symbol=symbol,side=setup['side'],strategy=StrategyName.STRUCTURE_SETUP,
+                entry_price=setup['entry_reference'],stop_loss_price=setup['stop_loss_price'],
+                take_profit_price=setup['take_profit_price'],confidence=.75,
+                fee_free_pair=symbol in fee_free or bool(ticker.fee_free),
+                rationale=f"{setup['context_timeframe']} bölgesi ve {frame} kapanış teyidi.",
+                features=dict(structure_seed=True,setup_family=setup['family'],setup_id=setup['setup_id'],
+                    htf_zone_seed=True,seed_timeframe=frame,observed_spread_bps=ticker.spread_bps,
+                    source_open_at=closed_at-SECONDS[frame],source_closed_at=closed_at)))
+        now=market['observed_at']
+        touched=any(setup['state']=='watch' and setup['evidence'].get('touch_at') for setup in options)
+        tracking=dict(last_scanned_at=now,priority_until=now+1200 if touched else 0,
+                      setups=[{key:setup[key] for key in ('state','side','context_timeframe','trigger_timeframe','evidence')}
+                              for setup in options])
+        return signals,tracking
 
     def _structure_candidates(self,symbol,ticker,rows,timeframe,fee_free):
         from trading.analysis.market import TIMEFRAMES, closed_candles, ict_features, structure_features

@@ -10,7 +10,7 @@ from math import isfinite
 
 VERSION = 'structure-setups-v1'
 FAMILIES = ('trend_continuation', 'pullback', 'countertrend_sweep_reclaim')
-SECONDS = {'5m': 300, '15m': 900, '4h': 14400}
+SECONDS = {'5m': 300, '15m': 900, '1h': 3600, '4h': 14400}
 HORIZONS = {'5m': 'scalp', '15m': 'intraday', '4h': 'swing'}
 REVIEW_BARS = {'5m': 6, '15m': 12, '4h': 12}
 
@@ -220,3 +220,146 @@ def build_structure_setups(market_context, *, current_price, price_step=0, trigg
                 add('countertrend_sweep_reclaim', 'short', _reference(view, tf, candle[0], 'high'),
                     dict(kind='high_sweep_closed_reclaim', timeframe=tf, at=candle[0], level=event['level']))
     return hypotheses
+
+
+HTF_ZONE_PATHS = (('4h', '15m', 'swing'), ('1h', '5m', 'intraday'))
+HTF_ZONE_VERSION = 'htf-zone-setup-v1'
+
+
+def _confirmed_zone(block, higher, context_tf):
+    if block.get('status') not in ('untested', 'retested'):
+        return None
+    direction = block.get('direction')
+    if direction not in ('bullish', 'bearish'):
+        return None
+    origin = _reference(higher, context_tf, block.get('open_time'), 'low')
+    high = _reference(higher, context_tf, block.get('open_time'), 'high')
+    confirmation = next((row for row in higher['rows'] if row[0] == block.get('confirmed_by')), None)
+    if not origin or not high or not confirmation or not origin['open_time'] < confirmation[0]:
+        return None
+    low_price, high_price = origin['price'], high['price']
+    if low_price >= high_price or low_price != block.get('low') or high_price != block.get('high'):
+        return None
+    long = direction == 'bullish'
+    if not (confirmation[4] > high_price if long else confirmation[4] < low_price):
+        return None
+    if any((row[4] < low_price if long else row[4] > high_price)
+           for row in higher['rows'] if row[0] > confirmation[0]):
+        return None
+    return dict(timeframe=context_tf, direction=direction, low=low_price, high=high_price,
+                open_time=origin['open_time'], confirmed_at=confirmation[0] + SECONDS[context_tf])
+
+
+def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step, observed, symbol):
+    direction = zone['direction']
+    long = direction == 'bullish'
+    edge = zone['high'] if long else zone['low']
+    distal = zone['low'] if long else zone['high']
+    outside_zone = current_price <= distal if long else current_price >= distal
+    if outside_zone:
+        return None
+    subsequent = [row for row in lower['rows'] if row[0] >= zone['confirmed_at']]
+    if any((row[4] < distal if long else row[4] > distal) for row in subsequent):
+        return None
+    touches = [row for row in subsequent if row[3] <= zone['high'] and row[2] >= zone['low']]
+    seconds = SECONDS[trigger_tf]
+    latest = lower['rows'][-1]
+    shift = next((event for event in reversed(lower['features'].get('structure_shifts', []))
+                  if event.get('at') == latest[0] and event.get('direction') == direction
+                  and event.get('kind') in ('choch', 'mss') and _positive(event.get('level'))
+                  and (latest[4] > event['level'] if long else latest[4] < event['level'])), None)
+    prior_touches = [row for row in touches if row[0] < latest[0]]
+    ready = shift is not None and bool(prior_touches) and observed < lower['closed_at'] + seconds
+
+    touch = None
+    if ready:
+        touch = prior_touches[-1]
+        stop_segment = [row for row in subsequent if row[0] >= touch[0]]
+        anchor = (min(stop_segment, key=lambda row: row[3]) if long
+                  else max(stop_segment, key=lambda row: row[2]))
+        trigger = condition = None
+    elif touches:
+        touch = touches[-1]
+        field = 'high' if long else 'low'
+        swings = _swings({trigger_tf: lower}, field)
+        levels = [ref['price'] for ref in swings
+                  if (ref['price'] > max(current_price, latest[4]) if long
+                      else ref['price'] < min(current_price, latest[4]))]
+        trigger = (min(levels) if long else max(levels)) if levels else None
+        condition = ('closed_candle_cross_above' if long else 'closed_candle_cross_below') if levels else None
+        anchor = touch
+    else:
+        approaching = current_price > edge if long else current_price < edge
+        trigger = edge if approaching else None
+        condition = ('price_below' if long else 'price_above') if approaching else None
+        anchor = None
+
+    entry = trigger if trigger is not None else current_price
+    field = 'low' if long else 'high'
+    stop_ref = (_reference(lower, trigger_tf, anchor[0], field) if anchor is not None
+                else _reference(higher, zone['timeframe'], zone['open_time'], field))
+    stop = _tick(stop_ref['price'] + (-1 if long else 1) * _atr(lower['rows']) * .1,
+                 price_step, up=not long)
+    targets = _swings({zone['timeframe']: higher}, 'high' if long else 'low')
+    possible = [ref for ref in targets if (ref['price'] > entry if long else ref['price'] < entry)]
+    if not possible:
+        return None
+    target_ref = min(possible, key=lambda ref: abs(ref['price'] - entry))
+    target = _tick(target_ref['price'], price_step, up=not long)
+    if not (0 < stop < entry < target if long else 0 < target < entry < stop):
+        return None
+
+    features = higher['features']
+    last_break = next(iter(reversed(features.get('breaks', []))), None)
+    last_shift = next(iter(reversed(features.get('structure_shifts', []))), None)
+    evidence = dict(kind=('htf_zone_' + shift['kind']) if ready else 'htf_zone_watch',
+                    stage='confirmed' if ready else 'awaiting_confirmation' if touch else 'awaiting_touch',
+                    zone=zone, touch_at=touch[0] + seconds if touch else None,
+                    confirmation_at=lower['closed_at'] if ready else None,
+                    context_last_break=last_break, context_last_shift=last_shift)
+    if ready:
+        evidence.update(shift=shift, expires_at=lower['closed_at'] + seconds)
+    macro = higher['features'].get('trend', 'unknown')
+    family = 'countertrend_sweep_reclaim' if macro in ('bullish', 'bearish') and macro != direction else 'pullback'
+    state = 'ready' if ready else 'watch'
+    material = dict(version=HTF_ZONE_VERSION, symbol=symbol, family=family,
+                    side='long' if long else 'short', horizon=horizon, evidence=evidence,
+                    trigger=trigger, state=state, stop=stop, target=target)
+    ident = sha256(json.dumps(material, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:24]
+    reference = lambda ref: {key: ref[key] for key in ('timeframe', 'open_time', 'field')}
+    return dict(setup_id=ident, **material, macro_trend=macro,
+                context_timeframe=zone['timeframe'], trigger_timeframe=trigger_tf,
+                source_closed_at=lower['closed_at'], requires_full_context=False,
+                entry_reference=entry, stop_loss_price=stop, take_profit_price=target,
+                reward_risk=abs(target - entry) / abs(entry - stop),
+                trigger_condition=condition, invalidation_condition='below' if long else 'above',
+                invalidation_price=distal,
+                stop_reference=reference(stop_ref), target_reference=reference(target_ref),
+                management_posture='reduced_risk_countertrend' if family == 'countertrend_sweep_reclaim' else 'normal_policy',
+                caveat='Closed HTF zone and LTF evidence; not a success probability or execution approval.')
+
+
+def build_htf_zone_setups(market_context, *, current_price, price_step=0):
+    """Use a confirmed HTF block, a subsequent closed LTF touch, then a later closed CHoCH/MSS.
+
+    A touch or a future level can produce a watch. The LTF trigger must close
+    after the touch candle, so same-candle intrabar ordering is never inferred.
+    BTC/ETH context stays independent of the symbol's executable evidence.
+    """
+    if (not _positive(current_price) or isinstance(price_step, bool)
+            or not isinstance(price_step, (int, float)) or not isfinite(price_step) or price_step < 0):
+        return []
+    views = _views(market_context)
+    options = []
+    for context_tf, trigger_tf, horizon in HTF_ZONE_PATHS:
+        if context_tf not in views or trigger_tf not in views:
+            continue
+        higher, lower = views[context_tf], views[trigger_tf]
+        for block in higher['features'].get('order_block_candidates', []):
+            zone = _confirmed_zone(block, higher, context_tf)
+            if zone is not None:
+                option = _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step,
+                                      market_context['observed_at'], market_context.get('symbol'))
+                if option is not None:
+                    options.append(option)
+    return options

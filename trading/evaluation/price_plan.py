@@ -14,7 +14,7 @@ from trading.quant.signals import CandidateSignal
 
 class CandleReference(BaseModel):
     model_config=ConfigDict(extra='forbid',strict=True,allow_inf_nan=False)
-    timeframe: Literal['5m','15m','4h']
+    timeframe: Literal['5m','15m','1h','4h']
     open_time: int = Field(ge=0)
     field: Literal['low','high']
 
@@ -25,7 +25,7 @@ class MarketPricePlan(BaseModel):
     entry_price: float = Field(gt=0)
     stop_loss_price: float = Field(gt=0)
     take_profit_price: float = Field(gt=0)
-    entry_timeframe: Literal['5m','15m','4h']
+    entry_timeframe: Literal['5m','15m','1h','4h']
     stop_reference: CandleReference
     target_reference: CandleReference
     reason: str = Field(min_length=12,max_length=600)
@@ -45,16 +45,17 @@ def evidence_from_market(market):
     result={}
     for view in market.get('timeframes',[]):
         tf=view.get('timeframe')
-        if tf not in ('5m','15m','4h'):continue
+        if tf not in ('5m','15m','1h','4h'):continue
         rows=view.get('recent_ohlcv',[])
-        if len(rows)>12:rows=rows[-12:]
+        max_rows = 48 if tf in ('1h', '4h') else 12
+        rows = rows[-max_rows:]
         result[tf]=[list(row[:6]) for row in rows if isinstance(row,(list,tuple)) and len(row)>=6]
     return result
 
 
 def _reference(ref,evidence,now):
     rows=evidence.get(ref.timeframe,[])
-    interval={'5m':300,'15m':900,'4h':14400}[ref.timeframe]
+    interval={'5m':300,'15m':900,'1h':3600,'4h':14400}[ref.timeframe]
     matches=[row for row in rows if type(row[0]) in (int,float) and row[0]==ref.open_time]
     if len(matches)!=1 or ref.open_time+interval>now:
         raise PricePlanError('missing_or_open_candle_reference')

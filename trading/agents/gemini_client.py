@@ -37,7 +37,7 @@ class GeminiClient:
     def _cooldown(self, key, seconds=60):
         self.store.put(key,time.time()+seconds)
 
-    def complete_json(self, *, system, user, max_tokens=800, images=None):
+    def complete_json(self, *, system, user, max_tokens=800, images=None, request_timeout=None):
         model=self.settings.gemini_vision_model if images else self.settings.gemini_text_model
         key='gemini:retry_at:'+model
         started=time.monotonic()
@@ -80,7 +80,8 @@ class GeminiClient:
                 endpoint='https://generativelanguage.googleapis.com/v1beta/models/'+model+':generateContent'
                 headers={'x-goog-api-key':self.settings.gemini_api_key}
             attempt.update(phase='generation',status='requesting',generation_requests=1)
-            response=self.client.post(endpoint,headers=headers,json=payload)
+            response=self.client.post(endpoint,headers=headers,json=payload,
+                **({'timeout':request_timeout} if request_timeout is not None else {}))
             if response.status_code==429:
                 from trading.agents.provider_limits import gemini_retry
                 retry,daily=gemini_retry(response)

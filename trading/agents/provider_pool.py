@@ -396,7 +396,7 @@ class ProviderPool:
         self._notify()
         return result
 
-    def _attempt(self,reservation,system,user,max_tokens,images):
+    def _attempt(self,reservation,system,user,max_tokens,images,*,vision_probe=False):
         slot,key,lease_id,tokens=reservation
         self.last_credential_id=slot.label
         self.last_quota_group=slot.group[:12]
@@ -416,7 +416,9 @@ class ProviderPool:
             self._notify()
         router.on_trace=progress
         try:
-            result=router.complete_json(system=system,user=user,max_tokens=max_tokens,images=images)
+            complete = (router.complete_vision_probe if vision_probe and isinstance(router,ProviderRouter)
+                        else router.complete_json)
+            result=complete(system=system,user=user,max_tokens=max_tokens,images=images)
             self.last_status=router.last_status
             self.last_fallback_reason=router.last_fallback_reason
             # Subrouter's generic final status is not the useful underlying failure.
@@ -596,7 +598,10 @@ class ProviderPool:
             self.successful_calls+=1
         return result
 
-    def complete_json(self, *, system, user, max_tokens=800, images=None):
+    def complete_vision_probe(self, *, system, user, max_tokens, images):
+        return self.complete_json(system=system,user=user,max_tokens=max_tokens,images=images,vision_probe=True)
+
+    def complete_json(self, *, system, user, max_tokens=800, images=None, vision_probe=False):
         self._reload_external()
         self.last_trace=dict(attempts=[],status='pending')
         self.last_status='not_called'
@@ -610,18 +615,18 @@ class ProviderPool:
             return self._finish(None)
         primary=self._primary(images)
         self._preferred_provider=primary
-        remaining=[slot for slot in self._slots if self._supports(slot,images)] if primary!='anthropic' else []
+        remaining=[slot for slot in self._slots if self._supports(slot,images)] if vision_probe or primary!='anthropic' else []
         retry=None
         waited_for_capacity=False
-        generation_limit=self.settings.ai_pool_max_generation_requests
-        reserve_paid=(self.settings.ai_claude_fallback_enabled and self.settings.anthropic_api_key
+        generation_limit=1 if vision_probe else self.settings.ai_pool_max_generation_requests
+        reserve_paid=(not vision_probe and self.settings.ai_claude_fallback_enabled and self.settings.anthropic_api_key
                       and generation_limit>1)
         free_limit=generation_limit-int(bool(reserve_paid))
         while remaining and self._allowed() and self._generation_requests()<free_limit:
             reservation=self._reserve(remaining,system,user,max_tokens,images)
             if reservation is None:
                 self.last_fallback_reason='free_pool_quota_or_cooldown'
-                if (not waited_for_capacity and getattr(self.settings,'ai_pool_max_retry_attempts',1)
+                if (not vision_probe and not waited_for_capacity and getattr(self.settings,'ai_pool_max_retry_attempts',1)
                         and self._busy(remaining,images)):
                     waited_for_capacity=True
                     if not self._wait(max(0,min(10,self.settings.ai_pool_retry_seconds))):
@@ -639,7 +644,7 @@ class ProviderPool:
                 break
             slot=reservation[0]
             remaining=[other for other in remaining if other is not slot]
-            result=self._attempt(reservation,system,user,max_tokens,images)
+            result=self._attempt(reservation,system,user,max_tokens,images,vision_probe=vision_probe)
             if result is not None:
                 self.successful_calls+=1
                 return self._finish(result)
@@ -653,6 +658,8 @@ class ProviderPool:
                 self.last_fallback_reason='invalid_model_output'
             elif retry is None and self._retryable(slot,images):
                 retry=slot
+        if vision_probe:
+            return self._finish(None)
         if not self._allowed():
             self.last_status='stopped'
             return self._finish(None)

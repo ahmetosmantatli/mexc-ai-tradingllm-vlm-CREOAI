@@ -9,7 +9,7 @@ from trading.models.domain import Side
 from trading.quant.signals import StrategyName
 from trading.runtime.store import RuntimeStore
 from .test_watch_service import signal
-from .test_structure_setups import context,view
+from .test_structure_setups import NOW, context, htf_zone_context, view
 
 
 def prepare(tmp_path,monkeypatch,*,counter=False):
@@ -152,21 +152,33 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
     market=context();market['symbol']='BTC_USDT'
     micro=view(market,'5m');micro['features']['breaks']=[dict(direction='bullish',at=micro['recent_ohlcv'][-1][0],level=100.)]
     if runner_id=='runner3':
-        micro['recent_ohlcv'][2][2]=115.
-        micro['features']['swings'][0]['price']=115.
+        offset=int(time())-NOW-1
+
+        def rebase(value):
+            if isinstance(value, dict):
+                return {key: rebase(item) for key,item in value.items()}
+            if isinstance(value, list):
+                return [rebase(item) for item in value]
+            return value + offset if isinstance(value, (int,float)) and value > 1000000 else value
+
+        market=rebase(htf_zone_context('4h','15m'))
+        market['symbol']='BTC_USDT'
     monkeypatch.setattr('trading.analysis.build_bundle',lambda *a,**kw:SimpleNamespace(fingerprint='native-choice',to_context=lambda **kw:deepcopy(market)))
-    monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
+    monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:
+                        [SimpleNamespace(path=tmp_path/'chart.png')] if runner_id=='runner3' else [])
     class Model:
         budget=None
         last_status='success';last_provider='mock';last_model='no-network'
         last_trace={'attempts':[{'generation_requests':1,'status':'success'}]}
         def complete_json(self,**kw):
             data=json.loads(kw['user']);assert data['candidate']['side']=='short'
-            option=next(o for o in data['account']['setup_selection']['options'] if o['family']=='trend_continuation' and o['state']=='ready')
+            assert bool(kw['images']) == (runner_id=='runner3')
+            family='pullback' if runner_id=='runner3' else 'trend_continuation'
+            option=next(o for o in data['account']['setup_selection']['options'] if o['family']==family and o['state']=='ready')
             return dict(action='trade',signal_id=data['candidate']['signal_id'],setup_id=option['setup_id'],
                 rationale='Kapanmış yapı ters ön elemeye rağmen long kurulum gösteriyor.',invalidation='Yapısal dip altı.',watch_note='',
                 sizing_plan={'leverage':5,'risk_per_trade_pct':.001},
-                price_plan=dict(entry_type='market',entry_price=100.,entry_timeframe='5m',stop_loss_price=option['stop_loss_price'],
+                price_plan=dict(entry_type='market',entry_price=100.,entry_timeframe=option.get('trigger_timeframe','5m'),stop_loss_price=option['stop_loss_price'],
                     take_profit_price=option['take_profit_price'],stop_reference=option['stop_reference'],
                     target_reference=option['target_reference'],reason='Teyitli fitil altı stop ve gözlenen üst likidite.'))
     cfg=Settings(_env_file=None,broker_mode='live',live_trading_enabled=True,live_automatic_enabled=True,
@@ -188,7 +200,7 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
         store,private,public,RiskEngine(settings=cfg),control_provider=lambda:dict(control),account_id='ahmet',binding_id='binding')
     runner=LiveRunner(cfg,store=store,account_id='ahmet',binding_id='binding',private=private,public=public,llm=Model(),external_control=lambda:dict(control),executor=executor)
     executor.grant_start('7',1)
-    seed=signal(Side.SHORT);seed.features.update(source_closed_at=time(),dedup_key='short-screen')
+    seed=signal(Side.SHORT);seed.features.update(source_closed_at=time(),dedup_key='short-screen',htf_zone_seed=runner_id=='runner3')
     runner.candidate_queue().refresh([seed])
     status=runner.cycle()
     assert status['reason']=='LIVE_PROTECTED',(status,store.get('analysis_trace'),store.get('live_candidate_error:BTC_USDT'))
@@ -198,4 +210,115 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
         row=executor.intents()[0]
         assert row['entry_submitted_type']==3
         assert row['proposal']['metadata']['runner3_allocation']['equity_usdt']==11
-        assert row['proposal']['metadata']['strategy_cohort']=='runner3-small-account-v2'
+        assert row['proposal']['metadata']['strategy_cohort']=='runner3-htf-zone-v3'
+        assert row['proposal']['metadata']['htf_setup']['context_timeframe']=='4h'
+        assert row['proposal']['metadata']['price_plan']['stop_reference']['timeframe']=='15m'
+        assert row['proposal']['metadata']['decision_ai']['review_mode']=='vlm'
+
+
+@pytest.mark.parametrize('probe_result', ['valid', 'invalid', 'unavailable'])
+def test_runner3_text_mode_prefers_valid_vision_and_keeps_single_decision(tmp_path, monkeypatch, probe_result):
+    from .test_structure_setups import htf_zone_context
+
+    market = htf_zone_context('4h','15m')
+    market['symbol'] = 'BTC_USDT'
+    monkeypatch.setattr('trading.analysis.build_bundle', lambda *args, **kwargs:
+                        SimpleNamespace(fingerprint='lane', to_context=lambda **kw: deepcopy(market)))
+    monkeypatch.setattr('trading.analysis.render_bundle', lambda *args, **kwargs:
+                        [SimpleNamespace(path=tmp_path/'chart.png')])
+
+    class Model:
+        budget = None
+        last_status = 'success'
+        last_provider = 'mock'
+        last_model = 'vision-model'
+        last_trace = {}
+        deadline = None
+
+        def __init__(self):
+            self.calls = []
+
+        def complete_vision_probe(self, **request):
+            self.calls.append(request)
+            self.last_trace = {'attempts':[{'generation_requests':int(probe_result != 'unavailable'),
+                                           'status':'quota_skipped' if probe_result == 'unavailable' else 'success'}]}
+            if probe_result == 'unavailable':
+                return None
+            return {'action':'hold', 'rationale':'Bekleme kararı.'} if probe_result == 'invalid' else self.hold()
+
+        def complete_json(self, **request):
+            self.calls.append(request)
+            self.last_model = 'text-model'
+            self.last_trace = {'attempts':[{'generation_requests':1,'status':'success'}]}
+            return self.hold()
+
+        @staticmethod
+        def hold():
+            return dict(action='hold',signal_id=None,rationale='Alt zaman dilimi teyidi bekleniyor.',
+                        invalidation='Bölge geçersiz olursa takip biter.',watch_note='')
+
+    model = Model()
+    settings = Settings(_env_file=None,analysis_version='text',live_structure_setups_enabled=True,
+                        live_price_plan_enabled=True)
+    store = RuntimeStore(str(tmp_path/'state'))
+    evaluator = ContextEvaluator(model,store,
+        SimpleNamespace(get_contract_rules=lambda symbol:SimpleNamespace(max_leverage=20,price_step=.01)),settings)
+    seed=signal(Side.LONG)
+    seed.entry_price=101.
+    result=evaluator.evaluate_candidates([seed],equity=11.58,risk_per_trade_pct=.03,target_leverage=20,
+        live_account_context=dict(mode='LIVE',currency='USDT',runner_id='runner3',current_equity=11.58,available_usdt=11.58),
+        live_positions={})
+    assert result.hold_reason == 'hold'
+    assert model.calls[0]['images'] and json.loads(model.calls[0]['user'])['version']=='vlm'
+    expected='vlm' if probe_result=='valid' else 'text'
+    assert result.metadata['decision_ai']['review_mode']==expected
+    trace=store.get('analysis_trace')
+    assert trace['decision_mode']==expected
+    assert [attempt['review_mode'] for attempt in trace['attempts']]==(['vlm'] if expected=='vlm' else ['vlm','text'])
+    if expected=='text':
+        assert len(model.calls)==2 and model.calls[1]['images'] is None
+        vision, text=(json.loads(call['user']) for call in model.calls)
+        vision.pop('version')
+        text.pop('version')
+        assert vision==text
+    else:
+        assert len(model.calls)==1
+
+
+@pytest.mark.parametrize('invalid_trigger',[False, True])
+def test_runner3_watch_uses_supplied_zone_trigger_and_invalidation(tmp_path, monkeypatch, invalid_trigger):
+    from .test_structure_setups import htf_zone_context
+
+    market = htf_zone_context('4h', '15m')
+    market['symbol'] = 'BTC_USDT'
+    lower = view(market,'15m')
+    lower['recent_ohlcv'][-3][3] = 98.
+    monkeypatch.setattr('trading.analysis.build_bundle', lambda *args, **kwargs:
+        SimpleNamespace(fingerprint='zone',to_context=lambda **kw:deepcopy(market)))
+    monkeypatch.setattr('trading.analysis.render_bundle',lambda *a,**kw:[])
+    cfg=Settings(_env_file=None,analysis_version='text',live_structure_setups_enabled=True,live_price_plan_enabled=True)
+    store=RuntimeStore(str(tmp_path/'state'))
+    def answer(**request):
+        option,=json.loads(request['user'])['account']['setup_selection']['options']
+        assert option['evidence']['stage']=='awaiting_touch'
+        payload=dict(action='watch',signal_id=None,setup_id=option['setup_id'],
+                     rationale='Bölgeye dönüş ve teyit gerekiyor.',invalidation='Bölgenin alt sınırı.',watch_note='')
+        if invalid_trigger:
+            from time import time
+            payload['watch_plan']=dict(trigger_condition='price_below',trigger_price=98.,
+                invalidation_condition='below',invalidation_price=94.,expires_at=time()+3600)
+        return payload
+    evaluator=ContextEvaluator(SimpleNamespace(budget=None,complete_json=answer),store,
+        SimpleNamespace(get_contract_rules=lambda _:SimpleNamespace(max_leverage=20,price_step=.01)),cfg)
+    seed=signal(Side.LONG)
+    seed.entry_price=101.
+    result=evaluator.evaluate_candidates([seed],equity=11.58,risk_per_trade_pct=.03,target_leverage=20,
+        live_account_context=dict(mode='LIVE',currency='USDT',runner_id='runner3',current_equity=11.58,available_usdt=11.58),
+        live_positions={})
+    if invalid_trigger:
+        assert result.hold_reason=='invalid_or_unavailable_model'
+        return
+    assert result.hold_reason=='watch'
+    assert result.metadata['watch_plan']['trigger_price']==97.
+    assert result.metadata['watch_plan']['invalidation_price']==94.
+    assert store.get('analysis_trace')['htf_evidence']['evidence']['stage']=='awaiting_touch'

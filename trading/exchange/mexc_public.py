@@ -136,7 +136,7 @@ class MexcPublicClient:
         key=path+json.dumps(params,sort_keys=True,separators=(',',':'))
         ttl=10. if path=='/api/v1/contract/detail' else 1. if path=='/api/v1/contract/ticker' and not params else 0.
         if '/contract/kline/' in path:
-            seconds={'Min5':300,'Min15':900,'Hour4':14400}.get(params.get('interval'))
+            seconds={'Min1':60,'Min5':300,'Min15':900,'Min60':3600,'Hour4':14400}.get(params.get('interval'))
             if seconds:
                 # Never age an earlier forming bar into a fake closed candle.
                 key+=':'+str(int(time.time()//seconds))
