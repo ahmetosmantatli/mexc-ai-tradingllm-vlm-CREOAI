@@ -157,6 +157,15 @@ class LivePositionManager:
                 except Exception as exc:
                     r.store.put('management_status',dict(at=time.time(),symbol=row['proposal']['symbol'],
                         status='review_failed',error_type=type(exc).__name__,reason='Yönetim değerlendirmesi tamamlanamadı; mevcut borsa koruması korunuyor.'))
+                try:self.review_favorable_vlm(row,control)
+                except Exception as exc:
+                    r.store.put('vlm_book_status',dict(at=time.time(),symbol=row['proposal']['symbol'],
+                        status='review_failed',error_type=type(exc).__name__,
+                        reason='VLM incelemesi tamamlanamadı; mevcut SL/TP korunuyor.'))
+            try:self.review_idle_vlm(control)
+            except Exception as exc:
+                r.store.put('vlm_book_status',dict(at=time.time(),status='idle_review_failed',
+                    error_type=type(exc).__name__,reason='VLM incelemesi tamamlanamadı; mevcut SL/TP korunuyor.'))
         finally:r._management_lock.release()
 
     def review(self,intent,control):
@@ -371,16 +380,279 @@ class LivePositionManager:
             latest=r.executor.state(intent['intent_id'])
             if latest.get('management_revision',0)!=revision or latest.get('status')!='protected':
                 trace['execution_reason']='management_position_changed';return
-            if decision.action!='hold':
+            from trading.runtime.vlm_book import four_hour_close_blocked
+            higher=next((view for view in market.get('timeframes',[]) if view.get('timeframe')=='4h'),{})
+            blocked=four_hour_close_blocked(action=decision.action,
+                context_timeframe=(metadata.get('htf_setup') or {}).get('context_timeframe'),
+                review_timeframe=decision.review_timeframe,side=proposal['side'],
+                higher_breaks=(higher.get('features') or {}).get('breaks'))
+            reported=decision.action
+            if blocked:
+                trace['execution_reason']='4h_structure_holds'
+                reported='hold'
+            elif decision.action!='hold':
                 latest=r.executor.manage_position(intent['intent_id'],data,expected_revision=revision,decision_id=trace['id'],
                     guard=lambda:self._permitted(control.get('updated_at')) and time.time()-now<=r.cfg.decision_ttl_seconds)
                 trace['execution_reason']=latest['status']
             with r.store.lock:
                 current=r.store.get(key,{})
                 current.update(review_timeframe=decision.review_timeframe,
-                    decisions=(current.get('decisions',[])+[dict(at=time.time(),action=decision.action,reason=decision.reason,ai=ai)])[-10:])
+                    decisions=(current.get('decisions',[])+[dict(at=time.time(),action=reported,reason=decision.reason,ai=ai)])[-10:])
                 r.store.put(key,current)
-            r.store.put('management_status',dict(at=time.time(),symbol=symbol,status=decision.action,reason=decision.reason,ai=ai))
+            r.store.put('management_status',dict(at=time.time(),symbol=symbol,status=reported,reason=decision.reason,ai=ai))
         finally:
             archive()
             if llm is not r.llm and callable(getattr(llm,'close',None)):llm.close()
+
+    def review_favorable_vlm(self, intent, control):
+        """Ask VLM once at about 1% in favor, and once around 2% if TP is still open."""
+        from trading.runtime.vlm_book import book_vlm_enabled, choch_extreme, due_favor_review
+        r = self.runner
+        if not self._permitted(control.get('updated_at')):
+            return
+        if intent.get('status') != 'protected' or intent.get('management_pending'):
+            return
+        proposal = intent['proposal']
+        metadata = proposal.get('metadata') or {}
+        if not book_vlm_enabled(metadata):
+            return
+        symbol = proposal['symbol']
+        side = proposal['side']
+        stop, target = r.executor.protection_levels(intent)
+        quote = r.quote(symbol)
+        fair = quote.raw['fairPrice']
+        key = self.key(intent)
+        card = r.store.get(key, {})
+        due = due_favor_review(side, intent['entry_fill_price'], quote.bid1, quote.ask1, fair, target,
+                               card.get('vlm_favor_fired'))
+        if due is None:
+            return
+        if time.time() < card.get('vlm_favor_retry_at', 0):
+            return
+        self._run_vlm_book(intent, control, phase=due, quote=quote, stop=stop, target=target,
+                           extreme=choch_extreme(metadata), reserve=due)
+
+    def review_idle_vlm(self, control):
+        """One VLM look at a triggered watch before the order, and one after, only while idle."""
+        from trading.evaluation.watch import WatchCoordinator, watch_event_key, watch_snapshot
+        r = self.runner
+        if r._cycle_lock.locked() or not self._permitted(control.get('updated_at')):
+            return
+        coordinator = WatchCoordinator(r.store)
+        protected = {row['proposal']['symbol']: row for row in r._intents()
+                     if row.get('status') == 'protected' and not row.get('management_pending')}
+        for summary in watch_snapshot(r.store):
+            symbol = summary.get('symbol')
+            if not symbol:
+                continue
+            card = coordinator.card(symbol)
+            state_key = 'live:vlm-watch:' + symbol
+            state = r.store.get(state_key, {})
+            if card.get('status') == 'triggered' and symbol not in protected:
+                event = watch_event_key(card)
+                if state.get('before_event') == event:
+                    continue
+                if time.time() < state.get('retry_at', 0) and state.get('event') == event:
+                    continue
+                self._run_watch_vlm(card, control, phase='before_order', event=event, intent=None)
+            elif card.get('status') == 'position_opened' and symbol in protected:
+                intent = protected[symbol]
+                if state.get('after_intent') == intent['intent_id']:
+                    continue
+                if time.time() < state.get('retry_at', 0) and state.get('after_event') == intent['intent_id']:
+                    continue
+                self._run_watch_vlm(card, control, phase='after_order', event=intent['intent_id'], intent=intent)
+
+    def _run_watch_vlm(self, card, control, *, phase, event, intent):
+        from trading.runtime.vlm_book import choch_extreme
+        r = self.runner
+        symbol = card['symbol']
+        state_key = 'live:vlm-watch:' + symbol
+        if intent is None:
+            candidate = card.get('candidate') or {}
+            plan = card.get('plan') or {}
+            side = card.get('side') or candidate.get('side')
+            stop = candidate.get('stop_loss_price') or plan.get('invalidation_price')
+            target = candidate.get('take_profit_price')
+            if side not in ('long', 'short') or not stop or not target:
+                return
+            try:
+                quote = r.quote(symbol)
+            except Exception:
+                self._watch_retry(state_key, event, phase)
+                return
+            position_id = 'watch:' + symbol
+            why = card.get('last_rationale') or candidate.get('rationale') or card.get('reason') or ''
+            extreme = plan.get('invalidation_price')
+            metadata = {}
+            synthetic = dict(intent_id='watch-' + symbol, position_id=position_id, entry_fill_price=candidate.get('entry_price') or plan.get('trigger_price'),
+                             proposal=dict(symbol=symbol, side=side, rationale=why, metadata=metadata,
+                                           stop_loss=dict(price=stop), take_profit_price=target))
+            self._run_vlm_book(synthetic, control, phase=phase, quote=quote, stop=stop, target=target,
+                               extreme=extreme if isinstance(extreme, (int, float)) else None,
+                               reserve=None, watch_event=event, position_id=position_id, apply_changes=False)
+            return
+        metadata = (intent['proposal'].get('metadata') or {})
+        stop, target = r.executor.protection_levels(intent)
+        try:
+            quote = r.quote(symbol)
+        except Exception:
+            self._watch_retry(state_key, event, phase)
+            return
+        self._run_vlm_book(intent, control, phase=phase, quote=quote, stop=stop, target=target,
+                           extreme=choch_extreme(metadata), reserve=None, watch_event=event,
+                           position_id=intent['position_id'], apply_changes=True)
+
+    def _watch_retry(self, state_key, event, phase):
+        r = self.runner
+        with r.store.lock:
+            state = r.store.get(state_key, {})
+            state['retry_at'] = time.time() + r.cfg.live_management_min_interval_seconds
+            state['event' if phase == 'before_order' else 'after_event'] = event
+            r.store.put(state_key, state)
+
+    def _run_vlm_book(self, intent, control, *, phase, quote, stop, target, extreme, reserve,
+                      watch_event=None, position_id=None, apply_changes=True):
+        from trading.analysis import build_bundle, render_bundle
+        from trading.runtime.live_capabilities import management_runner
+        from trading.runtime.vlm_book import VLM_BOOK_POLICY, VlmBookDecision, build_packet, judge_book_answer
+        r = self.runner
+        proposal = intent['proposal']
+        metadata = proposal.get('metadata') or {}
+        symbol = proposal['symbol']
+        side = proposal['side']
+        position_id = str(position_id or intent['position_id'])
+        now = time.time()
+        llm = None
+        trace = None
+        answered = False
+        try:
+            bundle = build_bundle(r.public, symbol)
+            paths = [str(chart.path) for chart in render_bundle(
+                bundle, Path(r.cfg.analysis_chart_dir) / symbol / ('vlm-book-' + bundle.fingerprint[:16]))]
+            if not paths:
+                raise ValueError('vlm_chart_missing')
+            equity = (r._refresh([symbol]).get('balance') or {}).get('equity')
+            setup = metadata.get('htf_setup') or {}
+            reference = (metadata.get('price_plan') or {}).get('stop_reference')
+            stop_loss = proposal.get('stop_loss') if isinstance(proposal.get('stop_loss'), dict) else {}
+            initial_stop = stop_loss.get('price', stop)
+            packet = build_packet(
+                phase=phase, why=proposal.get('rationale'),
+                choch_stop=dict(price=initial_stop, extreme=extreme, reference=reference, current_stop=stop),
+                target=target, equity=equity,
+                position=dict(position_id=position_id, symbol=symbol, side=side,
+                              entry=intent.get('entry_fill_price'), current_stop=stop, current_target=target,
+                              remaining_contracts=r.executor.remaining_contracts(intent) if intent.get('status') == 'protected' else None),
+                structure=dict(context_timeframe=setup.get('context_timeframe'),
+                               trigger_timeframe=setup.get('trigger_timeframe')))
+            prompt = json.dumps(dict(packet, charts=paths), ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+            llm = r.management_llm()
+            trace = dict(id=uuid4().hex, started_at=now, symbol=symbol, strategy='vlm_book', task='vlm_book_review',
+                         mode='LIVE', phase=phase, status='pending', attempts=[], prompt_bytes=len(prompt.encode()))
+            llm.decision_schema = VlmBookDecision.model_json_schema()
+            llm.response_validator = VlmBookDecision.model_validate
+            llm.can_call = lambda: self._permitted(control.get('updated_at'))
+            llm.deadline = now + r.cfg.decision_ttl_seconds
+            raw = llm.complete_json(system=VLM_BOOK_POLICY, user=prompt, max_tokens=700, images=paths)
+            answered = True
+            self._remember_vlm(intent, reserve, watch_event, phase)
+            trace.update(copy.deepcopy(getattr(llm, 'last_trace', {}) or {}))
+            judged = judge_book_answer(raw, position_id=str(position_id), side=side, current_stop=stop,
+                                       current_target=target, extreme=extreme)
+            trace.update(completed_at=time.time(), provider=getattr(llm, 'last_provider', 'none'),
+                         model=getattr(llm, 'last_model', ''), status=judged['kind'])
+            if judged['kind'] != 'apply' or not apply_changes:
+                r.store.put('vlm_book_status', dict(at=time.time(), symbol=symbol, status=judged['kind'], phase=phase,
+                                                    reason=self._vlm_reason(judged['kind'], apply_changes),
+                                                    past_extreme=judged.get('past_extreme')))
+                return
+            if not self._permitted(control.get('updated_at')) or time.time() - now > r.cfg.decision_ttl_seconds:
+                trace['execution_reason'] = 'vlm_book_expired'
+                return
+            if intent.get('status') != 'protected':
+                return
+            opening = metadata.get('runner_id', 'baseline-v1')
+            runner_id = management_runner(opening, control.get('runner_id'))
+            decision = judged['decision']
+            data = dict(action=decision.action, reason=decision.reason,
+                        ai=dict(provider=trace.get('provider'), model=trace.get('model')),
+                        management_runner_id=runner_id)
+            if decision.action == 'move_stop':
+                data['stop_price'] = decision.stop_price
+            elif decision.action == 'move_target':
+                data['target_price'] = decision.target_price
+            else:
+                data['close_fraction'] = decision.close_fraction
+            revision = intent.get('management_revision', 0)
+            latest = r.executor.state(intent['intent_id'])
+            if latest.get('management_revision', 0) != revision or latest.get('status') != 'protected':
+                trace['execution_reason'] = 'management_position_changed'
+                return
+            updated = r.executor.manage_position(
+                intent['intent_id'], data, expected_revision=revision, decision_id=trace['id'],
+                guard=lambda: self._permitted(control.get('updated_at')) and time.time() - now <= r.cfg.decision_ttl_seconds)
+            confirmed = any(event.get('decision_id') == trace['id'] and event.get('status') == 'confirmed'
+                            for event in updated.get('management_events') or [])
+            trace['execution_reason'] = 'confirmed' if confirmed else updated.get('status')
+            r.store.put('vlm_book_status', dict(at=time.time(), symbol=symbol,
+                                                status='confirmed' if confirmed else 'unconfirmed',
+                                                phase=phase, action=decision.action, reason=decision.reason))
+        except Exception:
+            if not answered:
+                self._defer_vlm(intent, reserve, watch_event, phase)
+            r.store.put('vlm_book_status', dict(at=time.time(), symbol=symbol, status='unchanged', phase=phase,
+                                                reason='VLM değişikliği uygulanmadı; mevcut SL/TP korunuyor.'))
+        finally:
+            if trace is not None:
+                archive_trace(r.store, trace)
+            if llm is not None and llm is not r.llm and callable(getattr(llm, 'close', None)):
+                llm.close()
+
+    @staticmethod
+    def _vlm_reason(kind, apply_changes):
+        if kind == 'apply' and not apply_changes:
+            return 'VLM notu emirden önce kaydedildi; borsa koruması değişmedi.'
+        return {'silent': 'VLM yanıtı yok; mevcut SL/TP korunuyor.',
+                'invalid': 'VLM yanıtı geçersiz; mevcut SL/TP korunuyor.',
+                'rejected': 'VLM stopu genişletilemez; mevcut SL/TP korunuyor.',
+                'hold': 'VLM pozisyonu olduğu gibi bırakıyor.'}.get(kind, 'Mevcut SL/TP korunuyor.')
+
+    def _remember_vlm(self, intent, reserve, watch_event, phase):
+        if reserve and intent.get('status') == 'protected':
+            r = self.runner
+            with r.store.lock:
+                card = r.store.get(self.key(intent), {})
+                fired = list(card.get('vlm_favor_fired') or [])
+                if reserve not in fired:
+                    fired.append(reserve)
+                card['vlm_favor_fired'] = fired
+                card.pop('vlm_favor_retry_at', None)
+                r.store.put(self.key(intent), card)
+            return
+        if watch_event:
+            self._mark_watch(intent['proposal']['symbol'], phase, watch_event, intent)
+
+    def _defer_vlm(self, intent, reserve, watch_event, phase):
+        r = self.runner
+        when = time.time() + r.cfg.live_management_min_interval_seconds
+        if reserve and intent.get('status') == 'protected':
+            with r.store.lock:
+                card = r.store.get(self.key(intent), {})
+                card['vlm_favor_retry_at'] = when
+                r.store.put(self.key(intent), card)
+            return
+        if watch_event:
+            self._watch_retry('live:vlm-watch:' + intent['proposal']['symbol'], watch_event, phase)
+
+    def _mark_watch(self, symbol, phase, event, intent):
+        r = self.runner
+        with r.store.lock:
+            state = r.store.get('live:vlm-watch:' + symbol, {})
+            if phase == 'before_order':
+                state['before_event'] = event
+                state['before_at'] = time.time()
+            else:
+                state['after_intent'] = intent['intent_id']
+            state.pop('retry_at', None)
+            r.store.put('live:vlm-watch:' + symbol, state)
