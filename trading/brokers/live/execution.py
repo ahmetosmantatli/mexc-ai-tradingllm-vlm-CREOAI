@@ -12,7 +12,7 @@ import copy
 import hashlib
 import json
 from math import isfinite
-from time import time
+from time import sleep, time
 from uuid import uuid4
 
 from trading.brokers.live.management import PositionManagementMixin
@@ -514,12 +514,25 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                 self._halt(row,'filled_position_risk_exceeds_plan')
                 return self._close_once(row,position,token,'EMERGENCY')
             protection_state=self._protected(row,position)
+            if ioc and protection_state is False:
+                # A complete but empty read can precede the IOC attachment
+                # becoming visible. Recheck without sending any exchange write.
+                self._save(row)
+                for delay in (.25,.5):
+                    sleep(delay)
+                    self._check_lease(token)
+                    protection_state=self._protected(row,position)
+                    position=self._position(row,order)
+                    if position is None:
+                        closed=self._historical_close(row,order)
+                        if closed:return closed
+                        return self._halt(row,'entry_position_not_identified')
+                    if protection_state is not False:break
             if protection_state is True:
                 row.update(status='protected')
                 return self._resolved(row)
             if ioc or protection_state is None:
-                # An absent IOC attachment may still be propagating. Do not
-                # submit a second stop/target pair for the same position.
+                # Never submit a second stop/target pair for an IOC position.
                 return self._emergency_close(row,position,token)
             if not row.get('protection_write_attempted') and not row.get('emergency_close_attempted'):
                 self._gate(entry=False)

@@ -181,10 +181,60 @@ def test_runner2_ioc_refuses_to_post_if_the_quote_cannot_meet_budget(tmp_path):
     assert not executor.state(intent['intent_id'])['entry_write_attempted']
 
 
-def test_runner2_ioc_missing_attachment_closes_without_duplicating_protection(tmp_path):
+def test_runner2_ioc_missing_attachment_closes_without_duplicating_protection(tmp_path,monkeypatch):
     executor,private,store,intent,calls=ioc_case(tmp_path,attached=False)
+    delays=[]
+    monkeypatch.setattr('trading.brokers.live.execution.sleep',delays.append)
     row=executor.execute(intent['intent_id'])
     assert row['close_reason']=='EMERGENCY'
+    assert len(private.closes)==1 and not private.protects and calls==[100.]
+    assert delays==[.25,.5]
+    closed=executor.reconcile(intent['intent_id'])
+    assert closed['status']=='closed'
+    assert store.get('live:halt')['reason']=='emergency_close_requires_review'
+
+
+def test_runner2_ioc_verifies_attachment_that_appears_on_recheck(tmp_path,monkeypatch):
+    executor,private,store,intent,calls=ioc_case(tmp_path)
+    reads=[]
+    def protection_orders(*args,**kwargs):
+        reads.append(kwargs['page_num'])
+        return [] if len(reads)==1 else deepcopy(private.stops)
+    private.protection_orders=protection_orders
+    monkeypatch.setattr('trading.brokers.live.execution.sleep',lambda _:None)
+    row=executor.execute(intent['intent_id'])
+    assert row['status']=='protected' and reads==[1,1]
+    assert not private.closes and not private.protects and calls==[100.]
+    assert not store.get('live:halt')
+
+
+@pytest.mark.parametrize('history_visible',[True,False])
+def test_runner2_ioc_reconciles_position_closed_during_protection_recheck(tmp_path,monkeypatch,history_visible):
+    executor,private,store,intent,calls=ioc_case(tmp_path,attached=False)
+    def exchange_closes(_):
+        private.positions=[]
+        if history_visible:
+            private.make_history(private.order_row['dealVol'])
+    monkeypatch.setattr('trading.brokers.live.execution.sleep',exchange_closes)
+    row=executor.execute(intent['intent_id'])
+    assert not private.closes and not private.protects and calls==[100.]
+    if not history_visible:
+        assert store.get('live:halt')['reason']=='entry_position_not_identified'
+        private.make_history(private.order_row['dealVol'])
+        row=executor.reconcile(intent['intent_id'])
+    assert row['status']=='closed' and row['close_reason']=='EXCHANGE_CLOSE'
+    assert not store.get('live:halt')
+
+
+def test_runner2_ioc_conflicting_attachment_does_not_get_visibility_grace(tmp_path,monkeypatch):
+    executor,private,store,intent,calls=ioc_case(tmp_path)
+    submit=private.submit_ioc
+    def submit_conflicting(**kwargs):
+        submit(**kwargs)
+        private.stops[0]['stopLossPrice']=97.
+    private.submit_ioc=submit_conflicting
+    monkeypatch.setattr('trading.brokers.live.execution.sleep',lambda _:pytest.fail('conflicting protection'))
+    assert executor.execute(intent['intent_id'])['close_reason']=='EMERGENCY'
     assert len(private.closes)==1 and not private.protects and calls==[100.]
 
 
