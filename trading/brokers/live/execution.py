@@ -224,6 +224,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             daily_loss_pct=state['daily_loss_pct'],weekly_loss_pct=state['weekly_loss_pct'],drawdown_pct=state['drawdown_pct'])
         decision=self.risk.evaluate(proposal,context)
         if not decision.accepted:raise LiveExecutionError('deterministic_risk_rejected',reason_codes=getattr(decision,'reason_codes',()))
+        row['entry_executable_quote']=entry
         row.update(planned_loss=planned_loss,equity_before=equity,entry_notional=notional,contract_size=rules.size,margin=readiness.planned_margin)
         return proposal,contracts,mode
 

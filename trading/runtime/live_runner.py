@@ -343,6 +343,8 @@ class LiveRunner:
             setup_family=(result.metadata.get('setup_selection') or {}).get('family',candidate.features.get('setup_family')),
             setup_id=(result.metadata.get('setup_selection') or {}).get('setup_id'),
             trade_horizon=result.metadata.get('trade_horizon'),
+            strategy_cohort=result.metadata.get('strategy_cohort'),
+            analysis_trace_id=result.metadata.get('analysis_trace_id'),
             contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
             decision_ai=result.metadata.get('decision_ai',{}),account_generation=snapshot['generation'])
         return proposal

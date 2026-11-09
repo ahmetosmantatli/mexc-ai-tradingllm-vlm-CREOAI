@@ -17,6 +17,7 @@ def record_review(store,trace,candidate,planned,settings):
     row=dict(id=trace['id'],opportunity=opportunity,at=trace['completed_at'],symbol=candidate.symbol,
         action=trace['action'],model_action=model_action,
         decision_status=trace.get('status','completed'),variant=settings.analysis_version,strategy=candidate.strategy.value,
+        strategy_cohort=trace.get('strategy_cohort'),trade_horizon=trace.get('trade_horizon'),
         setup_kind=trace.get('setup_family') or data['features'].get('setup_family',data['features'].get('setup_kind',data['strategy'])),
         baseline_kind='unconfirmed_structure_reference' if data['features'].get('structure_seed') else 'quant_reference',
         baseline=data,model_plan=planned.model_dump(mode='json') if planned is not None and model_action=='trade' else None,

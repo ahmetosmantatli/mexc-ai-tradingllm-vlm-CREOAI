@@ -49,3 +49,33 @@ def test_validated_trade_rejected_by_sizing_is_not_reported_as_model_hold():
     trace=dict(model_action='trade',action='hold',status='invalid_model_sizing',execution_status='not_opened')
     assert 'AI işlem önerdi' in trace_outcome(trace)
     assert 'beklemeyi seçti' not in trace_outcome(trace)
+
+
+def test_live_performance_separates_cohorts_and_requires_known_net(tmp_path):
+    path=tmp_path/'runtime.sqlite3'
+    store=RuntimeStore(str(path))
+    cohort=dict(runner_id='runner2',strategy_cohort='runner2-multihorizon-ict-v1',analysis_version='text')
+    archive_trace(store,dict(id='new',started_at=90,status='completed',action='trade',trade_horizon='swing',
+        attempts=[dict(generation_requests=1,input_tokens=120,output_tokens=30,latency_ms=100)],**cohort))
+    archive_trace(store,dict(id='old',started_at=90,status='completed',action='hold',runner_id='runner2',analysis_version='vlm'))
+    for ident,status,extra in [
+        ('win','closed',dict(entry_fill_price=99.,position_id='1',realized_complete=True,net_pnl=.5,
+                            entry_executable_quote=100.,entry_metrics=dict(initial_stop_risk_usdt=.25))),
+        ('missing','closed',dict(entry_fill_price=100.,position_id='2',realized_complete=False,net_pnl=0.)),
+        ('rejected','entry_rejected',{}),
+        ('unknown','entry_write_unknown',{}),
+    ]:
+        store.put('live:intent:'+ident,dict(staged_at=90,status=status,entry_write_attempted=True,
+            proposal=dict(side='long',metadata=dict(trade_horizon=dict(style='swing'),**cohort)),**extra))
+    result=audit(path,since=80,now=100,include_performance=True)
+    groups={g['cohort']:g for g in result['performance']}
+    assert groups['legacy_unversioned']['variant']=='vlm'
+    assert groups['legacy_unversioned']['win_rate'] is None
+    current=groups[cohort['strategy_cohort']]
+    assert current['entry_attempts']==4 and current['confirmed_fills']==2 and current['unresolved_attempts']==1
+    assert current['fill_rate_resolved_attempts']==2/3 and current['closed_with_net']==1
+    assert current['mean_net_r']==2 and current['by_opening_horizon']['swing']['wins']==1
+    assert round(current['mean_adverse_entry_slippage_bps'])==-100
+    assert current['mean_tokens']==150 and current['known_estimated_ai_cost_usd'] is None
+    saved=json.loads(store.db.execute("SELECT payload FROM ai_usage_events WHERE id='new'").fetchone()[0])
+    assert saved['strategy_cohort']==cohort['strategy_cohort'] and saved['trade_horizon']=='swing'

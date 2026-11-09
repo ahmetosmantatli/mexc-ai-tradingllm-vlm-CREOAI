@@ -244,6 +244,8 @@ class ContextEvaluator:
             analysis_version=self.cfg.analysis_version,started_at=started,status='pending',attempts=[],provider='none',model='',
             why_reconsidered=changes,market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))
+        if runner2:
+            trace['strategy_cohort']='runner2-multihorizon-ict-v1'
         publish_progress(self.store,trace)
         self.store.put('stage','model_evaluation')
         if hasattr(self.llm,'deadline'):
@@ -309,7 +311,7 @@ class ContextEvaluator:
         metadata=dict(charts=paths,analysis_version=self.cfg.analysis_version,provider_called=provider_called,analysis_trace_id=trace['id'],
             decision_created_at=time.time(),decision_started_at=started,fingerprint=fingerprint,
             input_fingerprint=trace['input_fingerprint'],context_policy=POLICY_VERSION,
-            why_reconsidered=changes,prompt_bytes=trace['prompt_bytes'])
+            why_reconsidered=changes,prompt_bytes=trace['prompt_bytes'],strategy_cohort=trace.get('strategy_cohort'))
         try:
             decision=validate(payload)
         except Exception:
