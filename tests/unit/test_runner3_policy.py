@@ -355,6 +355,13 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
 
     text = entry_gate_instruction(fee=fee, slippage=slippage)
     for line in (
+        'Price-action playbook, before you answer:',
+        'High structure is 4h with a 15m trigger. Low structure is 1h with a 5m trigger. Both directions use the same rule.',
+        'The stop is the CHoCH swing. A short uses the CHoCH high. A long uses the CHoCH low. Do not move it.',
+        'When the trade is against the higher timeframe, target only the next opposing block or flow on the trigger timeframe. Do not hold that trade toward a far higher-timeframe target.',
+        'When the trade is with the higher timeframe, a farther target is allowed. With the higher timeframe means the higher timeframe is long, price reached a block or flow, and the trigger CHoCH turns up, or the short mirror.',
+        'A hold is not the default when the CHoCH, the block or flow, and a target exist.',
+        'Free margin must cover the order. You choose the balance share.',
         'Runner 3 minimum cost-adjusted R is 1.25.',
         'Fee assumption is 0.0006 per side. Exit-slippage assumption is 0.0005 (5 bps), applied to the stop and the target.',
         'direction is 1 for long and -1 for short.',
@@ -386,6 +393,7 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
     assert 'cost_adjusted_R < 1.25' not in text
     assert 'do not replace the cost-adjusted R check' not in text
     assert 'If you BEKLE because no supplied level clears 1.25' not in text
+    assert text.index('Price-action playbook, before you answer:') < text.index('Runner 3 minimum cost-adjusted R is 1.25.')
     assert text.index('you must ENTER (action trade)') < text.index('would otherwise block')
     assert text.index('would otherwise block') < text.index('That choice stands')
     assert text.index('That choice stands') < text.index('does not reject that choice for cost-adjusted R')
@@ -548,3 +556,83 @@ def test_a_hold_keeps_only_the_farthest_supplied_level_that_clears_the_floor():
     assert selected_closed_setup(SimpleNamespace(features={}), [setup]) is None
     assert selected_closed_setup(SimpleNamespace(features={'setup_id': 'other'}), [setup]) is None
     assert selected_closed_setup(chosen, [dict(setup, state='watch')]) is None
+
+
+def test_entry_veto_names_the_failed_check_and_reentry_uses_the_current_price():
+    from trading.runtime.runner3_policy import entry_veto, priced_reentry
+
+    fee, slip = 0.0006, 0.0005
+    passed = dict(side='long', entry=100, stop=98, target=105, equity=100, free_margin=50,
+                  fee=fee, slippage=slip, notional=10, leverage=5)
+    assert entry_veto(**passed) is None
+    assert entry_veto(**dict(passed, target=100.4)) == 'cost_adjusted_r'
+    assert entry_veto(**dict(passed, target=100.2, free_margin=1, notional=100)) == 'cost_adjusted_r'
+    assert entry_veto(side='long', entry=100, stop=80, target=150, equity=100, free_margin=100,
+                      fee=fee, slippage=slip, notional=100, leverage=1) == 'equity_stop'
+    assert entry_veto(side='long', entry=100, stop=99, target=110, equity=1000, free_margin=10,
+                      fee=fee, slippage=slip, notional=40, leverage=1) == 'free_margin'
+
+    setup = dict(side='long', stop_loss_price=90, take_profit_price=120,
+                 entry_reference=100, opposing_target_levels=[dict(price=120, kind='block')],
+                 evidence=dict(alignment='against_higher_timeframe'))
+    prices, failed = priced_reentry(setup, price=96, equity=100, free_margin=50, fee=fee, slippage=slip)
+    assert failed is None
+    assert prices['entry'] == 96 and prices['stop'] == 90 and prices['target'] == 120
+    _prices, failed = priced_reentry(
+        dict(setup, take_profit_price=101), price=100, equity=100, free_margin=50, fee=fee, slippage=slip)
+    assert failed == 'cost_adjusted_r'
+    _prices, failed = priced_reentry(
+        dict(setup, stop_loss_price=80, take_profit_price=150), price=100, equity=100, free_margin=100,
+        fee=fee, slippage=slip, notional=100, leverage=1)
+    assert failed == 'equity_stop'
+
+
+def test_score_order_is_expected_r_then_with_the_higher_timeframe(tmp_path):
+    from time import time
+
+    from trading.models.domain import Side
+    from trading.quant.signals import CandidateSignal, StrategyName
+    from trading.runtime.candidates import CandidateQueue
+    from trading.runtime.runner3_policy import rank_setups, swap_candidate
+    from trading.runtime.store import RuntimeStore
+
+    fee, slip = 0.0006, 0.0005
+    against = dict(symbol='AAA', setup_id='a', side='long', entry_reference=100,
+                   stop_loss_price=90, take_profit_price=120,
+                   evidence=dict(alignment='against_higher_timeframe'))
+    with_htf = dict(symbol='BBB', setup_id='b', side='long', entry_reference=100,
+                    stop_loss_price=90, take_profit_price=120,
+                    evidence=dict(alignment='with_higher_timeframe'))
+    richer = dict(symbol='CCC', setup_id='c', side='long', entry_reference=100,
+                  stop_loss_price=90, take_profit_price=150,
+                  evidence=dict(alignment='against_higher_timeframe'))
+    assert [row['symbol'] for row in rank_setups([against, with_htf, richer], fee=fee, slippage=slip)] == [
+        'CCC', 'BBB', 'AAA']
+
+    report = swap_candidate(
+        [dict(richer, allocation=dict(target_margin_usdt=10))],
+        [dict(symbol='ETH_USDT', side='long', entry=100, stop=90, target=101)],
+        free_margin=1, required_margin=10, fee=fee, slippage=slip)
+    assert report['close'] is False
+    assert report['waiting']['symbol'] == 'CCC'
+    assert report['waiting']['expected_r'] > report['open_positions'][0]['expected_r']
+    assert swap_candidate([richer], [dict(symbol='ETH_USDT', side='long', entry=100, stop=90, target=101)],
+                          free_margin=10, required_margin=10, fee=fee, slippage=slip) is None
+
+    now = time()
+
+    def candidate(symbol, rank, aligned):
+        return CandidateSignal(
+            symbol=symbol, side=Side.LONG, strategy=StrategyName.STRUCTURE_SETUP,
+            entry_price=100, stop_loss_price=90, take_profit_price=120, confidence=.5,
+            features=dict(htf_zone_seed=True, seed_timeframe='15m', source_closed_at=now,
+                          capital_rank=rank, with_higher_timeframe=aligned, dedup_key=symbol))
+
+    queue = CandidateQueue(RuntimeStore(str(tmp_path / 'state')))
+    queue.refresh([
+        candidate('AGAINST', 2, False),
+        candidate('WITH', 2, True),
+        candidate('RICHER', 3, False),
+    ], now=now)
+    order = [queue.next(htf_zone_entries=True, now=now, lease_seconds=30).symbol for _ in range(3)]
+    assert order == ['RICHER', 'WITH', 'AGAINST']

@@ -356,6 +356,168 @@ def cost_adjusted_r(*, side, entry, stop, target, fee, slippage):
     return net / loss
 
 
+def _side_name(side):
+    value = getattr(side, 'value', side)
+    return value if value in ('long', 'short') else None
+
+
+def cash_for_veto(equity, live_account):
+    """Equity and free margin the veto reads. Paper passes its ledger; live passes the account."""
+    cash_equity = float(equity) if _positive_number(equity) else 0.
+    cash_free = cash_equity
+    if isinstance(live_account, dict):
+        current = live_account.get('current_equity')
+        available = live_account.get('available_usdt')
+        if _positive_number(current):
+            cash_equity = float(current)
+        if isinstance(available, (int, float)) and not isinstance(available, bool) and isfinite(available):
+            cash_free = max(0., float(available))
+    return cash_equity, cash_free
+
+
+def _cost_rate(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) and value >= 0
+
+
+def entry_veto(*, side, entry, stop, target, equity, free_margin, fee, slippage, notional=None, leverage=1):
+    """After the model. The name of the first failed check, or None when the order may stand.
+
+    Paper and live call this same function. The checks are cost-adjusted R,
+    the 15% equity stop, then whether free margin covers the order.
+    """
+    named = _side_name(side)
+    if named is None or not _positive_number(entry) or not _positive_number(stop) or not _positive_number(target):
+        return 'cost_adjusted_r'
+    if not _cost_rate(fee) or not _cost_rate(slippage):
+        return 'cost_adjusted_r'
+    long = named == 'long'
+    if long and not (stop < entry < target):
+        return 'cost_adjusted_r'
+    if not long and not (target < entry < stop):
+        return 'cost_adjusted_r'
+    ratio = cost_adjusted_r(side=named, entry=entry, stop=stop, target=target, fee=fee, slippage=slippage)
+    if ratio is None or ratio < MIN_NET_TARGET_R:
+        return 'cost_adjusted_r'
+    if not _positive_number(equity):
+        return 'equity_stop'
+    order_leverage = float(leverage) if _positive_number(leverage) else 1.
+    if notional is None:
+        if not isinstance(free_margin, (int, float)) or isinstance(free_margin, bool) or not isfinite(free_margin):
+            return 'free_margin'
+        if float(free_margin) + 1e-9 < MIN_OPEN_MARGIN_USDT / order_leverage:
+            return 'free_margin'
+        order_notional = MIN_OPEN_MARGIN_USDT
+    else:
+        if not _positive_number(notional):
+            return 'free_margin'
+        order_notional = float(notional)
+    _gross, _net, unit = ioc_target_economics(
+        side=named, entry=entry, stop=stop, target=target, fee=fee, slippage=slippage)
+    if unit * (order_notional / entry) > float(equity) * CONTINUOUS_STOP_RISK_CAP + 1e-8:
+        return 'equity_stop'
+    try:
+        free = float(free_margin)
+    except (TypeError, ValueError):
+        return 'free_margin'
+    if not isfinite(free) or order_notional / order_leverage > free + 1e-8:
+        return 'free_margin'
+    return None
+
+
+def priced_reentry(setup, *, price, equity, free_margin, fee, slippage, notional=None, leverage=1):
+    """A printed hold comes back at the current price, the CHoCH stop, and the next target.
+
+    The next target is the first supplied opposing level. Against the higher
+    timeframe that is the next block or flow. The returned veto name is the
+    failed check. A passing plan does not place the order by itself.
+    """
+    if not isinstance(setup, dict):
+        return None, 'cost_adjusted_r'
+    target = setup.get('take_profit_price')
+    stop = setup.get('stop_loss_price')
+    failed = entry_veto(
+        side=setup.get('side'), entry=price, stop=stop, target=target,
+        equity=equity, free_margin=free_margin, fee=fee, slippage=slippage,
+        notional=notional, leverage=leverage)
+    if failed:
+        return None, failed
+    levels = setup.get('opposing_target_levels')
+    level = levels[0] if isinstance(levels, list) and levels and isinstance(levels[0], dict) else None
+    return dict(entry=float(price), stop=float(stop), target=float(target), level=level,
+                stop_reference=setup.get('stop_reference'), target_reference=setup.get('target_reference')), None
+
+
+def with_higher_timeframe(setup):
+    """True when the setup trades in the higher-timeframe direction."""
+    if not isinstance(setup, dict):
+        return False
+    evidence = setup.get('evidence') if isinstance(setup.get('evidence'), dict) else {}
+    alignment = evidence.get('alignment')
+    if alignment == 'with_higher_timeframe':
+        return True
+    if alignment == 'against_higher_timeframe':
+        return False
+    macro = setup.get('macro_trend')
+    side = setup.get('side')
+    return macro in ('bullish', 'bearish') and macro == ('bullish' if side == 'long' else 'bearish')
+
+
+def rank_setups(setups, *, fee, slippage):
+    """Expected R after costs, then with the higher timeframe. Counter-HTF is not given a farther target."""
+    def key(setup):
+        ratio = cost_adjusted_r(
+            side=setup.get('side'), entry=setup.get('entry_reference', setup.get('entry')),
+            stop=setup.get('stop_loss_price', setup.get('stop')),
+            target=setup.get('take_profit_price', setup.get('target')),
+            fee=fee, slippage=slippage)
+        rank = ratio if isinstance(ratio, float) and isfinite(ratio) else float('-inf')
+        return (-rank, 0 if with_higher_timeframe(setup) else 1,
+                str(setup.get('symbol') or ''), str(setup.get('setup_id') or ''))
+    return sorted([row for row in setups or [] if isinstance(row, dict)], key=key)
+
+
+def swap_candidate(waiting, positions, *, free_margin, required_margin, fee, slippage):
+    """Report a higher-scoring waiting setup when free margin cannot fund it.
+
+    Waiting setups and open positions stay separate. This does not close anything.
+    """
+    if not _positive_number(required_margin):
+        return None
+    try:
+        free = float(free_margin)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(free) or free + 1e-9 >= float(required_margin):
+        return None
+    ranked = rank_setups(waiting, fee=fee, slippage=slippage)
+    if not ranked:
+        return None
+    best = ranked[0]
+    best_r = cost_adjusted_r(
+        side=best.get('side'), entry=best.get('entry_reference', best.get('entry')),
+        stop=best.get('stop_loss_price', best.get('stop')),
+        target=best.get('take_profit_price', best.get('target')),
+        fee=fee, slippage=slippage)
+    if best_r is None:
+        return None
+    weaker = []
+    for position in positions or []:
+        if not isinstance(position, dict) or position.get('symbol') == best.get('symbol'):
+            continue
+        ratio = cost_adjusted_r(
+            side=position.get('side'), entry=position.get('entry'), stop=position.get('stop'),
+            target=position.get('target'), fee=fee, slippage=slippage)
+        if ratio is not None and best_r > ratio:
+            weaker.append(dict(symbol=position.get('symbol'), side=position.get('side'), expected_r=ratio))
+    if not weaker:
+        return None
+    return dict(close=False, free_margin=free, required_margin=float(required_margin),
+                waiting=dict(symbol=best.get('symbol'), setup_id=best.get('setup_id'),
+                             expected_r=best_r, with_higher_timeframe=with_higher_timeframe(best),
+                             target=best.get('take_profit_price')),
+                open_positions=weaker)
+
+
 ENTRY_GATE_BEGIN = 'Runner 3 entry gate, checked before you propose and again by the engine:'
 ENTRY_GATE_END = 'End Runner 3 entry gate.'
 
@@ -440,6 +602,14 @@ def closed_entry_structure(setup):
     if not isinstance(shift, dict) or shift.get('kind') not in ('choch', 'mss'):
         return False
     return evidence.get('kind') == 'htf_zone_' + shift['kind']
+
+
+def closed_choch_at_block_or_flow(setup):
+    """A ready setup whose closed CHoCH or MSS sits at a block or a flow."""
+    if not closed_entry_structure(setup):
+        return False
+    zone = setup['evidence'].get('zone') or {}
+    return zone.get('kind') in ('block', 'flow')
 
 
 def _same_price(left, right):
@@ -576,6 +746,15 @@ def entry_gate_instruction(*, fee, slippage):
         raise ValueError('runner3_entry_cost_assumptions')
     lines = (
         ENTRY_GATE_BEGIN,
+        'Price-action playbook, before you answer:',
+        'High structure is 4h with a 15m trigger. Low structure is 1h with a 5m trigger. Both directions use the same rule.',
+        'Entry is a closed CHoCH on the trigger timeframe at a block or a flow. The trigger candle must close through that CHoCH level, against the structure it breaks.',
+        'The stop is the CHoCH swing. A short uses the CHoCH high. A long uses the CHoCH low. Do not move it.',
+        'When the trade is against the higher timeframe, target only the next opposing block or flow on the trigger timeframe. Do not hold that trade toward a far higher-timeframe target.',
+        'Against the higher timeframe means 4h long with a 15m short, or 1h long with a 5m short, and the mirror where the higher timeframe is short and the trigger is long.',
+        'When the trade is with the higher timeframe, a farther target is allowed. With the higher timeframe means the higher timeframe is long, price reached a block or flow, and the trigger CHoCH turns up, or the short mirror.',
+        'A hold is not the default when the CHoCH, the block or flow, and a target exist.',
+        'Free margin must cover the order. You choose the balance share.',
         'Before you propose an entry, apply this deterministic gate. The engine still runs it after you answer and still rejects a failure.',
         f'Runner 3 minimum cost-adjusted R is {MIN_NET_TARGET_R:.2f}.',
         f'Fee assumption is {fee:.4f} per side. Exit-slippage assumption is {slippage:.4f} ({slippage * 10000:.0f} bps), applied to the stop and the target.',

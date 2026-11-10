@@ -337,6 +337,117 @@ def test_htf_zone_requires_a_separate_touch_and_closed_confirmation_and_exposes_
     assert build_htf_zone_setups(ctx, current_price=99.) == []
 
 
+def _counter_context(context_tf, trigger_tf):
+    """Higher timeframe stays long. The trigger CHoCH is short, at a bearish block."""
+    ctx = htf_zone_context(context_tf, trigger_tf)
+    higher = view(ctx, context_tf)
+    higher['features']['trend'] = 'bullish'
+    origin, confirmation = higher['recent_ohlcv'][-4], higher['recent_ohlcv'][-3]
+    origin[1:5] = [105., 106., 103., 105.]
+    confirmation[1:5] = [104., 104., 100., 101.]
+    higher['features']['order_block_candidates'] = [dict(
+        direction='bearish', open_time=origin[0], confirmed_by=confirmation[0],
+        low=103., high=106., status='retested')]
+    swing = higher['features']['last_swing_low']
+    swing['price'] = 95.
+    for row in higher['features']['swings']:
+        if row.get('kind') == 'low':
+            row['price'] = 95.
+    pivot = next(row for row in higher['recent_ohlcv'] if row[0] == swing['pivot_at'])
+    pivot[3] = 95.
+    lower = view(ctx, trigger_tf)
+    block = lower['recent_ohlcv'][-6]
+    block[1:5] = [90., 92., 88., 89.]
+    lower['features']['order_block_candidates'] = [dict(
+        direction='bullish', open_time=block[0], low=88., high=92., status='untested')]
+    touch = lower['recent_ohlcv'][-3]
+    touch[1:5] = [102., 104., 101., 103.]
+    latest = lower['recent_ohlcv'][-1]
+    latest[1:5] = [100., 101., 96., 97.]
+    lower['features']['structure_shifts'] = [dict(
+        at=latest[0], direction='bearish', level=99., kind='choch')]
+    return ctx
+
+
+@pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
+def test_counter_htf_target_is_the_next_block(context_tf, trigger_tf):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = _counter_context(context_tf, trigger_tf)
+    setup = next(row for row in build_htf_zone_setups(ctx, current_price=99., price_step=.01)
+                 if row['context_timeframe'] == context_tf and row['side'] == 'short' and row['state'] == 'ready')
+    assert setup['evidence']['alignment'] == 'against_higher_timeframe'
+    assert setup['evidence']['shift']['kind'] == 'choch'
+    assert setup['take_profit_price'] == pytest.approx(88.)
+    assert setup['target_reference']['timeframe'] == trigger_tf
+    assert setup['opposing_target_levels'] == [dict(setup['target_reference'], price=88.)]
+    assert all(level['timeframe'] == trigger_tf for level in setup['opposing_target_levels'])
+    assert all(level['price'] != 95. for level in setup['opposing_target_levels'])
+
+
+@pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
+def test_with_htf_target_can_be_farther(context_tf, trigger_tf):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context(context_tf, trigger_tf)
+    higher = view(ctx, context_tf)
+    higher['recent_ohlcv'][1][2] = 120.
+    higher['features']['swings'].append(dict(
+        kind='high', price=120., pivot_at=higher['recent_ohlcv'][1][0],
+        confirmed_at=higher['recent_ohlcv'][4][0]))
+    setup = next(row for row in build_htf_zone_setups(ctx, current_price=101., price_step=.01)
+                 if row['context_timeframe'] == context_tf and row['state'] == 'ready')
+    assert setup['evidence']['alignment'] == 'with_higher_timeframe'
+    assert setup['side'] == 'long'
+    prices = [level['price'] for level in setup['opposing_target_levels']]
+    assert prices[0] < prices[-1]
+    assert 120. in prices
+    assert setup['take_profit_price'] == pytest.approx(prices[0])
+    assert all(level['timeframe'] == context_tf for level in setup['opposing_target_levels'])
+
+
+@pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
+@pytest.mark.parametrize('short', [False, True])
+def test_stop_is_the_choch_swing(context_tf, trigger_tf, short):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context(context_tf, trigger_tf)
+    if short:
+        ctx = mirror(ctx)
+        block = view(ctx, context_tf)['features']['order_block_candidates'][0]
+        block.update(direction='bearish', low=103., high=106.)
+        shift = view(ctx, trigger_tf)['features']['structure_shifts'][0]
+        shift.update(direction='bearish')
+    choch = view(ctx, trigger_tf)['recent_ohlcv'][-1]
+    setup, = [row for row in build_htf_zone_setups(ctx, current_price=99. if short else 101., price_step=.01)
+              if row['context_timeframe'] == context_tf and row['state'] == 'ready']
+    assert setup['stop_reference'] == dict(
+        timeframe=trigger_tf, open_time=choch[0], field='high' if short else 'low')
+    assert setup['stop_reference']['open_time'] == setup['evidence']['shift']['at']
+    if short:
+        assert setup['stop_loss_price'] > choch[2]
+    else:
+        assert setup['stop_loss_price'] < choch[3]
+
+
+@pytest.mark.parametrize('context_tf,trigger_tf,horizon', [('4h', '15m', 'swing'), ('1h', '5m', 'intraday')])
+def test_flow_confirms_the_same_way_as_a_block(context_tf, trigger_tf, horizon):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context(context_tf, trigger_tf)
+    higher = view(ctx, context_tf)
+    higher['features']['order_block_candidates'] = []
+    origin = higher['recent_ohlcv'][-5]
+    higher['features']['fvgs'] = [dict(direction='bullish', at=origin[0], lower=94., upper=97.)]
+    setup = next(row for row in build_htf_zone_setups(ctx, current_price=101., price_step=.01)
+                 if row['context_timeframe'] == context_tf and row['state'] == 'ready')
+    assert setup['evidence']['zone']['kind'] == 'flow'
+    assert (setup['context_timeframe'], setup['trigger_timeframe'], setup['horizon']) == (context_tf, trigger_tf, horizon)
+    assert setup['side'] == 'long'
+    assert setup['stop_reference']['timeframe'] == trigger_tf
+    assert setup['stop_reference']['field'] == 'low'
+
+
 def test_htf_zone_rejects_open_confirmation_and_distal_close_invalidation():
     from trading.quant.structure_setups import build_htf_zone_setups
 
