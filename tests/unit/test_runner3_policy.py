@@ -575,6 +575,8 @@ def test_entry_veto_names_the_failed_check_and_reentry_uses_the_current_price():
     assert entry_veto(side='long', entry=100, stop=99, target=110, equity=1000, free_margin=10,
                       fee=fee, slippage=slip, notional=40, leverage=1) == 'free_margin'
 
+    near = dict(timeframe='15m', open_time=2, field='high', price=105., kind='block')
+    far = dict(timeframe='4h', open_time=3, field='high', price=130., kind='block')
     setup = dict(side='long', stop_loss_price=90, take_profit_price=120,
                  entry_reference=100, opposing_target_levels=[dict(price=120, kind='block')],
                  evidence=dict(alignment='against_higher_timeframe'))
@@ -582,12 +584,25 @@ def test_entry_veto_names_the_failed_check_and_reentry_uses_the_current_price():
     assert failed is None
     assert prices['entry'] == 96 and prices['stop'] == 90 and prices['target'] == 120
     _prices, failed = priced_reentry(
-        dict(setup, take_profit_price=101), price=100, equity=100, free_margin=50, fee=fee, slippage=slip)
+        dict(setup, take_profit_price=101, opposing_target_levels=[dict(price=101, kind='block')]),
+        price=100, equity=100, free_margin=50, fee=fee, slippage=slip)
     assert failed == 'cost_adjusted_r'
     _prices, failed = priced_reentry(
-        dict(setup, stop_loss_price=80, take_profit_price=150), price=100, equity=100, free_margin=100,
-        fee=fee, slippage=slip, notional=100, leverage=1)
+        dict(setup, stop_loss_price=80, take_profit_price=150,
+             opposing_target_levels=[dict(price=150, kind='block')]),
+        price=100, equity=100, free_margin=100, fee=fee, slippage=slip, notional=100, leverage=1)
     assert failed == 'equity_stop'
+    # Against the higher timeframe the next block wins. With it, the farther supplied target wins.
+    against = dict(setup, stop_loss_price=98, take_profit_price=105, opposing_target_levels=[near, far])
+    against_prices, against_failed = priced_reentry(
+        against, price=100, equity=1000, free_margin=1000, fee=fee, slippage=slip, notional=10, leverage=5)
+    assert against_failed is None and against_prices['target'] == 105
+    assert against_prices['target_reference']['open_time'] == 2
+    with_prices, with_failed = priced_reentry(
+        dict(against, evidence=dict(alignment='with_higher_timeframe')),
+        price=100, equity=1000, free_margin=1000, fee=fee, slippage=slip, notional=10, leverage=5)
+    assert with_failed is None and with_prices['target'] == 130
+    assert with_prices['target_reference']['open_time'] == 3
 
 
 def test_score_order_is_expected_r_then_with_the_higher_timeframe(tmp_path):

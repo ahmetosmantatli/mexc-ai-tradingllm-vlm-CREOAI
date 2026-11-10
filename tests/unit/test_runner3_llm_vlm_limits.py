@@ -929,27 +929,16 @@ def test_hold_stores_triggers_and_a_hit_sends_the_pair_back(tmp_path, monkeypatc
     assert 'USELESS_USDT' in caplog.text and rationale in caplog.text
     assert all(f"{item['price']:.8g}" in caplog.text for item in row['triggers'])
 
-    old_observed = market['observed_at']
-    market['observed_at'] = old_observed + 30
-    market['timeframes'][0]['recent_ohlcv'][-1][4] = 96.
     hit = next(item['price'] for item in row['triggers'] if item['kind'] in ('zone_edge', 'block', 'flow'))
     due = claim_printed(store, lambda symbol: hit)
     assert due and due[0]['symbol'] == 'USELESS_USDT' and due[0]['trigger_price'] == hit
     review = review_signal(due[0])
 
     def again(packet):
-        prior = packet['account']['prior_hold']
-        assert prior['rationale'] == rationale
-        assert prior['old_market']['observed_at'] == old_observed
-        assert packet['market']['observed_at'] == old_observed + 30
-        assert prior['old_market']['observed_at'] != packet['market']['observed_at']
-        return hold_answer('USELESS yeni tetik bekleniyor.')
+        raise AssertionError('model was asked again')
 
     def again_vision(model, packet):
-        assert packet['account']['prior_hold']['rationale'] == rationale
-        assert model.calls[-1].get('images')
-        model.vision_answer = None
-        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+        raise AssertionError('model was asked again')
 
     second = DecisionModel(again, again_vision)
     settings = Settings(_env_file=None, analysis_version='text', live_structure_setups_enabled=True,
@@ -963,12 +952,15 @@ def test_hold_stores_triggers_and_a_hit_sends_the_pair_back(tmp_path, monkeypatc
         live_account_context=dict(mode='LIVE', currency='USDT', runner_id='runner3',
                                   current_equity=11.58, available_usdt=11.58),
         live_positions={})
+    # The printed price is outside the zone, so the card has no closed CHoCH.
     assert outcome.action.value == 'hold'
-    assert any(call.get('images') for call in second.calls)
-    assert 'Answer briefly whether the trade is taken now.' in second.calls[0]['system']
+    assert outcome.proposal is None
+    assert second.calls == []
+    assert outcome.metadata['provider_called'] is False
+    assert outcome.metadata['model_not_asked'] is True
     refreshed = store.get('price_action_holds')[-1]
     assert refreshed['status'] == 'armed'
-    assert refreshed['rationale'] == 'USELESS yeni tetik bekleniyor.'
+    assert refreshed['symbol'] == 'USELESS_USDT'
     assert refreshed['triggers']
 
 
@@ -1076,6 +1068,126 @@ def test_summary_packet_sends_closed_choch_and_the_fast_path_reads_it(tmp_path, 
     assert other_model.calls[0]['system'] == model.calls[0]['system']
     assert 'LAB_USDT' not in model.calls[0]['system']
     assert 'ETH_USDT' not in model.calls[0]['system']
+
+
+def _shift(value, offset):
+    if isinstance(value, dict):
+        return {key: _shift(item, offset) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_shift(item, offset) for item in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 1000000:
+        return value + offset
+    return value
+
+
+def _awaiting_touch_market(symbol='USELESS_USDT'):
+    from tests.unit.test_structure_setups import NOW, htf_zone_context, view
+
+    ctx = htf_zone_context('4h', '15m')
+    lower = view(ctx, '15m')
+    lower['recent_ohlcv'][-3][3] = 98.
+    lower['recent_ohlcv'][-1][3] = 98.
+    market = _shift(ctx, int(time.time()) - NOW - 1)
+    market['symbol'] = symbol
+    return market
+
+
+def _with_farther_high(market):
+    higher = next(view for view in market['timeframes'] if view['timeframe'] == '4h')
+    higher['recent_ohlcv'][1][2] = 120.
+    higher['features']['swings'].append(dict(
+        kind='high', price=120., pivot_at=higher['recent_ohlcv'][1][0],
+        confirmed_at=higher['recent_ohlcv'][4][0]))
+    return market
+
+
+def _printed_hold_review(tmp_path, monkeypatch, market, price, *, equity=1000., risk=.03, available=None):
+    from trading.evaluation.hold_triggers import claim_printed, review_signal, save_hold
+
+    def text(packet):
+        raise AssertionError('model was asked again')
+
+    def vision(model, packet):
+        raise AssertionError('model was asked again')
+
+    model = DecisionModel(text, vision)
+    _run, store = evaluator(tmp_path, monkeypatch, model, market=market)
+    save_hold(store, symbol=market['symbol'], side='long', price=price - 10,
+              rationale=market['symbol'] + ' beklerken yeniden bak.',
+              levels=[dict(kind='choch', price=price)], trigger_timeframe='15m')
+    due = claim_printed(store, lambda symbol: price)
+    review = review_signal(due[0])
+    settings = Settings(_env_file=None, analysis_version='text', live_structure_setups_enabled=True,
+                        live_price_plan_enabled=True)
+    reviewed = ContextEvaluator(
+        model, store,
+        SimpleNamespace(get_contract_rules=lambda symbol: SimpleNamespace(max_leverage=20, price_step=.01)),
+        settings)
+    outcome = reviewed.evaluate_candidates(
+        [review], equity=equity, risk_per_trade_pct=risk, target_leverage=20,
+        live_account_context=dict(mode='LIVE', currency='USDT', runner_id='runner3',
+                                  current_equity=equity, available_usdt=equity if available is None else available),
+        live_positions={})
+    return outcome, model
+
+
+def test_retriggered_ready_card_enters_without_asking_the_model(tmp_path, monkeypatch, caplog):
+    import logging
+
+    market = _with_farther_high(rebase_market('USELESS_USDT'))
+    caplog.set_level(logging.INFO, logger='worker')
+    outcome, model = _printed_hold_review(tmp_path, monkeypatch, market, 101.)
+    assert model.calls == []
+    assert outcome.metadata['provider_called'] is False
+    assert outcome.metadata['model_not_asked'] is True
+    assert outcome.action.value == 'trade'
+    assert outcome.proposal is not None
+    assert abs(outcome.proposal.entry_price - 101.) < 1e-9
+    chosen = outcome.metadata['setup_selection']
+    assert chosen['evidence']['alignment'] == 'with_higher_timeframe'
+    assert [level['price'] for level in chosen['opposing_target_levels']] == [110., 120.]
+    assert abs(outcome.proposal.take_profit_price - 120.) < 1e-9
+    assert abs(outcome.proposal.stop_loss.price - chosen['stop_loss_price']) < 1e-9
+    assert 'USELESS_USDT' in caplog.text
+    assert 'model was not asked again' in caplog.text
+
+
+def test_awaiting_touch_retrigger_stays_a_hold(tmp_path, monkeypatch):
+    market = _awaiting_touch_market()
+    outcome, model = _printed_hold_review(tmp_path, monkeypatch, market, 101.)
+    assert model.calls == []
+    assert outcome.action.value == 'hold'
+    assert outcome.proposal is None
+    assert outcome.metadata['provider_called'] is False
+    held = outcome.metadata['price_action_hold']
+    assert held['status'] == 'armed'
+    assert held['symbol'] == 'USELESS_USDT'
+    assert held['triggers']
+    assert any(item['price'] > 0 for item in held['triggers'])
+
+
+def test_ready_card_retrigger_names_the_failed_check(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from trading.runtime.runner3_policy import cost_adjusted_r
+
+    caplog.set_level(logging.INFO, logger='worker')
+    market = rebase_market('USELESS_USDT')
+    low_r, _low_model = _printed_hold_review(tmp_path / 'r', monkeypatch, market, 109.)
+    assert low_r.action.value == 'hold'
+    assert low_r.proposal is None
+    assert low_r.hold_reason == 'cost_adjusted_r'
+    assert low_r.metadata['veto'] == 'cost_adjusted_r'
+    assert 'VETO USELESS_USDT check=cost_adjusted_r' in caplog.text
+    assert cost_adjusted_r(side='long', entry=109., stop=97.76, target=110., fee=0.0006, slippage=0.0005) < 1.25
+
+    wide, _wide_model = _printed_hold_review(
+        tmp_path / 'cap', monkeypatch, rebase_market('USELESS_USDT'), 101., equity=1000., risk=.20)
+    assert wide.action.value == 'hold'
+    assert wide.proposal is None
+    assert wide.hold_reason == 'equity_stop'
+    assert wide.metadata['veto'] == 'equity_stop'
+    assert 'VETO USELESS_USDT check=equity_stop' in caplog.text
 
 
 def test_printed_hold_reenters_at_the_current_price(tmp_path, monkeypatch):
