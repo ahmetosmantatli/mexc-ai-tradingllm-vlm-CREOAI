@@ -88,6 +88,81 @@ def change_summary(previous, current, previous_fingerprint=None, fingerprint=Non
     return {'reason':reason,'summary':summary,'timeframes':changed}
 
 
+def runner3_model_view(account, market):
+    """Prompt copy for Runner 3.
+
+    The model sees setups that already have a closed CHoCH at a block or a flow,
+    and the candles those levels name, not the raw history. When no such setup
+    exists, a watch can still be shown. The system prompt is not built here.
+    """
+    import copy
+
+    from trading.runtime.runner3_policy import closed_choch_at_block_or_flow
+
+    account = copy.deepcopy(account) if isinstance(account, dict) else {}
+    market = copy.deepcopy(market) if isinstance(market, dict) else {}
+    selection = account.get('setup_selection') if isinstance(account.get('setup_selection'), dict) else None
+    options = list(selection.get('options') or []) if selection else []
+    ready = [row for row in options if closed_choch_at_block_or_flow(row)]
+    shown = ready if ready else options
+    if selection is not None:
+        selection['options'] = shown
+    wanted = {}
+
+    def mark(timeframe, stamp):
+        if not isinstance(timeframe, str) or isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            return
+        wanted.setdefault(timeframe, set()).add(int(stamp))
+
+    for row in shown:
+        if not isinstance(row, dict):
+            continue
+        evidence = row.get('evidence') if isinstance(row.get('evidence'), dict) else {}
+        shift = evidence.get('shift') if isinstance(evidence.get('shift'), dict) else {}
+        zone = evidence.get('zone') if isinstance(evidence.get('zone'), dict) else {}
+        mark(row.get('trigger_timeframe'), shift.get('at'))
+        mark(zone.get('timeframe'), zone.get('open_time'))
+        mark(row.get('trigger_timeframe'), evidence.get('touch_at'))
+        for ref in (row.get('stop_reference'), row.get('target_reference')):
+            if isinstance(ref, dict):
+                mark(ref.get('timeframe'), ref.get('open_time'))
+        for level in row.get('opposing_target_levels') or []:
+            if isinstance(level, dict):
+                mark(level.get('timeframe'), level.get('open_time'))
+    frames = []
+    total = 0
+    for view in market.get('timeframes') or []:
+        if not isinstance(view, dict):
+            continue
+        rows = [row for row in (view.get('recent_ohlcv') or []) if isinstance(row, (list, tuple)) and row]
+        keep = wanted.get(view.get('timeframe')) or set()
+        tail = {row[0] for row in rows[-4:]}
+        chosen = []
+        seen = set()
+        for row in rows:
+            stamp = row[0]
+            if stamp in seen or (stamp not in keep and stamp not in tail):
+                continue
+            chosen.append(list(row))
+            seen.add(stamp)
+        if len(chosen) > 8:
+            referenced = [row for row in chosen if row[0] in keep]
+            latest = [row for row in chosen if row[0] not in keep][-4:]
+            chosen = (referenced + latest)[:8]
+        view = dict(view)
+        view['recent_ohlcv'] = chosen
+        view['history_bars'] = len(chosen)
+        total += len(chosen)
+        frames.append(view)
+    market['timeframes'] = frames
+    market['summary'] = dict(
+        kind='closed_choch_at_block_or_flow',
+        setup_ids=[row.get('setup_id') for row in shown if isinstance(row, dict)],
+        candle_count=total,
+        prior_hold=isinstance(account.get('prior_hold'), dict))
+    return account, market
+
+
 def build_prompt(candidate, market, memory, positions, account, version, changes):
     data=candidate.model_dump(mode='json')
     data.pop('created_at',None)
@@ -180,7 +255,8 @@ def compact_decision_packet(user):
         kept.append(dict(setup_id=option.get('setup_id'), state=option.get('state'), side=option.get('side'),
                          horizon=option.get('horizon'), context_timeframe=option.get('context_timeframe'),
                          trigger_timeframe=trigger, zone=evidence.get('zone'), touch_at=evidence.get('touch_at'),
-                         closed_choch_mss=shift, entry=option.get('entry_reference', option.get('entry')),
+                         closed_choch_mss=shift, alignment=evidence.get('alignment'),
+                         entry=option.get('entry_reference', option.get('entry')),
                          stop=option.get('stop_loss_price', option.get('stop')),
                          target=option.get('take_profit_price', option.get('target')),
                          opposing_target_levels=levels if isinstance(levels, list) else [],
@@ -231,6 +307,15 @@ def compact_decision_packet(user):
     gates = account.get('runner3_entry_gate')
     if isinstance(gates, str) and gates.strip():
         packet['entry_gates'] = gates
+    summary = market.get('summary')
+    if isinstance(summary, dict):
+        packet['summary'] = summary
+    prior = account.get('prior_hold')
+    if isinstance(prior, dict):
+        old_market = prior.get('old_market') if isinstance(prior.get('old_market'), dict) else {}
+        packet['prior_hold'] = dict(
+            rationale=prior.get('rationale'), triggers=prior.get('triggers'),
+            printed_trigger=prior.get('printed_trigger'), old_observed_at=old_market.get('observed_at'))
     if not isinstance(packet['symbol'], str):
         packet['symbol'] = market.get('symbol')
     return canonical(packet)

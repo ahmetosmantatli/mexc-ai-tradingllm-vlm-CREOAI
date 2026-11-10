@@ -50,6 +50,7 @@ class CandidateQueue:
                 def _kept(row):
                     features=row['signal'].get('features') or {}
                     return bool(features.get('watch_review') or features.get('local_limit_review')
+                                or features.get('hold_review')
                                 or bool(features.get('htf_zone_seed')) == htf_zone_entries)
                 eligible=[row for row in eligible if _kept(row)]
             if not eligible:
@@ -61,10 +62,13 @@ class CandidateQueue:
                     return float((row['signal'].get('features') or {}).get('capital_rank') or 0)
                 except (TypeError, ValueError):
                     return 0.
+            def _with_higher(row):
+                return 0 if (row['signal'].get('features') or {}).get('with_higher_timeframe') else 1
             row=min(eligible,key=lambda r:(
                 not bool((r['signal'].get('features') or {}).get('watch_review')
-                         or (r['signal'].get('features') or {}).get('local_limit_review')),
-                -_rank(r), r['last_considered_at'], r['first_seen'], -r['signal']['confidence'], r['key']))
+                         or (r['signal'].get('features') or {}).get('local_limit_review')
+                         or (r['signal'].get('features') or {}).get('hold_review')),
+                -_rank(r), _with_higher(r), r['last_considered_at'], r['first_seen'], -r['signal']['confidence'], r['key']))
             # Reserve consideration before slow provider work; concurrent scans
             # preserve this timestamp, so a refreshed top signal cannot starve peers.
             row['last_considered_at']=now

@@ -541,6 +541,18 @@ class PaperRunner:
                 proposal=fresh_proposal()
             except PlanSizingError:
                 return finish('HOLD_INVALID_MODEL_SIZING')
+            if signal.features.get('htf_zone_seed'):
+                from trading.runtime.runner3_policy import entry_veto
+                free = ledger.equity
+                if account is not None and getattr(account, 'available', None) is not None:
+                    free = float(account.available)
+                failed = entry_veto(
+                    side=signal.side, entry=proposal.entry_price, stop=proposal.stop_loss.price,
+                    target=proposal.take_profit_price, equity=ledger.equity, free_margin=free,
+                    fee=self.cfg.paper_fee_rate, slippage=self.cfg.paper_slippage_bps / 10000,
+                    notional=proposal.notional, leverage=proposal.leverage)
+                if failed:
+                    return finish('HOLD_VETO_' + failed)
             context.equity = ledger.equity
             context.open_risk = sum(p['risk'] for p in ledger.positions.values())
             context.open_positions = len(ledger.positions)

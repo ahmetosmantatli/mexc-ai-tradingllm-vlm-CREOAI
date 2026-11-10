@@ -62,6 +62,7 @@ def evaluator(tmp_path, monkeypatch, model, market=None, version='text', prepare
         SimpleNamespace(get_contract_rules=lambda symbol: SimpleNamespace(max_leverage=20, price_step=.01)),
         settings)
     seed = signal(Side.SHORT)
+    seed.symbol = market.get('symbol') or 'BTC_USDT'
     seed.entry_price = 100.
     seed.features.update(htf_zone_seed=True, source_closed_at=time.time() - 1, dedup_key='seed')
     if prepare is not None:
@@ -726,6 +727,9 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
     result = run()
     system = model.calls[0]['system']
     for line in (
+        'Price-action playbook, before you answer:',
+        'A hold is not the default when the CHoCH, the block or flow, and a target exist.',
+        'Do not hold that trade toward a far higher-timeframe target.',
         'Runner 3 minimum cost-adjusted R is 1.25.',
         'Fee assumption is 0.0006 per side. Exit-slippage assumption is 0.0005 (5 bps), applied to the stop and the target.',
         'stop_fill = stop * (1 - direction * slippage).',
@@ -758,6 +762,7 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
     assert 'cost_adjusted_R < 1.25' not in system
     assert system.index('you must ENTER (action trade)') < system.index('would otherwise block')
     assert system.index('would otherwise block') < system.index('That choice stands')
+    assert system.index('Price-action playbook, before you answer:') < system.index('Runner 3 minimum cost-adjusted R is 1.25.')
     assert system.index('Runner 3 minimum cost-adjusted R is 1.25.') < system.index('Runner 3 requires the selected READY')
     assert system.index('Runner 3 requires the selected READY') < system.index('must be ENTER at that target')
     assert system.index('must be ENTER at that target') < system.index('A valid hold on that selected setup is entered')
@@ -860,10 +865,14 @@ def test_valid_hold_on_the_selected_ready_setup_enters_the_farthest_clearing_tar
         tmp_path / 'trade', monkeypatch, trade_model, market=deepcopy(market), prepare=_select_ready)
     traded = trade_run()
     named = _select_ready.setup['take_profit_price']
-    assert traded.action.value == 'trade'
-    assert traded.metadata.get('ready_setup_after_hold') is not True
-    assert abs(traded.proposal.take_profit_price - named) < 1e-9
     assert abs(named - 120.) > 1
+    assert cost_adjusted_r(
+        side='long', entry=100., stop=_select_ready.setup['stop_loss_price'], target=named,
+        fee=0.0006, slippage=0.0005) < MIN_NET_TARGET_R
+    assert traded.action.value == 'hold'
+    assert traded.hold_reason == 'cost_adjusted_r'
+    assert traded.metadata['veto'] == 'cost_adjusted_r'
+    assert traded.proposal is None
 
     def silent(packet):
         return None
@@ -886,3 +895,264 @@ def test_valid_hold_on_the_selected_ready_setup_enters_the_farthest_clearing_tar
     assert held.action.value == 'hold'
     assert held.proposal is None
     assert held.hold_reason == 'hold'
+
+
+def test_hold_stores_triggers_and_a_hit_sends_the_pair_back(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from trading.config import Settings
+    from trading.evaluation.hold_triggers import claim_printed, review_signal
+    from trading.evaluation.service import ContextEvaluator
+
+    market = rebase_market('USELESS_USDT')
+    rationale = 'USELESS için bölge kenarı ve CHoCH basınca yeniden bak.'
+
+    def text(packet):
+        return hold_answer(rationale)
+
+    def vision(model, packet):
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    caplog.set_level(logging.INFO, logger='worker')
+    model = DecisionModel(text, vision)
+    run, store = evaluator(tmp_path, monkeypatch, model, market=market)
+    result = run()
+    assert result.action.value == 'hold'
+    raw = store.db.execute("SELECT value FROM state WHERE key='price_action_holds'").fetchone()
+    assert raw and 'USELESS_USDT' in raw[0]
+    row = store.get('price_action_holds')[-1]
+    assert row['status'] == 'armed' and row['rationale'] == rationale
+    kinds = {item['kind'] for item in row['triggers']}
+    assert 'choch' in kinds
+    assert any(item['kind'] in ('block', 'flow', 'zone_edge') for item in row['triggers'])
+    assert 'USELESS_USDT' in caplog.text and rationale in caplog.text
+    assert all(f"{item['price']:.8g}" in caplog.text for item in row['triggers'])
+
+    old_observed = market['observed_at']
+    market['observed_at'] = old_observed + 30
+    market['timeframes'][0]['recent_ohlcv'][-1][4] = 96.
+    hit = next(item['price'] for item in row['triggers'] if item['kind'] in ('zone_edge', 'block', 'flow'))
+    due = claim_printed(store, lambda symbol: hit)
+    assert due and due[0]['symbol'] == 'USELESS_USDT' and due[0]['trigger_price'] == hit
+    review = review_signal(due[0])
+
+    def again(packet):
+        prior = packet['account']['prior_hold']
+        assert prior['rationale'] == rationale
+        assert prior['old_market']['observed_at'] == old_observed
+        assert packet['market']['observed_at'] == old_observed + 30
+        assert prior['old_market']['observed_at'] != packet['market']['observed_at']
+        return hold_answer('USELESS yeni tetik bekleniyor.')
+
+    def again_vision(model, packet):
+        assert packet['account']['prior_hold']['rationale'] == rationale
+        assert model.calls[-1].get('images')
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    second = DecisionModel(again, again_vision)
+    settings = Settings(_env_file=None, analysis_version='text', live_structure_setups_enabled=True,
+                        live_price_plan_enabled=True)
+    reviewed = ContextEvaluator(
+        second, store,
+        SimpleNamespace(get_contract_rules=lambda symbol: SimpleNamespace(max_leverage=20, price_step=.01)),
+        settings)
+    outcome = reviewed.evaluate_candidates(
+        [review], equity=11.58, risk_per_trade_pct=.03, target_leverage=20,
+        live_account_context=dict(mode='LIVE', currency='USDT', runner_id='runner3',
+                                  current_equity=11.58, available_usdt=11.58),
+        live_positions={})
+    assert outcome.action.value == 'hold'
+    assert any(call.get('images') for call in second.calls)
+    assert 'Answer briefly whether the trade is taken now.' in second.calls[0]['system']
+    refreshed = store.get('price_action_holds')[-1]
+    assert refreshed['status'] == 'armed'
+    assert refreshed['rationale'] == 'USELESS yeni tetik bekleniyor.'
+    assert refreshed['triggers']
+
+
+def test_printed_hold_is_queued_ahead_of_an_idle_symbol(tmp_path):
+    from trading.evaluation.hold_triggers import save_hold
+    from .test_live_runner import prepare
+
+    runner, _private, executor, control = prepare(tmp_path)
+    control['runner_id'] = 'runner3'
+    save_hold(runner.store, symbol='BTC_USDT', side='long', price=90,
+              rationale='USELESS beklerken 100 basınca dön.',
+              levels=[dict(kind='choch', price=100.)])
+    seen = []
+
+    def evaluate(candidate, snapshot, control):
+        seen.append(candidate)
+        return EvaluationResult(action=GraphAction.HOLD, hold_reason='hold', metadata={'provider_called': True})
+
+    runner._evaluate = evaluate
+    status = runner.cycle()
+    assert status['reason'] == 'HOLD_LIVE_MODEL'
+    assert seen[0].features['hold_review'] is True
+    assert seen[0].features['prior_hold']['rationale'] == 'USELESS beklerken 100 basınca dön.'
+    assert executor.calls == []
+    assert runner.store.get('price_action_holds')[-1]['status'] == 'review_queued'
+
+
+def test_veto_after_the_model_names_the_failed_check(tmp_path, monkeypatch):
+    from inspect import getsource
+
+    from trading.evaluation.service import ContextEvaluator
+    from trading.runtime.runner import PaperRunner
+    from trading.runtime.runner3_policy import entry_veto
+
+    assert entry_veto(side='long', entry=100, stop=98, target=100.3, equity=100, free_margin=50,
+                      fee=0.0006, slippage=0.0005, notional=10, leverage=5) == 'cost_adjusted_r'
+    live = getsource(ContextEvaluator.evaluate_candidates)
+    paper = getsource(PaperRunner._apply_evaluation)
+    assert 'entry_veto' in live and 'entry_veto' in paper
+
+    def text(packet):
+        return ready_answer(packet, rationale='Model işlemi istedi, serbest marjin yok.')
+
+    def vision(model, packet):
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    model = DecisionModel(text, vision)
+    run, _store = evaluator(tmp_path, monkeypatch, model)
+    result = run(available_usdt=0)
+    assert result.action.value == 'hold'
+    assert result.hold_reason == 'free_margin'
+    assert result.metadata['veto'] == 'free_margin'
+    assert result.proposal is None
+
+
+def test_summary_packet_sends_closed_choch_and_the_fast_path_reads_it(tmp_path, monkeypatch):
+    from trading.evaluation.context import compact_decision_packet
+    from .test_provider_pool import pool, settings
+
+    market = rebase_market('LAB_USDT')
+    frame = next(view for view in market['timeframes'] if view['timeframe'] == '4h')
+    first = frame['recent_ohlcv'][0][0]
+    pad = [[first - 14400 * (500 - index), 1, 424242.5, 0.5, 1.1, 3] for index in range(500)]
+    frame['recent_ohlcv'] = pad + frame['recent_ohlcv']
+
+    def text(packet):
+        options = packet['account']['setup_selection']['options']
+        assert options
+        assert all(row['state'] == 'ready' for row in options)
+        assert all((row['evidence'].get('zone') or {}).get('kind') in ('block', 'flow') for row in options)
+        assert all((row['evidence'].get('shift') or {}).get('kind') in ('choch', 'mss') for row in options)
+        assert all(len(item['recent_ohlcv']) <= 8 for item in packet['market']['timeframes'])
+        assert packet['market']['summary']['kind'] == 'closed_choch_at_block_or_flow'
+        return ready_answer(packet, rationale='Özet paketteki kapalı CHoCH ile işlem.')
+
+    def vision(model, packet):
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    model = DecisionModel(text, vision)
+    run, _store = evaluator(tmp_path, monkeypatch, model, market=market)
+    result = run()
+    assert result.action.value == 'trade'
+    user = model.calls[0]['user']
+    assert '424242.5' not in user
+    compact = json.loads(compact_decision_packet(user))
+    assert compact['summary']['kind'] == 'closed_choch_at_block_or_flow'
+    assert compact['zone'] and compact['closed_choch_mss']
+    assert compact['entry'] and compact['stop'] and compact['opposing_target_levels']
+    assert '424242.5' not in json.dumps(compact)
+    routed, _routed_store = pool(tmp_path / 'pool', settings())
+    _system, outbound = routed._prepared(routed._slots[0], model.calls[0]['system'], user, 700, None)
+    assert json.loads(outbound)['context_policy'] == 'pa-context-v4-compact'
+    assert '424242.5' not in outbound
+
+    other = rebase_market('ETH_USDT')
+    other_model = DecisionModel(text, vision)
+    other_run, _other_store = evaluator(tmp_path / 'other', monkeypatch, other_model, market=other)
+    assert other_run().action.value == 'trade'
+    assert other_model.calls[0]['system'] == model.calls[0]['system']
+    assert 'LAB_USDT' not in model.calls[0]['system']
+    assert 'ETH_USDT' not in model.calls[0]['system']
+
+
+def test_printed_hold_reenters_at_the_current_price(tmp_path, monkeypatch):
+    from trading.evaluation.hold_triggers import claim_printed, review_signal
+    from trading.evaluation.service import ContextEvaluator
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    market = rebase_market('USELESS_USDT')
+    ready = next(row for row in build_htf_zone_setups(market, current_price=100., price_step=.01)
+                 if row['family'] == 'pullback' and row['state'] == 'ready')
+    current = round(ready['entry_reference'] + (-0.01 if ready['side'] == 'long' else 0.01), 2)
+    if ready['side'] == 'long':
+        assert ready['stop_loss_price'] < current < ready['take_profit_price']
+    else:
+        assert ready['take_profit_price'] < current < ready['stop_loss_price']
+
+    def text(packet):
+        return hold_answer('USELESS ilk bekleme, tetik basınca yeniden bak.')
+
+    def vision(model, packet):
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    model = DecisionModel(text, vision)
+    run, store = evaluator(tmp_path, monkeypatch, model, market=market)
+    assert run().action.value == 'hold'
+    row = store.get('price_action_holds')[-1]
+    row['triggers'] = [dict(kind='choch', price=current)]
+    row['latched'] = []
+    store.put('price_action_holds', [row])
+    due = claim_printed(store, lambda symbol: current)
+    review = review_signal(due[0])
+    assert review.entry_price == current
+
+    def again(packet):
+        assert packet['account']['prior_hold']['rationale'].startswith('USELESS ilk bekleme')
+        answer = ready_answer(packet, rationale='USELESS güncel fiyattan girilir.')
+        answer['price_plan']['entry_price'] = current + 5
+        return answer
+
+    second = DecisionModel(again, vision)
+    settings = Settings(_env_file=None, analysis_version='text', live_structure_setups_enabled=True,
+                        live_price_plan_enabled=True)
+    reviewed = ContextEvaluator(
+        second, store,
+        SimpleNamespace(get_contract_rules=lambda symbol: SimpleNamespace(max_leverage=20, price_step=.01)),
+        settings)
+    outcome = reviewed.evaluate_candidates(
+        [review], equity=1000, risk_per_trade_pct=.03, target_leverage=20,
+        live_account_context=dict(mode='LIVE', currency='USDT', runner_id='runner3',
+                                  current_equity=1000, available_usdt=1000),
+        live_positions={})
+    assert outcome.action.value == 'trade'
+    chosen = outcome.metadata['setup_selection']
+    assert abs(outcome.proposal.entry_price - current) < 1e-9
+    assert abs(outcome.proposal.stop_loss.price - chosen['stop_loss_price']) < 1e-9
+    assert abs(outcome.proposal.take_profit_price - chosen['take_profit_price']) < 1e-9
+    assert outcome.proposal.entry_price != current + 5
+    level = chosen['opposing_target_levels'][0]
+    assert chosen['target_reference']['open_time'] == level['open_time']
+
+
+def test_short_margin_reports_a_swap_and_does_not_close(tmp_path, monkeypatch):
+    briefs = [dict(symbol='ETH_USDT', side='long', entry=100, stop=90, target=101,
+                   unrealized_pnl=0, thesis='eski tez', leverage=2, mark=100)]
+
+    def text(packet):
+        report = packet['account']['swap_candidate']
+        assert report['close'] is False
+        assert report['waiting']['expected_r'] > report['open_positions'][0]['expected_r']
+        assert report['open_positions'][0]['symbol'] == 'ETH_USDT'
+        return ready_answer(packet, rationale='Yeni kurulum daha yüksek R taşır, açık pozisyon durur.')
+
+    def vision(model, packet):
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    model = DecisionModel(text, vision)
+    run, store = evaluator(tmp_path, monkeypatch, model)
+    result = run(open_position_briefs=briefs, available_usdt=1)
+    assert result.action.value == 'trade'
+    assert result.metadata.get('release_symbol') is None
+    assert result.metadata['swap_candidate']['close'] is False
+    assert store.get('swap_candidate:BTC_USDT')['close'] is False

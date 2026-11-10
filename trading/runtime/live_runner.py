@@ -301,6 +301,20 @@ class LiveRunner:
                     dedup_key='local-limit:'+row['id'], setup_id=row.get('setup_id'))))
         self.candidate_queue().refresh(signals, refreshed_symbols=set())
 
+    def _queue_printed_holds(self):
+        from trading.evaluation.hold_triggers import claim_printed, review_signal
+
+        def tick(symbol):
+            try:
+                return self.public.get_contract_rules(symbol).price_step
+            except Exception:
+                return 0
+
+        due=claim_printed(self.store, lambda symbol: self.quote(symbol).last_price, tick_of=tick)
+        if not due:
+            return
+        self.candidate_queue().refresh([review_signal(row) for row in due], refreshed_symbols=set())
+
     def _rotation_allowed(self, symbol, snapshot, result, control):
         """A market close needs an invalidated thesis and no free margin for the new plan."""
         if not result.metadata.get('thesis_invalidated'):
@@ -839,6 +853,7 @@ class LiveRunner:
                     self.store.put('live_capacity_probe',{})
             if control.get('runner_id')=='runner3':
                 self._queue_reached_limits()
+                self._queue_printed_holds()
             queue=self.candidate_queue()
             for _ in range(count):
                 candidate=queue.next(open_symbols=set(self._positions(snapshot))|waiting|{c.symbol for c in selected},
@@ -865,6 +880,7 @@ class LiveRunner:
             if control.get('runner_id')=='runner3':
                 finished.sort(key=lambda item: (
                     -float(item[0].features.get('capital_rank') or 0),
+                    0 if item[0].features.get('with_higher_timeframe') else 1,
                     item[0].symbol))
             for candidate, result, exc in finished:
                 if exc is not None:

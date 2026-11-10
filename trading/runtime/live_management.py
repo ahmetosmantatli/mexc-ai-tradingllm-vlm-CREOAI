@@ -13,14 +13,14 @@ from trading.evaluation.price_plan import CandleReference, evidence_from_market,
 from trading.runtime.usage import archive_trace
 from trading.quant.structure_setups import trade_horizon
 
-TIMEFRAME_SECONDS={'5m':300,'15m':900,'4h':14400}
+TIMEFRAME_SECONDS={'5m':300,'15m':900,'1h':3600,'4h':14400}
 
 class ManagementDecision(BaseModel):
     model_config=ConfigDict(extra='forbid',strict=True,allow_inf_nan=False)
     action: str = Field(pattern='^(hold|move_stop|reduce|close)$')
     position_id: str
     reason: str = Field(min_length=12,max_length=800)
-    review_timeframe: str = Field(pattern='^(5m|15m|4h)$')
+    review_timeframe: str = Field(pattern='^(5m|15m|1h|4h)$')
     stop_price: float | None = Field(default=None,gt=0)
     stop_reference: CandleReference | None = None
     close_fraction: float | None = Field(default=None,gt=0,le=1)
@@ -213,7 +213,7 @@ class LivePositionManager:
         # No reason to download three histories again before a trigger can change.
         if (previous.get('management_runner',opening_runner)==runner_id and previous.get('timeframe')==timeframe and previous.get('favorable_r_milestone')==milestone
                 and now<previous.get('closed_at',0)+TIMEFRAME_SECONDS[timeframe] and not retry_due and not near_target and not horizon_due and not reversal):return
-        bundle=build_bundle(r.public,symbol)
+        bundle=build_bundle(r.public,symbol,include_hourly=runner_id=='runner3')
         market=bundle.to_context(ict=True) if runner2 else bundle.to_context()
         view=next((v for v in market['timeframes'] if v['timeframe']==timeframe),None)
         if view is None:raise ValueError('management entry timeframe evidence missing')

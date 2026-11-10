@@ -11,8 +11,8 @@ from math import isfinite
 VERSION = 'structure-setups-v1'
 FAMILIES = ('trend_continuation', 'pullback', 'countertrend_sweep_reclaim')
 SECONDS = {'5m': 300, '15m': 900, '1h': 3600, '4h': 14400}
-HORIZONS = {'5m': 'scalp', '15m': 'intraday', '4h': 'swing'}
-REVIEW_BARS = {'5m': 6, '15m': 12, '4h': 12}
+HORIZONS = {'5m': 'scalp', '15m': 'intraday', '1h': 'intraday', '4h': 'swing'}
+REVIEW_BARS = {'5m': 6, '15m': 12, '1h': 12, '4h': 12}
 
 
 def trade_horizon(frame, now):
@@ -246,8 +246,86 @@ def _confirmed_zone(block, higher, context_tf):
     if any((row[4] < low_price if long else row[4] > high_price)
            for row in higher['rows'] if row[0] > confirmation[0]):
         return None
-    return dict(timeframe=context_tf, direction=direction, low=low_price, high=high_price,
+    return dict(kind='block', timeframe=context_tf, direction=direction, low=low_price, high=high_price,
                 open_time=origin['open_time'], confirmed_at=confirmation[0] + SECONDS[context_tf])
+
+
+def _confirmed_flow(gap, higher, context_tf):
+    """A fair-value gap is a flow. It confirms the same way a block does."""
+    direction = gap.get('direction')
+    if direction not in ('bullish', 'bearish'):
+        return None
+    lower, upper = gap.get('lower'), gap.get('upper')
+    if not _positive(lower) or not _positive(upper) or lower >= upper:
+        return None
+    origin = next((row for row in higher['rows'] if row[0] == gap.get('at')), None)
+    if origin is None:
+        return None
+    long = direction == 'bullish'
+    later = [row for row in higher['rows'] if row[0] > origin[0]]
+    confirmation = next((row for row in later if (row[4] > upper if long else row[4] < lower)), None)
+    if confirmation is None:
+        return None
+    if any((row[4] < lower if long else row[4] > upper)
+           for row in higher['rows'] if row[0] > confirmation[0]):
+        return None
+    return dict(kind='flow', timeframe=context_tf, direction=direction, low=lower, high=upper,
+                open_time=origin[0], confirmed_at=confirmation[0] + SECONDS[context_tf])
+
+
+def _wick_reference(view, tf, price, field):
+    """A closed candle whose named wick is exactly this price."""
+    for row in view['rows']:
+        if (row[2] if field == 'high' else row[3]) == price:
+            return _reference(view, tf, row[0], field)
+    return None
+
+
+def _opposing_locations(view, tf, *, long, entry):
+    """Nearest opposing block or flow on one timeframe.
+
+    A long meets bearish supply above. A short meets bullish demand below.
+    The referenced wick is the block or flow extreme on that side.
+    """
+    found = []
+    field = 'high' if long else 'low'
+
+    def add(kind, price, at):
+        if not _positive(price):
+            return
+        if long and not price > entry:
+            return
+        if not long and not price < entry:
+            return
+        ref = _reference(view, tf, at, field)
+        if ref is None or ref['price'] != price:
+            ref = _wick_reference(view, tf, price, field)
+        if ref is None or ref in found:
+            return
+        found.append(dict(ref, kind=kind))
+
+    for block in view['features'].get('order_block_candidates') or []:
+        if not isinstance(block, dict) or block.get('status') == 'invalidated':
+            continue
+        direction = block.get('direction')
+        if long and direction != 'bearish':
+            continue
+        if not long and direction != 'bullish':
+            continue
+        price = block.get('high') if long else block.get('low')
+        add('block', price, block.get('open_time'))
+    for gap in view['features'].get('fvgs') or []:
+        if not isinstance(gap, dict):
+            continue
+        direction = gap.get('direction')
+        if long and direction != 'bearish':
+            continue
+        if not long and direction != 'bullish':
+            continue
+        price = gap.get('upper') if long else gap.get('lower')
+        add('flow', price, gap.get('at'))
+    found.sort(key=lambda ref: (ref['price'] if long else -ref['price'], ref['open_time']))
+    return found
 
 
 def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step, observed, symbol):
@@ -297,16 +375,26 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     field = 'low' if long else 'high'
     stop_ref = (_reference(lower, trigger_tf, anchor[0], field) if anchor is not None
                 else _reference(higher, zone['timeframe'], zone['open_time'], field))
+    if stop_ref is None:
+        return None
     stop = _tick(stop_ref['price'] + (-1 if long else 1) * _atr(lower['rows']) * .1,
                  price_step, up=not long)
-    targets = _swings({zone['timeframe']: higher}, 'high' if long else 'low')
-    possible = [ref for ref in targets if (ref['price'] > entry if long else ref['price'] < entry)]
-    if not possible:
-        return None
-    # Nearest opposing level stays the default. Farther supplied levels stay on
-    # the setup so the model can clear the cost floor without inventing a price.
-    ordered = sorted(possible, key=lambda ref: (ref['price'] if long else -ref['price'], ref['open_time']))
-    target_ref = min(possible, key=lambda ref: abs(ref['price'] - entry))
+    macro = higher['features'].get('trend', 'unknown')
+    # With the higher timeframe, farther swings stay available. Against it, the
+    # only target is the next opposing block or flow on the trigger timeframe.
+    aligned = macro == direction and macro in ('bullish', 'bearish')
+    if aligned:
+        targets = _swings({zone['timeframe']: higher}, 'high' if long else 'low')
+        possible = [ref for ref in targets if (ref['price'] > entry if long else ref['price'] < entry)]
+        if not possible:
+            return None
+        ordered = sorted(possible, key=lambda ref: (ref['price'] if long else -ref['price'], ref['open_time']))
+        target_ref = min(possible, key=lambda ref: abs(ref['price'] - entry))
+    else:
+        ordered = _opposing_locations(lower, trigger_tf, long=long, entry=entry)[:1]
+        if not ordered:
+            return None
+        target_ref = ordered[0]
     target = _tick(target_ref['price'], price_step, up=not long)
     if not (0 < stop < entry < target if long else 0 < target < entry < stop):
         return None
@@ -321,7 +409,7 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
                     context_last_break=last_break, context_last_shift=last_shift)
     if ready:
         evidence.update(shift=shift, expires_at=lower['closed_at'] + seconds)
-    macro = higher['features'].get('trend', 'unknown')
+    evidence['alignment'] = 'with_higher_timeframe' if aligned else 'against_higher_timeframe'
     family = 'countertrend_sweep_reclaim' if macro in ('bullish', 'bearish') and macro != direction else 'pullback'
     state = 'ready' if ready else 'watch'
     material = dict(version=HTF_ZONE_VERSION, symbol=symbol, family=family,
@@ -343,12 +431,15 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
 
 
 def build_htf_zone_setups(market_context, *, current_price, price_step=0):
-    """Use a confirmed HTF block, a subsequent closed LTF touch, then a later closed CHoCH/MSS.
+    """Use a confirmed HTF block or flow, a later closed LTF touch, then a closed CHoCH/MSS.
 
-    A ready long stops just beyond the low of that CHoCH candle. A ready short
-    stops just beyond its high. Swing uses the 15m candle; intraday uses the 5m
-    candle. The default target remains the nearest opposing higher-timeframe
-    level. Every opposing level beyond entry is supplied with it.
+    Swing is 4h structure with a 15m trigger. Intraday is 1h structure with a
+    5m trigger. Both directions use that same path. A ready long stops just
+    beyond the CHoCH low. A ready short stops just beyond the CHoCH high.
+    The trigger candle must close through the CHoCH level. When the trade
+    agrees with the higher timeframe, farther higher-timeframe swings stay
+    supplied. When it does not, the only target is the next opposing block or
+    flow on the trigger timeframe.
     A touch or a future level can produce a watch. The LTF trigger must close
     after the touch candle, so same-candle intrabar ordering is never inferred.
     BTC/ETH context stays independent of the symbol's executable evidence.
@@ -362,11 +453,18 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0):
         if context_tf not in views or trigger_tf not in views:
             continue
         higher, lower = views[context_tf], views[trigger_tf]
+        zones = []
         for block in higher['features'].get('order_block_candidates', []):
             zone = _confirmed_zone(block, higher, context_tf)
             if zone is not None:
-                option = _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step,
-                                      market_context['observed_at'], market_context.get('symbol'))
-                if option is not None:
-                    options.append(option)
+                zones.append(zone)
+        for gap in higher['features'].get('fvgs', []) or []:
+            zone = _confirmed_flow(gap, higher, context_tf)
+            if zone is not None:
+                zones.append(zone)
+        for zone in zones:
+            option = _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step,
+                                  market_context['observed_at'], market_context.get('symbol'))
+            if option is not None:
+                options.append(option)
     return options

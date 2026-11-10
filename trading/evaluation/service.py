@@ -1,6 +1,7 @@
 from trading.runtime.live_capabilities import STRUCTURAL_IOC_RUNNERS
 from trading.runtime import runner3_policy
 import copy
+import logging
 from pathlib import Path
 import sqlite3
 import threading
@@ -10,9 +11,9 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from trading.agents.schemas import EvaluationResult, GraphAction, MarketAnalystNote, StrategyReviewNote, PortfolioAnalystNote
 from trading.evaluation.watch import WatchPlan, WatchCoordinator, ACTIVE, watch_event_key
-from trading.evaluation.price_plan import MarketPricePlan,apply_market_price_plan,evidence_from_market
+from trading.evaluation.price_plan import CandleReference, MarketPricePlan,apply_market_price_plan,evidence_from_market
 from trading.evaluation.planning import PlanSizing, PlanSizingError, apply_decision_sizing
-from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context, economic_review_key, canonical_watch_card, watch_review_key
+from trading.evaluation.context import POLICY_VERSION, build_prompt, change_summary, digest, position_cards, setup_card, account_research_context, economic_review_key, canonical_watch_card, watch_review_key, runner3_model_view
 
 
 class ModelDecision(BaseModel):
@@ -332,6 +333,26 @@ class ContextEvaluator:
         account['setup_selection']=dict(enabled=selection_enabled,options=options,
             countertrend_max_risk_fraction=countertrend_cap,
             note='Select setup_id and provide a fresh grounded price_plan for TRADE. No hypothesis means no forced trade.')
+        if runner3:
+            waiting=[]
+            for row in options:
+                if runner3_policy.closed_choch_at_block_or_flow(row):
+                    copy_row=dict(row)
+                    copy_row['symbol']=symbol
+                    waiting.append(copy_row)
+            ranked=runner3_policy.rank_setups(waiting, fee=fee, slippage=slippage)
+            required=None if not ranked else (ranked[0].get('allocation') or {}).get('target_margin_usdt')
+            report=runner3_policy.swap_candidate(
+                waiting, live_account.get('open_position_briefs') or [],
+                free_margin=live_account.get('available_usdt'), required_margin=required,
+                fee=fee, slippage=slippage)
+            if report:
+                account['swap_candidate']=report
+                self.store.put('swap_candidate:'+symbol, report)
+                logging.getLogger('worker').info(
+                    'SWAP %s expected_r=%s open=%s', report['waiting'].get('symbol'),
+                    report['waiting'].get('expected_r'),
+                    ' '.join(str(row.get('symbol')) for row in report['open_positions']))
         economic_basis=economic_review_key(account,positions)
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
         if runner2:
@@ -341,7 +362,7 @@ class ContextEvaluator:
             policy_version=(runner3_policy.CONTINUOUS_COHORT if continuous else
                             runner3_policy.MODEL_SIZING_COHORT if model_sizing else runner3_policy.COHORT)
         evaluation_key=digest(dict(policy=policy_version,market=fingerprint,scope=scope,economic_basis=economic_basis))
-        if memory.get('last_evaluation_key')==evaluation_key:
+        if memory.get('last_evaluation_key')==evaluation_key and not candidate.features.get('hold_review'):
             self.store.put('stage','unchanged_closed_candles')
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='unchanged_closed_candles',
                 metadata={'provider_called':False,'fingerprint':fingerprint})
@@ -358,13 +379,19 @@ class ContextEvaluator:
             structural=prior_watch.get('reason')=='structure_changed'
             changes.update(reason='watch_structure_changed' if structural else 'watch_triggered',
                 summary='Takip gerekçesine karşı kapanmış yapısal kırılım oluştu; plan yeniden inceleniyor.' if structural else 'Takip koşulu gerçekleşti; eski algoritmadan yeni sinyal beklenmeden plan inceleniyor.')
+        prior_hold=candidate.features.get('prior_hold') if candidate.features.get('hold_review') else None
+        if isinstance(prior_hold, dict):
+            account['prior_hold']=copy.deepcopy(prior_hold)
+            changes.update(reason='hold_trigger_printed',
+                summary='Bekleme tetiki basıldı. Eski gerekçe: '+str(prior_hold.get('rationale') or '')[:240])
         if runner2:
             from trading.analysis.market import trade_flow_context
             chart_context['recent_trade_flow']=trade_flow_context(self.public,symbol)
         if runner3 and any(option['state']=='ready' and option.get('context_timeframe')=='1h' for option in options):
             from trading.analysis.market import entry_refinement_context
             chart_context['entry_refinement_1m'] = entry_refinement_context(self.public,chart_context)
-        prompt=build_prompt(candidate,chart_context,memory,positions,account,self.cfg.analysis_version,changes)
+        model_account, model_market = (runner3_model_view(account, chart_context) if runner3 else (account, chart_context))
+        prompt=build_prompt(candidate,model_market,memory,positions,model_account,self.cfg.analysis_version,changes)
         try:
             charts=render_bundle(bundle,Path(self.cfg.analysis_chart_dir)/symbol/fingerprint[:16])
         except (OSError, ValueError, RuntimeError):
@@ -387,6 +414,7 @@ class ContextEvaluator:
             self.on_live_review(trace)
         self.store.put('stage','model_evaluation')
         deadline=started+self.cfg.decision_ttl_seconds
+        reentry_note={}
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
             if model_sizing and decision.action == 'trade' and decision.sizing_plan is None:
@@ -435,7 +463,35 @@ class ContextEvaluator:
                 if funded or not decision.thesis_invalidated or not runner3_policy.thesis_invalidated(position, position.get('mark')):
                     decision.release_symbol = None
                     decision.thesis_invalidated = False
-            if decision.price_plan is not None:
+            if (runner3 and candidate.features.get('hold_review') and decision.action=='trade'
+                    and isinstance(option, dict) and decision.price_plan is not None):
+                cash_equity, cash_free = runner3_policy.cash_for_veto(equity, live_account)
+                prices, failed = runner3_policy.priced_reentry(
+                    option, price=candidate.entry_price, equity=cash_equity, free_margin=cash_free,
+                    fee=fee, slippage=slippage)
+                if failed:
+                    reentry_note['veto']=failed
+                else:
+                    update=dict(entry_price=prices['entry'], stop_loss_price=prices['stop'],
+                                take_profit_price=prices['target'])
+
+                    def _reference(source):
+                        if not isinstance(source, dict) or any(source.get(key) is None for key in ('timeframe', 'open_time', 'field')):
+                            return None
+                        try:
+                            opened=int(source['open_time'])
+                        except (TypeError, ValueError):
+                            return None
+                        return dict(timeframe=source['timeframe'], open_time=opened, field=source['field'])
+
+                    target_ref=_reference(prices.get('target_reference'))
+                    stop_ref=_reference(prices.get('stop_reference'))
+                    if target_ref is not None:
+                        update['target_reference']=CandleReference(**target_ref)
+                    if stop_ref is not None:
+                        update['stop_reference']=CandleReference(**stop_ref)
+                    decision=decision.model_copy(update={'price_plan': decision.price_plan.model_copy(update=update)})
+            if decision.price_plan is not None and not reentry_note.get('veto'):
                 if not price_planning or decision.action!='trade':
                     raise ValueError('price planning disabled or not trade')
                 if option and option.get('horizon')=='swing' and not option.get('context_timeframe') and (
@@ -484,8 +540,14 @@ class ContextEvaluator:
         if runner3:
             policy+='\n'+account['runner3_entry_gate']+'\n'
             policy+=('Runner 3 requires the selected READY setup ID, its exact stop, and a target that is one of the supplied opposing target levels. '
-                     'Use the selected 4h→15m or 1h→5m lane. Require the valid HTF zone, a closed LTF touch, '
-                     'and a later closed LTF CHoCH/MSS; use the supplied LTF stop and one supplied opposing HTF target level. '
+                     'Use the selected 4h→15m or 1h→5m lane. Both directions use the same rule. '
+                     'Entry is a closed CHoCH on the trigger timeframe at a block or a flow, with the trigger candle closing through that CHoCH level. '
+                     'The stop is the CHoCH swing: a short uses the CHoCH high and a long uses the CHoCH low. '
+                     'When the trade is against the higher timeframe, target only the next opposing block or flow on the trigger timeframe. Do not hold that trade toward a far higher-timeframe target. '
+                     'When the trade is with the higher timeframe, a farther target is allowed. '
+                     'A hold is not the default when the CHoCH, the block or flow, and a target exist. '
+                     'Require the valid HTF zone, a closed LTF touch, '
+                     'and a later closed LTF CHoCH/MSS; use the supplied LTF stop and one supplied opposing target level. '
                      'Optional 1m timing evidence never substitutes for the 5m confirmation or supplies price references. '
                      'A zone awaiting touch or confirmation can only be watched. Preserve its supplied trigger and '
                      'invalidation. BTC/ETH structure provides context; an altcoin can diverge if its own closed evidence supports it. '
@@ -506,7 +568,7 @@ class ContextEvaluator:
                      'For a long, the initial stop is just beyond the low of the CHoCH candle that confirmed the entry. '
                      'For a short, it is just beyond that CHoCH candle high. A 4h setup uses the 15m CHoCH. '
                      'A 1h setup uses the 5m CHoCH. Do not use another candle wick on that timeframe. '
-                     'The target is one of the supplied opposing higher-timeframe levels. Do not invent a level. Later management may only tighten that stop, '
+                     'The target is one of the supplied opposing levels. Against the higher timeframe that is only the next block or flow on the trigger timeframe. With the higher timeframe a farther supplied level is allowed. Do not invent a level. Later management may only tighten that stop, '
                      'never widen it past this invalidation. Do not open a hedge. '
                      'Decide from the numeric setup: zone, touch, closed CHoCH/MSS, price-action and ICT labels, and the algorithm reason. '
                      'Swing stays 4h zone then 15m confirmation. Intraday stays 1h zone then 5m confirmation. Touch alone is not an entry. '
@@ -526,7 +588,13 @@ class ContextEvaluator:
                      'A valid hold on that selected setup is entered at the farthest supplied level that clears 1.25. Silence still opens nothing. '
                      'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons. '
                      'Account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons. '
-                     'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.')
+                     'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent. '
+                     'When prior_hold is present this is a hold retrigger. A stored number printed. '
+                     'prior_hold.rationale is the short prior rationale. '
+                     'prior_hold.old_market is the market from that hold. '
+                     'market is the new data. Answer briefly whether the trade is taken now. '
+                     'You may hold again. A new hold stores the new zone edge, CHoCH level, and block or flow price. '
+                     'When a chart is attached, this review uses it.')
         decision_mode = None
         winning_identity = {}
         share_decision = None
@@ -574,8 +642,11 @@ class ContextEvaluator:
                                   'A missing text share stays the 35% fallback. Do not invent a larger share. '
                                   'Chart annotations cannot replace candle references or mandatory price and risk checks. '
                                   'Equity under 100 USDT still needs zone, touch, and closed CHoCH/MSS. It is not a reason to drop a real setup whose supplied target clears cost-adjusted R 1.25. Touch alone never places an order.')
-            review_account = account if prompt_account is None else prompt_account
-            review_prompt = build_prompt(candidate, chart_context, memory, positions, review_account, mode, changes)
+            review_account = model_account if prompt_account is None else prompt_account
+            review_market = model_market
+            if runner3 and prompt_account is not None:
+                review_account, review_market = runner3_model_view(prompt_account, chart_context)
+            review_prompt = build_prompt(candidate, review_market, memory, positions, review_account, mode, changes)
             payload = client.complete_json(system=review_policy, user=review_prompt,
                                            max_tokens=1100 if price_planning else 700,
                                            images=paths if mode == 'vlm' else None)
@@ -737,7 +808,7 @@ class ContextEvaluator:
                 metadata['retry_at']=memory['last_failure']['retry_at']
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_or_unavailable_model',metadata=metadata)
         ready_setup_after_hold = False
-        if runner3 and decision.action == 'hold' and price_rules is not None:
+        if runner3 and decision.action == 'hold' and price_rules is not None and not candidate.features.get('hold_review'):
             promoted = _ready_hold_trade(
                 decision, candidate, options, chart_context, prior_watch,
                 entry=candidate.entry_price, fee=fee, slippage=slippage,
@@ -762,8 +833,8 @@ class ContextEvaluator:
         if runner2 and decision.price_plan:
             from trading.quant.structure_setups import trade_horizon
             frame=selection['trigger_timeframe'] if selection else decision.price_plan.entry_timeframe
-            if runner3 and selection and selection.get('context_timeframe'):
-                frame={'swing':'4h','intraday':'15m'}[selection['horizon']]
+            if runner3 and selection and selection.get('context_timeframe') in ('4h', '1h'):
+                frame=selection['context_timeframe']
             metadata['trade_horizon']=trade_horizon(frame,time.time())
             trace['trade_horizon']=metadata['trade_horizon']['style']
         shadow_plan=None
@@ -790,8 +861,35 @@ class ContextEvaluator:
             self._save_trace(trace)
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='decision_expired',metadata=metadata)
         planned_candidate=candidate
-        price_evidence=evidence_from_market(chart_context) if decision.price_plan is not None else None
-        if decision.price_plan is not None:
+        entry_block=reentry_note.get('veto')
+        if (runner3 and candidate.features.get('hold_review') and decision.action=='trade'
+                and isinstance(selection, dict)):
+            cash_equity, cash_free = runner3_policy.cash_for_veto(equity, live_account)
+            prices, entry_block = runner3_policy.priced_reentry(
+                selection, price=candidate.entry_price, equity=cash_equity, free_margin=cash_free,
+                fee=fee, slippage=slippage)
+            if entry_block is None and prices is not None and decision.price_plan is not None:
+                update=dict(entry_price=prices['entry'], stop_loss_price=prices['stop'],
+                            take_profit_price=prices['target'])
+
+                def _reference(source):
+                    if not isinstance(source, dict) or any(source.get(key) is None for key in ('timeframe', 'open_time', 'field')):
+                        return None
+                    try:
+                        opened=int(source['open_time'])
+                    except (TypeError, ValueError):
+                        return None
+                    return dict(timeframe=source['timeframe'], open_time=opened, field=source['field'])
+
+                target_ref=_reference(prices.get('target_reference'))
+                stop_ref=_reference(prices.get('stop_reference'))
+                if target_ref is not None:
+                    update['target_reference']=CandleReference(**target_ref)
+                if stop_ref is not None:
+                    update['stop_reference']=CandleReference(**stop_ref)
+                decision=decision.model_copy(update={'price_plan': decision.price_plan.model_copy(update=update)})
+        price_evidence=evidence_from_market(chart_context) if decision.price_plan is not None and entry_block is None else None
+        if decision.price_plan is not None and entry_block is None:
             try:
                 planned_candidate=apply_market_price_plan(candidate,decision.price_plan,price_evidence,
                     price_step=price_rules.price_step,current_price=candidate.entry_price,now=time.time())
@@ -801,7 +899,7 @@ class ContextEvaluator:
             price_evidence=price_evidence,price_plan_enabled=price_planning)
         shadow_plan=planned_candidate if decision.action=='trade' else None
         prepared_proposal=None
-        if decision.action=='trade':
+        if decision.action=='trade' and entry_block is None:
             try:
                 prepared_proposal=apply_decision_sizing(planned_candidate,decision.sizing_plan,equity,risk_per_trade_pct,target_leverage,exchange_cap)
             except PlanSizingError:
@@ -860,6 +958,8 @@ class ContextEvaluator:
             watch_note=decision.watch_note,sizing_plan=decision.sizing_plan.model_dump(exclude_none=True) if decision.sizing_plan else None,
             release_symbol=decision.release_symbol,
             thesis_invalidated=bool(decision.release_symbol and decision.thesis_invalidated))
+        if account.get('swap_candidate'):
+            metadata['swap_candidate']=account['swap_candidate']
         if runner3 and not model_sizing:
             text_plan = getattr(share_decision, 'sizing_plan', None) if share_decision is not None else None
             metadata['guclu_margin_share'] = None if text_plan is None else text_plan.margin_share
@@ -884,6 +984,51 @@ class ContextEvaluator:
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='decision_expired',metadata=metadata)
         if local_limit:
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='local_limit',metadata=metadata)
+        if runner3 and decision.action=='hold':
+            from trading.evaluation.hold_triggers import save_hold, snapshot_market, trigger_levels
+            setup=selection if isinstance(selection, dict) else None
+            if setup is None:
+                ident=candidate.features.get('setup_id')
+                setup=next((row for row in options if isinstance(row, dict) and row.get('setup_id')==ident), None)
+            if setup is None:
+                setup=next((row for row in options if isinstance(row, dict) and row.get('state')=='ready'), None)
+            levels=trigger_levels(setup, candidate)
+            if levels:
+                step=price_rules.price_step if price_rules is not None else 0
+                metadata['price_action_hold']=save_hold(
+                    self.store, symbol=symbol, rationale=decision.rationale, levels=levels,
+                    side=(setup or {}).get('side') or candidate.side.value,
+                    setup_id=None if setup is None else setup.get('setup_id'),
+                    old_market=snapshot_market(chart_context),
+                    trigger_timeframe=None if setup is None else setup.get('trigger_timeframe'),
+                    price=candidate.entry_price, tick=step)
+        if runner3 and decision.action=='trade' and entry_block is None and prepared_proposal is not None:
+            cash_equity, cash_free = runner3_policy.cash_for_veto(equity, live_account)
+            entry_block = runner3_policy.entry_veto(
+                side=prepared_proposal.side, entry=prepared_proposal.entry_price,
+                stop=prepared_proposal.stop_loss.price, target=prepared_proposal.take_profit_price,
+                equity=cash_equity, free_margin=cash_free, fee=fee, slippage=slippage,
+                notional=prepared_proposal.notional, leverage=prepared_proposal.leverage)
+        if entry_block:
+            metadata['veto']=entry_block
+            logging.getLogger('worker').info('VETO %s check=%s', symbol, entry_block)
+            if candidate.features.get('hold_review'):
+                from trading.evaluation.hold_triggers import save_hold, snapshot_market, trigger_levels
+                setup=selection if isinstance(selection, dict) else None
+                levels=trigger_levels(setup, candidate)
+                if levels:
+                    step=price_rules.price_step if price_rules is not None else 0
+                    metadata['price_action_hold']=save_hold(
+                        self.store, symbol=symbol, rationale=decision.rationale, levels=levels,
+                        side=(setup or {}).get('side') or candidate.side.value,
+                        setup_id=None if setup is None else setup.get('setup_id'),
+                        old_market=snapshot_market(chart_context),
+                        trigger_timeframe=None if setup is None else setup.get('trigger_timeframe'),
+                        price=candidate.entry_price, tick=step)
+            return EvaluationResult(action=GraphAction.HOLD, hold_reason=entry_block, metadata=metadata)
+        if runner3 and decision.action=='trade':
+            from trading.evaluation.hold_triggers import clear_hold
+            clear_hold(self.store, symbol)
         if decision.action!='trade':
             return EvaluationResult(action=GraphAction.HOLD,hold_reason=decision.action,metadata=metadata)
         proposal=prepared_proposal
