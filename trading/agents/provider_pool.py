@@ -25,7 +25,7 @@ from trading.agents.model_limits import COMPACT_TPM, cap_limits, estimate_input_
 from trading.agents.provider_limits import blocked
 from trading.agents.provider_router import ProviderRouter
 from trading.agents.telemetry import is_model_output_failure
-from trading.evaluation.context import COMPACT_SYSTEM, compact_decision_packet
+from trading.evaluation.context import COMPACT_SYSTEM, compact_decision_packet, system_with_entry_gate
 
 
 GROQ_DAILY_PROBE_KEY = 'pool:groq:daily_probe_at'
@@ -254,8 +254,9 @@ class ProviderPool:
         completion=self._completion(slot, max_tokens)
         if estimate_input_tokens(system, compact, images)+completion<=self._limits(slot, images)[1]:
             return system, compact
-        if estimate_input_tokens(COMPACT_SYSTEM, compact, images)+completion<=self._limits(slot, images)[1]:
-            return COMPACT_SYSTEM, compact
+        compact_system = system_with_entry_gate(COMPACT_SYSTEM, system)
+        if estimate_input_tokens(compact_system, compact, images)+completion<=self._limits(slot, images)[1]:
+            return compact_system, compact
         return system, user
 
     def _sized(self, slot, system, user, max_tokens, images, prompt_bytes=None):

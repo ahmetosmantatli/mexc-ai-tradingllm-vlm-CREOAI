@@ -113,6 +113,21 @@ COMPACT_SYSTEM = (
 )
 
 
+def system_with_entry_gate(base, full_system):
+    """Keep the Runner 3 cost gate when a short system prompt replaces the full one."""
+    from trading.runtime.runner3_policy import ENTRY_GATE_BEGIN, ENTRY_GATE_END
+    if not isinstance(full_system, str) or not isinstance(base, str):
+        return base
+    start = full_system.find(ENTRY_GATE_BEGIN)
+    end = full_system.find(ENTRY_GATE_END, start if start >= 0 else 0)
+    if start < 0 or end < start:
+        return base
+    clause = full_system[start:end + len(ENTRY_GATE_END)]
+    if clause in base:
+        return base
+    return base + ' ' + clause
+
+
 def _summary_frame(frame):
     if not isinstance(frame, dict):
         return frame
@@ -196,6 +211,9 @@ def compact_decision_packet(user):
                   text_decision_why=text.get('rationale'), benchmarks=benchmarks, equity=equity,
                   free_margin=free_margin, open_positions=positions if positions is not None else [],
                   confirming_candles=candles, setups=kept)
+    gates = account.get('runner3_entry_gate')
+    if isinstance(gates, str) and gates.strip():
+        packet['entry_gates'] = gates
     if not isinstance(packet['symbol'], str):
         packet['symbol'] = market.get('symbol')
     return canonical(packet)

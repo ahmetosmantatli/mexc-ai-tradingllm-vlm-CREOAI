@@ -318,3 +318,66 @@ def test_text_share_wins_over_a_later_sizing_plan():
     assert chosen_margin_share({'guclu_margin_share': .22, 'sizing_plan': {'margin_share': .9}}) == .22
     assert chosen_margin_share({'sizing_plan': {'margin_share': .22}}) == .22
     assert chosen_margin_share({'sizing_plan': {}}) is None
+
+
+def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
+    from inspect import signature
+    import json
+
+    from trading.brokers.live.execution import ApprovedLiveExecutor
+    from trading.config import Settings
+    from trading.evaluation.context import COMPACT_SYSTEM, compact_decision_packet, system_with_entry_gate
+    from trading.runtime.runner3_policy import (
+        AGGRESSIVE_STOP_RISK_CAP, CONTINUOUS_STOP_RISK_CAP, MAX_COST_SHARE, MIN_NET_TARGET_R,
+        entry_gate_instruction, prompt_entry_costs, validate_economics)
+
+    defaults = signature(ApprovedLiveExecutor.__init__)
+    fee = defaults.parameters['fee_rate'].default
+    slip_bps = defaults.parameters['slippage_bps'].default
+    slippage = slip_bps / 10000
+    assert fee == Settings.model_fields['paper_fee_rate'].default == 0.0006
+    assert slip_bps == Settings.model_fields['paper_slippage_bps'].default == 5
+    assert MIN_NET_TARGET_R == 1.25
+    assert CONTINUOUS_STOP_RISK_CAP == .15
+    assert AGGRESSIVE_STOP_RISK_CAP == .10
+    assert MAX_COST_SHARE == .30
+    validate_economics(1.5, 1.25, 1.)
+    with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
+        validate_economics(1.5, 1.249, 1.)
+
+    class Costs:
+        paper_fee_rate = 0.0006
+        paper_slippage_bps = 5
+
+    assert prompt_entry_costs(Costs()) == (0.0006, 0.0005)
+    assert prompt_entry_costs(Costs(), {'fee': 0.001, 'slippage': 0.001}) == (0.001, 0.001)
+    assert prompt_entry_costs(Costs(), {'fee': True, 'slippage': 0.001}) == (0.0006, 0.0005)
+
+    text = entry_gate_instruction(fee=fee, slippage=slippage)
+    for line in (
+        'Runner 3 minimum cost-adjusted R is 1.25.',
+        'Fee assumption is 0.0006 per side. Exit-slippage assumption is 0.0005 (5 bps), applied to the stop and the target.',
+        'direction is 1 for long and -1 for short.',
+        'stop_fill = stop * (1 - direction * slippage).',
+        'target_fill = target * (1 - direction * slippage).',
+        'loss = abs(entry - stop_fill) + fee * (entry + stop_fill).',
+        'net = direction * (target_fill - entry) - fee * (entry + target_fill).',
+        'cost_adjusted_R = net / loss.',
+        'gross = abs(target - entry).',
+        'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < 1.25, and when gross <= 0 or (gross - net) / gross > 0.30.',
+        'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
+        'When continuous aggressive is off, aggressive model sizing uses the 10% equity stop cap.',
+        'A proposal whose target fails that R must be BEKLE (action hold) or a farther target on the supplied target reference that clears 1.25, not ENTER (action trade).',
+        'Do not move the stop to manufacture R. Do not invent a setup or a target reference.',
+        'Do not invent a trade when you are silent.',
+    ):
+        assert line in text
+    compact_system = system_with_entry_gate(COMPACT_SYSTEM, 'full policy\n' + text + '\nmore')
+    assert 'cost_adjusted_R = net / loss.' in compact_system
+    assert 'The continuous equity stop cap is 15% of equity.' in compact_system
+    assert system_with_entry_gate(COMPACT_SYSTEM, 'no gate here') == COMPACT_SYSTEM
+    raw = json.dumps(dict(context_policy='pa-context-v4', account=dict(runner3_entry_gate=text, equity=10),
+                          market=dict(symbol='LAB_USDT')), separators=(',', ':'))
+    packet = json.loads(compact_decision_packet(raw))
+    assert packet['entry_gates'] == text
+    assert packet['symbol'] == 'LAB_USDT'

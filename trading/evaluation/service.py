@@ -252,6 +252,9 @@ class ContextEvaluator:
         continuous = bool(runner3 and live_account.get('continuous_aggressive'))
         countertrend_cap = risk_per_trade_pct if continuous else risk_per_trade_pct * .5
         if runner3:
+            fee, slippage = runner3_policy.prompt_entry_costs(
+                self.cfg, live_account.get('runner3_entry_costs'))
+            account['runner3_entry_gate'] = runner3_policy.entry_gate_instruction(fee=fee, slippage=slippage)
             balance=live_account['current_equity']
             for option in options:
                 grade=runner3_policy.evidence_grade(option)
@@ -437,7 +440,8 @@ class ContextEvaluator:
                               'Use visible wick references for levels and confirmed structure for invalidation. '
                               'BTC/ETH relative returns and recent_trade_flow are optional context, never an automatic veto. The flow is a bounded exchange trade-side sample; null means unavailable.' if runner2 else '')
         if runner3:
-            policy+=(' Runner 3 requires the selected READY setup ID and its exact stop and target references. '
+            policy+='\n'+account['runner3_entry_gate']+'\n'
+            policy+=('Runner 3 requires the selected READY setup ID and its exact stop and target references. '
                      'Use the selected 4h→15m or 1h→5m lane. Require the valid HTF zone, a closed LTF touch, '
                      'and a later closed LTF CHoCH/MSS; use the supplied LTF stop and HTF target. '
                      'Optional 1m timing evidence never substitutes for the 5m confirmation or supplies price references. '

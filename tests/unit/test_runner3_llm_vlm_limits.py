@@ -705,3 +705,38 @@ def test_text_model_receives_the_guclu_packet_and_keeps_its_share(tmp_path, monk
     silent = run()
     assert silent.metadata['guclu_margin_share'] is None
     assert silent.metadata['sizing_plan']['margin_share'] == .8
+
+
+def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monkeypatch):
+    def text(packet):
+        gate = packet['account']['runner3_entry_gate']
+        assert 'Runner 3 minimum cost-adjusted R is 1.25.' in gate
+        assert 'cost_adjusted_R = net / loss.' in gate
+        assert 'The continuous equity stop cap is 15% of equity.' in gate
+        return hold_answer('Hedef maliyet sonrası 1.25 R altında, bekliyorum.')
+
+    def vision(model, packet):
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    model = DecisionModel(text, vision)
+    run, _store = evaluator(tmp_path, monkeypatch, model)
+    result = run()
+    system = model.calls[0]['system']
+    for line in (
+        'Runner 3 minimum cost-adjusted R is 1.25.',
+        'Fee assumption is 0.0006 per side. Exit-slippage assumption is 0.0005 (5 bps), applied to the stop and the target.',
+        'stop_fill = stop * (1 - direction * slippage).',
+        'target_fill = target * (1 - direction * slippage).',
+        'loss = abs(entry - stop_fill) + fee * (entry + stop_fill).',
+        'net = direction * (target_fill - entry) - fee * (entry + target_fill).',
+        'cost_adjusted_R = net / loss.',
+        'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < 1.25, and when gross <= 0 or (gross - net) / gross > 0.30.',
+        'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
+        'A proposal whose target fails that R must be BEKLE (action hold) or a farther target on the supplied target reference that clears 1.25, not ENTER (action trade).',
+        'Do not invent a trade when you are silent.',
+    ):
+        assert line in system
+    assert system.index('Runner 3 minimum cost-adjusted R is 1.25.') < system.index('Runner 3 requires the selected READY')
+    assert result.action.value == 'hold'
+    assert result.proposal is None
