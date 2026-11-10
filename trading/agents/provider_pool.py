@@ -6,8 +6,8 @@ window or daily count is full. Local estimates are not live quota telemetry.
 8K TPM models may receive a compact packet. Wider models receive the full packet.
 Valid HOLD never triggers fallback. A local free-route estimate of zero is not
 proof those routes are exhausted, and a does-not-fit skip is not exhaustion.
-Gemini and Groq are tried before NVIDIA, OpenRouter, Cloudflare, and Anthropic.
-Two NVIDIA network timeouts end that review.
+Live review tries every configured Gemini key before any Groq model.
+Groq is next. NVIDIA is last. Two NVIDIA network timeouts end that review.
 """
 from dataclasses import dataclass, field
 from datetime import datetime,timedelta
@@ -33,6 +33,11 @@ from trading.evaluation.context import COMPACT_SYSTEM, compact_decision_packet, 
 GROQ_DAILY_PROBE_KEY = 'pool:groq:daily_probe_at'
 GROQ_DAILY_PROBE_INTERVAL = 60
 NVIDIA_REVIEW_CAP = 2
+
+
+def key_slot_numbers(provider):
+    """Gemini has a third key slot. Groq stays at two."""
+    return (1, 2, 3) if provider == 'gemini' else (1, 2)
 
 
 class PrefixStore:
@@ -92,8 +97,8 @@ class ProviderPool:
         from trading.agents.quota_routes import parse_routes
         routes=parse_routes(getattr(settings,'ai_free_model_routes','[]'))
         for provider in ('groq','gemini'):
-            for number in (1,2):
-                suffix = '' if number == 1 else '_2'
+            for number in key_slot_numbers(provider):
+                suffix = '' if number == 1 else '_'+str(number)
                 credential = getattr(settings, provider+'_api_key'+suffix, '')
                 if not credential:
                     continue
@@ -801,11 +806,13 @@ class ProviderPool:
         return status!=429 or self._cooldown(slot,images)<=time.time()+seconds
 
     def _route_priority(self,slot,probe):
-        """Gemini and Groq first. NVIDIA is last among the free routes."""
+        """Every Gemini key, then Groq. NVIDIA is last among the free routes."""
         if probe:
             return -1
-        if slot.provider in ('gemini','groq'):
-            return 0 if slot.provider==getattr(self,'_preferred_provider','groq') else 1
+        if slot.provider=='gemini':
+            return 0
+        if slot.provider=='groq':
+            return 1
         if slot.provider=='nvidia':
             return 3
         return 2

@@ -207,6 +207,7 @@ class Settings(BaseSettings):
     ai_pool_max_generation_requests: int = Field(default=3,ge=1,le=8)
     groq_api_key_2: str = Field(default='',repr=False)
     gemini_api_key_2: str = Field(default='',repr=False)
+    gemini_api_key_3: str = Field(default='',repr=False)
     groq_quota_group: str = Field(default='groq-main',pattern='^[A-Za-z0-9_-]{1,64}$')
     groq_quota_group_2: str = Field(default='groq-main',pattern='^[A-Za-z0-9_-]{1,64}$')
     gemini_quota_group: str = Field(default='gemini-main',pattern='^[A-Za-z0-9_-]{1,64}$')
