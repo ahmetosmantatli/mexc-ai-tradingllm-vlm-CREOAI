@@ -49,7 +49,7 @@ def ready_answer(data, **extra):
     return answer
 
 
-def evaluator(tmp_path, monkeypatch, model, market=None, version='text'):
+def evaluator(tmp_path, monkeypatch, model, market=None, version='text', prepare=None):
     market = rebase_market() if market is None else market
     monkeypatch.setattr('trading.analysis.build_bundle', lambda *args, **kwargs:
                         SimpleNamespace(fingerprint='lane', to_context=lambda **kw: deepcopy(market)))
@@ -64,6 +64,8 @@ def evaluator(tmp_path, monkeypatch, model, market=None, version='text'):
     seed = signal(Side.SHORT)
     seed.entry_price = 100.
     seed.features.update(htf_zone_seed=True, source_closed_at=time.time() - 1, dedup_key='seed')
+    if prepare is not None:
+        prepare(seed, market)
 
     def run(**account):
         context = dict(mode='LIVE', currency='USDT', runner_id='runner3', current_equity=11.58,
@@ -740,12 +742,12 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
         'These are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
         'The 15% equity stop cap still applies. Do not move the stop.',
-        'A silent answer or BEKLE (action hold) opens nothing.',
+        'A silent or invalid answer opens nothing. When the selected setup is real and you hold, the engine enters the farthest supplied opposing target that clears 1.25 and keeps the stop. A hold with no such level stays a hold.',
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
         'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target.',
         'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.',
-        'A silent answer or BEKLE opens nothing.',
+        'A valid hold on that selected setup is entered at the farthest supplied level that clears 1.25. Silence still opens nothing.',
         'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.',
     ):
         assert line in system
@@ -758,7 +760,7 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
     assert system.index('would otherwise block') < system.index('That choice stands')
     assert system.index('Runner 3 minimum cost-adjusted R is 1.25.') < system.index('Runner 3 requires the selected READY')
     assert system.index('Runner 3 requires the selected READY') < system.index('must be ENTER at that target')
-    assert system.index('must be ENTER at that target') < system.index('A silent answer or BEKLE opens nothing.')
+    assert system.index('must be ENTER at that target') < system.index('A valid hold on that selected setup is entered')
     assert 'must be BEKLE (action hold) or a farther target' not in system
     for call in model.calls:
         assert 'you must ENTER (action trade)' in call['system']
@@ -790,3 +792,97 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
     assert 'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.' in note
     assert result.action.value == 'hold'
     assert result.proposal is None
+
+
+def _ready_market():
+    market = rebase_market()
+    higher = next(view for view in market['timeframes'] if view['timeframe'] == '4h')
+    rows = higher['recent_ohlcv']
+    rows[0][2] = 101.
+    rows[1][2] = 120.
+    higher['features']['swings'].extend([
+        dict(kind='high', price=101., pivot_at=rows[0][0], confirmed_at=rows[3][0]),
+        dict(kind='high', price=120., pivot_at=rows[1][0], confirmed_at=rows[4][0]),
+    ])
+    return market
+
+
+def _select_ready(seed, market):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ready = next(row for row in build_htf_zone_setups(market, current_price=100., price_step=.01)
+                 if row['state'] == 'ready')
+    seed.side = Side(ready['side'])
+    seed.features['setup_id'] = ready['setup_id']
+    _select_ready.setup = ready
+
+
+def test_valid_hold_on_the_selected_ready_setup_enters_the_farthest_clearing_target(tmp_path, monkeypatch):
+    from trading.runtime.runner3_policy import MIN_NET_TARGET_R, clearing_supplied_targets, cost_adjusted_r
+
+    market = _ready_market()
+
+    def text(packet):
+        return hold_answer('Üst zaman dilimi düşüşte ve fiyat bölgeye değmedi.')
+
+    def vision(model, packet):
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    model = DecisionModel(text, vision)
+    run, store = evaluator(tmp_path, monkeypatch, model, market=market, prepare=_select_ready)
+    result = run()
+    ready = _select_ready.setup
+    levels = clearing_supplied_targets(
+        ready, entry=100., fee=0.0006, slippage=0.0005, price_step=.01)
+    assert levels[0]['price'] == 120.
+    assert cost_adjusted_r(
+        side='long', entry=100., stop=ready['stop_loss_price'], target=101.,
+        fee=0.0006, slippage=0.0005) < MIN_NET_TARGET_R
+    assert result.action.value == 'trade'
+    assert result.proposal is not None
+    assert abs(result.proposal.stop_loss.price - ready['stop_loss_price']) < 1e-9
+    assert abs(result.proposal.take_profit_price - levels[0]['take_profit_price']) < 1e-9
+    assert abs(result.proposal.take_profit_price - 120.) < 1e-9
+    assert result.metadata['ready_setup_after_hold'] is True
+    assert result.metadata['rationale'].startswith('Üst zaman dilimi')
+    trace = store.get('analysis_trace')
+    assert trace['action'] == 'trade'
+    assert trace['model_action'] == 'hold'
+    assert trace['ready_setup_after_hold'] is True
+    assert trace['execution_status'] == 'awaiting_risk'
+
+    def trading(packet):
+        return ready_answer(packet, rationale='Model verilen yakın hedefi seçti.')
+
+    trade_model = DecisionModel(trading, vision)
+    trade_run, _trade_store = evaluator(
+        tmp_path / 'trade', monkeypatch, trade_model, market=deepcopy(market), prepare=_select_ready)
+    traded = trade_run()
+    named = _select_ready.setup['take_profit_price']
+    assert traded.action.value == 'trade'
+    assert traded.metadata.get('ready_setup_after_hold') is not True
+    assert abs(traded.proposal.take_profit_price - named) < 1e-9
+    assert abs(named - 120.) > 1
+
+    def silent(packet):
+        return None
+
+    silent_model = DecisionModel(silent, vision)
+    silent_run, silent_store = evaluator(
+        tmp_path / 'silent', monkeypatch, silent_model, market=deepcopy(market), prepare=_select_ready)
+    missed = silent_run()
+    assert missed.action.value == 'hold'
+    assert missed.proposal is None
+    assert missed.hold_reason == 'invalid_or_unavailable_model'
+    assert silent_store.get('analysis_trace').get('ready_setup_after_hold') is not True
+
+    monkeypatch.setattr(
+        'trading.runtime.runner3_policy.clearing_supplied_targets', lambda *args, **kwargs: [])
+    held_model = DecisionModel(text, vision)
+    held_run, _held_store = evaluator(
+        tmp_path / 'below', monkeypatch, held_model, market=deepcopy(market), prepare=_select_ready)
+    held = held_run()
+    assert held.action.value == 'hold'
+    assert held.proposal is None
+    assert held.hold_reason == 'hold'

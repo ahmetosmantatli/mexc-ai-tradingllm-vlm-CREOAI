@@ -374,7 +374,7 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
         'These are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
         'The 15% equity stop cap still applies. Do not move the stop.',
-        'A silent answer or BEKLE (action hold) opens nothing.',
+        'A silent or invalid answer opens nothing. When the selected setup is real and you hold, the engine enters the farthest supplied opposing target that clears 1.25 and keeps the stop. A hold with no such level stays a hold.',
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
     ):
@@ -501,3 +501,50 @@ def test_a_model_chosen_supplied_target_is_not_rejected_for_r():
     missing_touch = dict(setup, evidence=dict(setup['evidence']))
     missing_touch['evidence'].pop('touch_at')
     assert order_names_supplied_target(missing_touch, far_plan, stop=90, target=105) is False
+
+
+def test_a_hold_keeps_only_the_farthest_supplied_level_that_clears_the_floor():
+    from types import SimpleNamespace
+
+    from trading.runtime.runner3_policy import (
+        MIN_NET_TARGET_R, clearing_supplied_targets, cost_adjusted_r, selected_closed_setup)
+
+    near = dict(timeframe='4h', open_time=2, field='high', price=110.)
+    mid = dict(timeframe='4h', open_time=4, field='high', price=140.)
+    far = dict(timeframe='4h', open_time=3, field='high', price=160.)
+    setup = dict(
+        setup_id='ready-long', side='long', state='ready',
+        evidence=dict(
+            kind='htf_zone_mss', stage='confirmed',
+            zone=dict(low=95., high=99.), touch_at=10.,
+            shift=dict(kind='mss', at=11)),
+        stop_loss_price=90.,
+        opposing_target_levels=[near, mid, far])
+    fee, slip = 0.0006, 0.0005
+    assert cost_adjusted_r(side='long', entry=100, stop=90, target=110, fee=fee, slippage=slip) < MIN_NET_TARGET_R
+    assert cost_adjusted_r(side='long', entry=100, stop=90, target=160, fee=fee, slippage=slip) >= MIN_NET_TARGET_R
+    found = clearing_supplied_targets(setup, entry=100, fee=fee, slippage=slip, price_step=0)
+    assert [row['take_profit_price'] for row in found] == [160., 140.]
+    assert all(row['price'] in (140., 160.) for row in found)
+    assert clearing_supplied_targets(
+        dict(setup, opposing_target_levels=[near]), entry=100, fee=fee, slippage=slip) == []
+    invented = dict(timeframe='4h', open_time=9, field='high', price=200.)
+    assert invented['price'] not in {
+        row['take_profit_price'] for row in clearing_supplied_targets(
+            setup, entry=100, fee=fee, slippage=slip)}
+    bare = dict(setup, evidence=dict(setup['evidence'], zone=None))
+    assert clearing_supplied_targets(bare, entry=100, fee=fee, slippage=slip) == []
+
+    short_near = dict(timeframe='4h', open_time=2, field='low', price=90.)
+    short_far = dict(timeframe='4h', open_time=3, field='low', price=70.)
+    short = dict(setup, side='short', stop_loss_price=110.,
+                 opposing_target_levels=[short_near, short_far])
+    short_found = clearing_supplied_targets(short, entry=100, fee=fee, slippage=slip)
+    assert short_found[0]['take_profit_price'] == 70.
+    assert cost_adjusted_r(side='short', entry=100, stop=110, target=90, fee=fee, slippage=slip) < MIN_NET_TARGET_R
+
+    chosen = SimpleNamespace(features={'setup_id': 'ready-long'})
+    assert selected_closed_setup(chosen, [setup])['setup_id'] == 'ready-long'
+    assert selected_closed_setup(SimpleNamespace(features={}), [setup]) is None
+    assert selected_closed_setup(SimpleNamespace(features={'setup_id': 'other'}), [setup]) is None
+    assert selected_closed_setup(chosen, [dict(setup, state='watch')]) is None

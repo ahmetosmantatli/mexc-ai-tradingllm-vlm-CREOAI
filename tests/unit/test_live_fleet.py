@@ -428,3 +428,35 @@ def test_live_review_notices_deliver_start_and_hold_separately(tmp_path):
         assert len(f.controller.messages) == 3
     finally:
         f.stop()
+
+
+def test_ready_setup_after_bekle_is_said_on_telegram(tmp_path):
+    from types import SimpleNamespace
+    from trading.control.telegram import TelegramController
+    from trading.runtime.live_runner import LiveRunner
+
+    f = fleet(tmp_path)
+    try:
+        runner = f.runners['a']
+        runner.binding_id = 'binding'
+        LiveRunner._record_review_notice(SimpleNamespace(binding_id='binding', store=runner.store), dict(
+            id='ready', symbol='SOL_USDT', completed_at=1, status='completed', action='trade',
+            model_action='hold', model='test-model', decision_mode='text', attempts=[],
+            strategy='structure_setup', ready_setup_after_hold=True,
+            rationale='Üst zaman dilimi düşüşte ve fiyat bölgeye değmedi.'))
+        f.publish(f.accounts[0])
+        text = f.controller.messages[-1][0][1]
+        assert 'Giriş, hazır kurulumdan alındı. Model BEKLE seçmişti.' in text
+        assert 'Üst zaman dilimi düşüşte ve fiyat bölgeye değmedi.' in text
+        assert 'AI beklemeyi seçti' not in text
+        fake = SimpleNamespace(
+            snapshot_provider=lambda _account: dict(analysis_trace=dict(
+                id='ready', symbol='SOL_USDT', strategy='structure_setup', status='completed',
+                action='trade', model_action='hold', decision_mode='text', attempts=[],
+                ready_setup_after_hold=True, rationale='Üst zaman dilimi düşüşte.')),
+            progress_text=lambda _snapshot: '', control=lambda _account: {})
+        screen = TelegramController.diagnostics_text(fake, 'a')
+        assert 'Model kararı: Bekle' in screen
+        assert 'Giriş, hazır kurulumdan alındı. Model BEKLE seçmişti.' in screen
+    finally:
+        f.stop()

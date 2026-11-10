@@ -169,6 +169,46 @@ def finalize_trace(store, trace_id, status, reason, details=None):
         return True
 
 
+def _ready_hold_trade(decision, candidate, options, chart_context, prior_watch, *, entry, fee, slippage, price_step, now):
+    """A valid hold becomes a trade at the farthest supplied level that clears 1.25.
+
+    The setup stop stays. A level that was not supplied is not created. No
+    qualifying level, a plan that does not ground, or a conflicting watch
+    leaves the hold. Silence never reaches this function.
+    """
+    if decision.action != 'hold' or decision.price_plan is not None or decision.limit_price is not None:
+        return None
+    setup = runner3_policy.selected_closed_setup(candidate, options)
+    if setup is None:
+        return None
+    if (prior_watch.get('status') in ACTIVE and prior_watch.get('side') != setup.get('side')
+            and (decision.reviewed_watch_revision != prior_watch.get('revision')
+                 or len(decision.rationale.strip()) < 12)):
+        return None
+    evidence = evidence_from_market(chart_context)
+    for level in runner3_policy.clearing_supplied_targets(
+            setup, entry=entry, fee=fee, slippage=slippage, price_step=price_step):
+        try:
+            plan = MarketPricePlan.model_validate(dict(
+                entry_type='market', entry_price=entry,
+                stop_loss_price=setup['stop_loss_price'],
+                take_profit_price=level['take_profit_price'],
+                entry_timeframe=setup['trigger_timeframe'],
+                stop_reference=setup['stop_reference'],
+                target_reference={key: level[key] for key in ('timeframe', 'open_time', 'field')},
+                reason='Hazır kurulumun verilen hedefi. Stop aynı kaldı.'))
+            apply_market_price_plan(candidate, plan, evidence, price_step=price_step,
+                                    current_price=entry, now=now)
+            runner3_policy.validate_evidence(setup, plan, now)
+        except (ValueError, TypeError):
+            continue
+        return decision.model_copy(update=dict(
+            action='trade', signal_id=candidate.signal_id, setup_id=setup['setup_id'],
+            price_plan=plan, watch_plan=None, limit_price=None, release_symbol=None,
+            thesis_invalidated=False))
+    return None
+
+
 class ContextEvaluator:
     """Self-contained current evidence + bounded application-owned setup memory.
 
@@ -483,7 +523,7 @@ class ContextEvaluator:
                      'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target. '
                      'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
                      'If your action is trade and the target you name is one of the supplied opposing levels, the engine does not reject that choice for cost-adjusted R. '
-                     'A silent answer or BEKLE opens nothing. '
+                     'A valid hold on that selected setup is entered at the farthest supplied level that clears 1.25. Silence still opens nothing. '
                      'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons. '
                      'Account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons. '
                      'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.')
@@ -696,8 +736,19 @@ class ContextEvaluator:
                 self.store.put(key,memory)
                 metadata['retry_at']=memory['last_failure']['retry_at']
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_or_unavailable_model',metadata=metadata)
+        ready_setup_after_hold = False
+        if runner3 and decision.action == 'hold' and price_rules is not None:
+            promoted = _ready_hold_trade(
+                decision, candidate, options, chart_context, prior_watch,
+                entry=candidate.entry_price, fee=fee, slippage=slippage,
+                price_step=price_rules.price_step, now=time.time())
+            if promoted is not None:
+                decision = promoted
+                ready_setup_after_hold = True
         metadata['decision_mode']=decision_mode
-        trace['model_action']=decision.action
+        trace['model_action']='hold' if ready_setup_after_hold else decision.action
+        if ready_setup_after_hold:
+            metadata['ready_setup_after_hold'] = True
         source_candidate=candidate
         from trading.evaluation.setup_selection import validate_selection
         candidate,selection=validate_selection(decision,candidate,options,selection_enabled)
@@ -777,7 +828,10 @@ class ContextEvaluator:
             economic_basis['benchmarks']=chart_context['benchmarks']
         evaluation_key=digest(dict(policy=policy_version,market=fingerprint,scope=scope,economic_basis=economic_basis))
         reported_action='local_limit' if local_limit else decision.action
-        trace.update(status='completed',action=reported_action,model_action=reported_action,rationale=decision.rationale,
+        if ready_setup_after_hold:
+            trace['ready_setup_after_hold'] = True
+        trace.update(status='completed',action=reported_action,
+            model_action='hold' if ready_setup_after_hold else reported_action,rationale=decision.rationale,
             invalidation=decision.invalidation,watch_note=decision.watch_note,
             execution_status='not_opened' if local_limit or decision.action!='trade' else 'awaiting_risk')
         self._save_trace(trace)

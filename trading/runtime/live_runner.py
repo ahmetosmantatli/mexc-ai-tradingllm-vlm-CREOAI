@@ -398,6 +398,7 @@ class LiveRunner:
         notice = dict(id=trace['id'], phase=phase, binding_id=self.binding_id, symbol=trace['symbol'],
                       status=trace['status'], action=trace.get('action'), model=trace.get('model'),
                       decision_mode=trace.get('decision_mode'),
+                      ready_setup_after_hold=bool(trace.get('ready_setup_after_hold')),
                       rationale=' '.join((trace.get('rationale') or '').split())[:180],
                       strategy=trace.get('strategy'), seed_timeframe=trace.get('seed_timeframe'),
                       review_reason=(trace.get('why_reconsidered') or {}).get('reason'),
@@ -469,7 +470,8 @@ class LiveRunner:
         private_risk=next(row for row in snapshot['risk_limits'][candidate.symbol] if row['side']==side)
         private_leverage=next(row for row in snapshot['leverage'][candidate.symbol] if row['side']==side)
         exchange_cap=min(rules.max_leverage,private_risk['max_leverage'],private_leverage['max_leverage'])
-        if self.cfg.live_leverage_mode=='exchange' and result.metadata.get('sizing_plan') is None:
+        ready_hold = bool(result.metadata.get('ready_setup_after_hold'))
+        if self.cfg.live_leverage_mode=='exchange' and result.metadata.get('sizing_plan') is None and not ready_hold:
             raise ValueError('model must explicitly choose live leverage and risk')
         ticker=self.quote(candidate.symbol)
         runner_id=control.get('runner_id','baseline-v1')
@@ -495,7 +497,7 @@ class LiveRunner:
         account_equity = snapshot['balance']['equity']
         model_sizing = runner3_policy.aggressive_model_sizing(
             self.cfg, self.risk.preset.profile, runner_id, account_equity)
-        if model_sizing and result.metadata.get('sizing_plan') is None:
+        if model_sizing and result.metadata.get('sizing_plan') is None and not ready_hold:
             raise PlanSizingError('aggressive_runner3_requires_explicit_sizing')
         risk_fraction = self._risk_fraction(control, account_equity)
         continuous = runner3_policy.continuous_aggressive(self.cfg, self.risk.preset.profile, runner_id)
