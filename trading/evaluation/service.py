@@ -282,8 +282,8 @@ class ContextEvaluator:
                 open_positions=list(live_account.get('open_position_briefs') or []),
                 queued_confirmed_plans=runner3_policy.rank_confirmed_plans(live_account.get('queued_confirmed_plans') or []),
                 note=('Confirmed plans share one balance. Simultaneous local limits are ranked by cost-adjusted R. '
-                      'A local limit does not reserve margin. Equity under 100 USDT is not a reason to enter without a valid zone, '
-                      'a closed touch, and a later closed CHoCH/MSS. Touch alone never places an order. '
+                      'A local limit does not reserve margin. Equity under 100 USDT still needs a valid zone, '
+                      'a closed touch, and a later closed CHoCH/MSS. It is not a BEKLE reason when a supplied target clears cost-adjusted R 1.25. Touch alone never places an order. '
                       'The risk engine still caps size and loss. Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
                       'release_symbol closes one different open position only when its thesis is invalidated and free margin cannot fund the new plan. '
                       'The close uses the single writer and the new entry waits until the exchange confirms that close.'))
@@ -468,14 +468,18 @@ class ContextEvaluator:
                      'never widen it past this invalidation. Do not open a hedge. '
                      'Decide from the numeric setup: zone, touch, closed CHoCH/MSS, price-action and ICT labels, and the algorithm reason. '
                      'Swing stays 4h zone then 15m confirmation. Intraday stays 1h zone then 5m confirmation. Touch alone is not an entry. '
-                     'Equity under 100 USDT is not a reason to enter. A trade still requires the valid HTF zone, a closed touch, '
-                     'and a later closed CHoCH/MSS. Touch alone never places an order. The risk engine still caps size and loss. '
+                     'Equity under 100 USDT still needs the valid HTF zone, a closed touch, '
+                     'and a later closed CHoCH/MSS. It is not a BEKLE reason when a supplied target clears cost-adjusted R 1.25. Touch alone never places an order. The risk engine still caps size and loss. '
                      'Queued confirmed plans share one balance. Simultaneous local limits are ranked by cost-adjusted R, not by preference. '
                      'Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
                      'release_symbol may name one different open position only when thesis_invalidated is true and that thesis is already invalidated, '
                      'and free margin cannot fund this confirmed plan. A higher payoff alone is not a close. '
                      'The close uses the single order writer and the new entry waits until the exchange confirms that close. '
-                     'limit_price is optional. Omit it or null for a market-now entry. A number is stored locally and is not a resting exchange order.')
+                     'limit_price is optional. Omit it or null for a market-now entry. A number is stored locally and is not a resting exchange order. '
+                     'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target. '
+                     'BEKLE only when confirmation is missing or none of the supplied levels clears 1.25. '
+                     'Account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons. '
+                     'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.')
         decision_mode = None
         winning_identity = {}
         share_decision = None
@@ -510,7 +514,9 @@ class ContextEvaluator:
                                   'zone, touch, closed CHoCH/MSS, price-action and ICT labels, and the algorithm reason. '
                                   'You have that same packet plus the chart. Text and this review run together. '
                                   'You have two minutes to answer. A valid answer in that time is the decision. '
-                                  'You may drop the trade, rebuild the plan, refuse the pair, take the market-now setup, or name limit_price. '
+                                  'You may rebuild the plan onto a supplied opposing target, take the market-now setup, or name limit_price. '
+                                  'Do not drop or refuse a real setup when a supplied opposing target clears cost-adjusted R 1.25. '
+                                  'Account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not reasons to drop it. '
                                   'An answer after the order is already sent does not unwind it. It may only update the saved local plan for the next trigger. '
                                   'limit_price is stored locally and is not a resting exchange order. '
                                   'Price reaching it only reopens analysis; confirmation is still required. '
@@ -518,7 +524,7 @@ class ContextEvaluator:
                                   'The text model chooses sizing_plan.margin_share for a Güçlü plan. Do not replace that share. '
                                   'A missing text share stays the 35% fallback. Do not invent a larger share. '
                                   'Chart annotations cannot replace candle references or mandatory price and risk checks. '
-                                  'Equity under 100 USDT is not a reason to enter without zone, touch, and closed CHoCH/MSS. Touch alone never places an order.')
+                                  'Equity under 100 USDT still needs zone, touch, and closed CHoCH/MSS. It is not a reason to drop a real setup whose supplied target clears cost-adjusted R 1.25. Touch alone never places an order.')
             review_account = account if prompt_account is None else prompt_account
             review_prompt = build_prompt(candidate, chart_context, memory, positions, review_account, mode, changes)
             payload = client.complete_json(system=review_policy, user=review_prompt,

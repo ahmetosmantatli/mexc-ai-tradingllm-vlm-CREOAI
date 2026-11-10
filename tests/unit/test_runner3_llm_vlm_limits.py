@@ -733,15 +733,32 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
         'cost_adjusted_R = net / loss.',
         'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < 1.25, and when gross <= 0 or (gross - net) / gross > 0.30.',
         'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
-        'When the setup is real (zone, touch, and a later closed CHoCH/MSS), first choose a farther target that is one of the supplied opposing target levels and whose cost-adjusted R clears 1.25.',
-        'BEKLE (action hold) only when none of the supplied levels clears 1.25.',
+        'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears 1.25, you must ENTER (action trade) at that supplied target.',
+        'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears 1.25.',
+        'If you BEKLE because no supplied level clears 1.25, say that. Do not cite account balance or other risk-management limits in its place.',
+        'These are not BEKLE reasons: account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
+        'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
+        'The equity stop cap and free margin change size after ENTER. They are not BEKLE reasons, and they do not replace the cost-adjusted R check.',
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
+        'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target.',
+        'BEKLE only when confirmation is missing or none of the supplied levels clears 1.25.',
+        'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.',
     ):
         assert line in system
-    assert system.index('first choose a farther target') < system.index('BEKLE (action hold) only when none')
+    assert 'first choose a farther target' not in system
+    assert 'Equity under 100 USDT is not a reason to enter.' not in system
+    assert 'You may drop the trade' not in system
+    assert system.index('you must ENTER (action trade)') < system.index('BEKLE (action hold) only when confirmation is missing')
     assert system.index('Runner 3 minimum cost-adjusted R is 1.25.') < system.index('Runner 3 requires the selected READY')
+    assert system.index('Runner 3 requires the selected READY') < system.index('must be ENTER at that target')
     assert 'must be BEKLE (action hold) or a farther target' not in system
+    for call in model.calls:
+        assert 'you must ENTER (action trade)' in call['system']
+        assert 'You may drop the trade' not in call['system']
+        if call.get('images'):
+            assert 'Do not drop or refuse a real setup when a supplied opposing target clears cost-adjusted R 1.25.' in call['system']
+            assert 'are not reasons to drop it.' in call['system']
     packet = json.loads(model.calls[0]['user'])
     account = packet['account']
     option = next(row for row in account['setup_selection']['options'] if row['state'] == 'ready')
@@ -756,5 +773,8 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
     assert account['equity'] == 11.58
     assert account['capital_allocation']['available_usdt'] == 11.58
     assert account['capital_allocation']['equity_usdt'] == 11.58
+    note = account['capital_allocation']['note']
+    assert 'Equity under 100 USDT is not a reason to enter' not in note
+    assert 'It is not a BEKLE reason when a supplied target clears cost-adjusted R 1.25.' in note
     assert result.action.value == 'hold'
     assert result.proposal is None

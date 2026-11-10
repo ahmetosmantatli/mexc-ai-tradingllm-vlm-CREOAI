@@ -367,14 +367,21 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
         'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < 1.25, and when gross <= 0 or (gross - net) / gross > 0.30.',
         'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
         'When continuous aggressive is off, aggressive model sizing uses the 10% equity stop cap.',
-        'When the setup is real (zone, touch, and a later closed CHoCH/MSS), first choose a farther target that is one of the supplied opposing target levels and whose cost-adjusted R clears 1.25.',
-        'BEKLE (action hold) only when none of the supplied levels clears 1.25.',
+        'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears 1.25, you must ENTER (action trade) at that supplied target.',
+        'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears 1.25.',
+        'If you BEKLE because no supplied level clears 1.25, say that. Do not cite account balance or other risk-management limits in its place.',
+        'These are not BEKLE reasons: account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
+        'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
+        'The equity stop cap and free margin change size after ENTER. They are not BEKLE reasons, and they do not replace the cost-adjusted R check.',
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
     ):
         assert line in text
     assert 'must be BEKLE (action hold) or a farther target' not in text
-    assert text.index('first choose a farther target') < text.index('BEKLE (action hold) only when none')
+    assert 'first choose a farther target' not in text
+    assert 'BEKLE (action hold) only when none of the supplied levels clears 1.25.' not in text
+    assert text.index('you must ENTER (action trade)') < text.index('BEKLE (action hold) only when confirmation is missing')
+    assert text.index('These are not BEKLE reasons') < text.index('Do not move the stop to manufacture R')
     compact_system = system_with_entry_gate(COMPACT_SYSTEM, 'full policy\n' + text + '\nmore')
     assert 'cost_adjusted_R = net / loss.' in compact_system
     assert 'The continuous equity stop cap is 15% of equity.' in compact_system
