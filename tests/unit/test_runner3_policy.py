@@ -368,7 +368,7 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
         'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
         'When continuous aggressive is off, aggressive model sizing uses the 10% equity stop cap.',
         'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears 1.25, you must ENTER (action trade) at that supplied target.',
-        'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears 1.25.',
+        'A real setup whose best supplied target is between 1.10 and 1.25 may still ENTER. BEKLE (action hold) remains for missing confirmation or no supplied level at or above 1.10.',
         'If you BEKLE because no supplied level clears 1.25, say that. Do not cite account balance or other risk-management limits in its place.',
         'These are not BEKLE reasons: account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
@@ -380,7 +380,9 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
     assert 'must be BEKLE (action hold) or a farther target' not in text
     assert 'first choose a farther target' not in text
     assert 'BEKLE (action hold) only when none of the supplied levels clears 1.25.' not in text
-    assert text.index('you must ENTER (action trade)') < text.index('BEKLE (action hold) only when confirmation is missing')
+    assert 'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears 1.25.' not in text
+    assert text.index('you must ENTER (action trade)') < text.index('may still ENTER')
+    assert text.index('Runner 3 minimum cost-adjusted R is 1.25.') < text.index('between 1.10 and 1.25 may still ENTER')
     assert text.index('These are not BEKLE reasons') < text.index('Do not move the stop to manufacture R')
     compact_system = system_with_entry_gate(COMPACT_SYSTEM, 'full policy\n' + text + '\nmore')
     assert 'cost_adjusted_R = net / loss.' in compact_system
@@ -424,3 +426,50 @@ def test_a_farther_supplied_target_is_allowed_and_the_floor_stays():
     validate_economics(1.5, 1.25, 1.)
     with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
         validate_economics(1.5, 1.249, 1.)
+
+
+def test_trade_on_a_real_setup_accepts_cost_adjusted_r_at_or_above_1_10():
+    from trading.runtime.runner3_policy import (
+        CONTINUOUS_STOP_RISK_CAP, ENGINE_R_SLACK, MIN_NET_TARGET_R, setup_is_real)
+
+    assert MIN_NET_TARGET_R == 1.25
+    assert ENGINE_R_SLACK == 1.10
+    assert CONTINUOUS_STOP_RISK_CAP == .15
+    real = dict(
+        state='ready',
+        evidence=dict(
+            kind='htf_zone_choch', stage='confirmed',
+            zone=dict(direction='bullish', low=90., high=95.),
+            touch_at=1_700_000_000.,
+            shift=dict(kind='choch', direction='bullish')))
+    assert setup_is_real(real)
+    validate_economics(1.5, 1.10, 1., action='trade', setup=real)
+    validate_economics(1.5, 1.249, 1., action='trade', setup=real)
+    with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
+        validate_economics(1.5, 1.099, 1., action='trade', setup=real)
+    with pytest.raises(ValueError, match='runner3_cost_share_too_high'):
+        validate_economics(2., 1.15, 1., action='trade', setup=real)
+    for action in ('hold', 'watch', 'cancel_watch', None, ''):
+        with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
+            validate_economics(1.5, 1.20, 1., action=action, setup=real)
+    for dropped in ('zone', 'touch_at', 'shift'):
+        evidence = dict(real['evidence'])
+        evidence.pop(dropped)
+        broken = dict(state='ready', evidence=evidence)
+        assert not setup_is_real(broken)
+        with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
+            validate_economics(1.5, 1.20, 1., action='trade', setup=broken)
+    awaiting = dict(state='ready', evidence=dict(real['evidence'], stage='awaiting_confirmation'))
+    watch = dict(state='watch', evidence=dict(real['evidence']))
+    wrong_kind = dict(state='ready', evidence=dict(real['evidence'], shift=dict(kind='bos')))
+    assert not setup_is_real(awaiting)
+    assert not setup_is_real(watch)
+    assert not setup_is_real(wrong_kind)
+    assert not setup_is_real(None)
+    stored = dict(evidence=real['evidence'])
+    assert setup_is_real(stored)
+    validate_economics(1.5, 1.10, 1., action='trade', setup=stored)
+    mss = dict(state='ready', evidence=dict(
+        real['evidence'], kind='htf_zone_mss', shift=dict(kind='mss')))
+    assert setup_is_real(mss)
+    validate_economics(1.5, 1.10, 1., action='trade', setup=mss)

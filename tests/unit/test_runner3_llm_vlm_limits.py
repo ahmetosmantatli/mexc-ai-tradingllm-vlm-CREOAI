@@ -734,7 +734,7 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
         'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < 1.25, and when gross <= 0 or (gross - net) / gross > 0.30.',
         'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
         'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears 1.25, you must ENTER (action trade) at that supplied target.',
-        'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears 1.25.',
+        'A real setup whose best supplied target is between 1.10 and 1.25 may still ENTER. BEKLE (action hold) remains for missing confirmation or no supplied level at or above 1.10.',
         'If you BEKLE because no supplied level clears 1.25, say that. Do not cite account balance or other risk-management limits in its place.',
         'These are not BEKLE reasons: account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
@@ -742,14 +742,14 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
         'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target.',
-        'BEKLE only when confirmation is missing or none of the supplied levels clears 1.25.',
+        'A real setup whose best supplied target is between 1.10 and 1.25 may still ENTER. BEKLE only when confirmation is missing or no supplied level is at or above 1.10.',
         'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.',
     ):
         assert line in system
     assert 'first choose a farther target' not in system
     assert 'Equity under 100 USDT is not a reason to enter.' not in system
     assert 'You may drop the trade' not in system
-    assert system.index('you must ENTER (action trade)') < system.index('BEKLE (action hold) only when confirmation is missing')
+    assert system.index('you must ENTER (action trade)') < system.index('between 1.10 and 1.25 may still ENTER')
     assert system.index('Runner 3 minimum cost-adjusted R is 1.25.') < system.index('Runner 3 requires the selected READY')
     assert system.index('Runner 3 requires the selected READY') < system.index('must be ENTER at that target')
     assert 'must be BEKLE (action hold) or a farther target' not in system

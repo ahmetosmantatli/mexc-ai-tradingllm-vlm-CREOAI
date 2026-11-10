@@ -477,7 +477,7 @@ class ContextEvaluator:
                      'The close uses the single order writer and the new entry waits until the exchange confirms that close. '
                      'limit_price is optional. Omit it or null for a market-now entry. A number is stored locally and is not a resting exchange order. '
                      'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target. '
-                     'BEKLE only when confirmation is missing or none of the supplied levels clears 1.25. '
+                     f'A real setup whose best supplied target is between {runner3_policy.ENGINE_R_SLACK:.2f} and {runner3_policy.MIN_NET_TARGET_R:.2f} may still ENTER. BEKLE only when confirmation is missing or no supplied level is at or above {runner3_policy.ENGINE_R_SLACK:.2f}. '
                      'Account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons. '
                      'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.')
         decision_mode = None
