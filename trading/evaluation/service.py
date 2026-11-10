@@ -169,46 +169,6 @@ def finalize_trace(store, trace_id, status, reason, details=None):
         return True
 
 
-def _ready_hold_trade(decision, candidate, options, chart_context, prior_watch, *, entry, fee, slippage, price_step, now):
-    """A valid hold becomes a trade at the farthest supplied level that clears 1.25.
-
-    The setup stop stays. A level that was not supplied is not created. No
-    qualifying level, a plan that does not ground, or a conflicting watch
-    leaves the hold. Silence never reaches this function.
-    """
-    if decision.action != 'hold' or decision.price_plan is not None or decision.limit_price is not None:
-        return None
-    setup = runner3_policy.selected_closed_setup(candidate, options)
-    if setup is None:
-        return None
-    if (prior_watch.get('status') in ACTIVE and prior_watch.get('side') != setup.get('side')
-            and (decision.reviewed_watch_revision != prior_watch.get('revision')
-                 or len(decision.rationale.strip()) < 12)):
-        return None
-    evidence = evidence_from_market(chart_context)
-    for level in runner3_policy.clearing_supplied_targets(
-            setup, entry=entry, fee=fee, slippage=slippage, price_step=price_step):
-        try:
-            plan = MarketPricePlan.model_validate(dict(
-                entry_type='market', entry_price=entry,
-                stop_loss_price=setup['stop_loss_price'],
-                take_profit_price=level['take_profit_price'],
-                entry_timeframe=setup['trigger_timeframe'],
-                stop_reference=setup['stop_reference'],
-                target_reference={key: level[key] for key in ('timeframe', 'open_time', 'field')},
-                reason='Hazır kurulumun verilen hedefi. Stop aynı kaldı.'))
-            apply_market_price_plan(candidate, plan, evidence, price_step=price_step,
-                                    current_price=entry, now=now)
-            runner3_policy.validate_evidence(setup, plan, now)
-        except (ValueError, TypeError):
-            continue
-        return decision.model_copy(update=dict(
-            action='trade', signal_id=candidate.signal_id, setup_id=setup['setup_id'],
-            price_plan=plan, watch_plan=None, limit_price=None, release_symbol=None,
-            thesis_invalidated=False))
-    return None
-
-
 class ContextEvaluator:
     """Self-contained current evidence + bounded application-owned setup memory.
 
@@ -323,9 +283,10 @@ class ContextEvaluator:
                 queued_confirmed_plans=runner3_policy.rank_confirmed_plans(live_account.get('queued_confirmed_plans') or []),
                 note=('Confirmed plans share one balance. Simultaneous local limits are ranked by cost-adjusted R. '
                       'A local limit does not reserve margin. Equity under 100 USDT still needs a valid zone, '
-                      'a closed touch, and a later closed CHoCH/MSS. It is not a BEKLE reason when a supplied target clears cost-adjusted R 1.25. Touch alone never places an order. '
-                      'Balance, free margin, and leverage (the multiplier) stay in this packet so you can size. They are not BEKLE reasons. '
-                      'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
+                      'a closed touch, and a later closed CHoCH/MSS. Touch alone never places an order. '
+                      'Propose an entry, a stop, and a target that pass cost-adjusted R 1.25, a stop loss of at most 15% of equity, and free margin for the sized order. '
+                      'When the setup is real, balance, free margin, and leverage (the multiplier) are not BEKLE reasons. '
+                      'If you choose hold, that hold stands. The engine does not replace your prices with a supplied opposing level. '
                       'The risk engine still caps size and loss. Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
                       'release_symbol closes one different open position only when its thesis is invalidated and free margin cannot fund the new plan. '
                       'The close uses the single writer and the new entry waits until the exchange confirms that close.'))
@@ -483,9 +444,9 @@ class ContextEvaluator:
                               'BTC/ETH relative returns and recent_trade_flow are optional context, never an automatic veto. The flow is a bounded exchange trade-side sample; null means unavailable.' if runner2 else '')
         if runner3:
             policy+='\n'+account['runner3_entry_gate']+'\n'
-            policy+=('Runner 3 requires the selected READY setup ID, its exact stop, and a target that is one of the supplied opposing target levels. '
+            policy+=('Runner 3 requires the selected READY setup. Propose the entry, the stop, and the target for that pair. '
                      'Use the selected 4h→15m or 1h→5m lane. Require the valid HTF zone, a closed LTF touch, '
-                     'and a later closed LTF CHoCH/MSS; use the supplied LTF stop and one supplied opposing HTF target level. '
+                     'and a later closed LTF CHoCH/MSS. Ground the stop and the target in supplied closed candles. '
                      'Optional 1m timing evidence never substitutes for the 5m confirmation or supplies price references. '
                      'A zone awaiting touch or confirmation can only be watched. Preserve its supplied trigger and '
                      'invalidation. BTC/ETH structure provides context; an altcoin can diverge if its own closed evidence supports it. '
@@ -502,31 +463,28 @@ class ContextEvaluator:
                         'A Güçlü setup may use more of the existing per-trade loss ceiling. '
                         'Leverage is the lowest value that fits that share and the CHoCH stop. '
                         'Do not ask for a margin below 1 USDT while equity is under 100. ') +
-                     'Do not narrow or move the CHoCH stop to make the position bigger. '
+                     'Do not narrow or move the stop only to make the position bigger. '
                      'For a long, the initial stop is just beyond the low of the CHoCH candle that confirmed the entry. '
                      'For a short, it is just beyond that CHoCH candle high. A 4h setup uses the 15m CHoCH. '
-                     'A 1h setup uses the 5m CHoCH. Do not use another candle wick on that timeframe. '
-                     'The target is one of the supplied opposing higher-timeframe levels. Do not invent a level. Later management may only tighten that stop, '
+                     'A 1h setup uses the 5m CHoCH. '
+                     'Propose the entry, the stop, and the target. The engine accepts those prices or rejects the proposal and names the failed check. '
+                     'It does not replace them with a supplied opposing level. Later management may only tighten the stop, '
                      'never widen it past this invalidation. Do not open a hedge. '
                      'Decide from the numeric setup: zone, touch, closed CHoCH/MSS, price-action and ICT labels, and the algorithm reason. '
                      'Swing stays 4h zone then 15m confirmation. Intraday stays 1h zone then 5m confirmation. Touch alone is not an entry. '
                      'Equity under 100 USDT still needs the valid HTF zone, a closed touch, '
-                     'and a later closed CHoCH/MSS. It is not a BEKLE reason when a supplied target clears cost-adjusted R 1.25. Touch alone never places an order. The risk engine still caps size and loss. '
-                     'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons. '
-                     'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
+                     'and a later closed CHoCH/MSS. Touch alone never places an order. The risk engine still caps size and loss. '
+                     'When the setup is real, balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons. '
                      'Queued confirmed plans share one balance. Simultaneous local limits are ranked by cost-adjusted R, not by preference. '
                      'Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
                      'release_symbol may name one different open position only when thesis_invalidated is true and that thesis is already invalidated, '
                      'and free margin cannot fund this confirmed plan. A higher payoff alone is not a close. '
                      'The close uses the single order writer and the new entry waits until the exchange confirms that close. '
                      'limit_price is optional. Omit it or null for a market-now entry. A number is stored locally and is not a resting exchange order. '
-                     'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target. '
-                     'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
-                     'If your action is trade and the target you name is one of the supplied opposing levels, the engine does not reject that choice for cost-adjusted R. '
-                     'A valid hold on that selected setup is entered at the farthest supplied level that clears 1.25. Silence still opens nothing. '
-                     'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons. '
-                     'Account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons. '
-                     'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.')
+                     'A real setup is zone, touch, and a closed CHoCH/MSS. Propose an entry, a stop, and a target that pass the three checks. '
+                     'If you choose hold, that hold stands. The engine does not turn it into a trade. Silence still opens nothing. '
+                     'When the setup is real, account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons. '
+                     'Do not invent a trade if you are silent.')
         decision_mode = None
         winning_identity = {}
         share_decision = None
@@ -561,11 +519,11 @@ class ContextEvaluator:
                                   'zone, touch, closed CHoCH/MSS, price-action and ICT labels, and the algorithm reason. '
                                   'You have that same packet plus the chart. Text and this review run together. '
                                   'You have two minutes to answer. A valid answer in that time is the decision. '
-                                  'You may rebuild the plan onto a supplied opposing target, take the market-now setup, or name limit_price. '
-                                  'Do not drop or refuse a real setup when a supplied opposing target clears cost-adjusted R 1.25. '
-                                  'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
-                                  'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not reasons to drop the setup. '
-                                  'Account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not reasons to drop it. '
+                                  'Propose an entry, a stop, and a target that pass the three checks, or name limit_price. '
+                                  'The engine accepts those prices or rejects them and names the failed check. It does not replace them with a supplied opposing level. '
+                                  'When the setup is real, balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not reasons to drop the setup. '
+                                  'When the setup is real, account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not reasons to drop it. '
+                                  'If you choose hold, that hold stands. '
                                   'An answer after the order is already sent does not unwind it. It may only update the saved local plan for the next trigger. '
                                   'limit_price is stored locally and is not a resting exchange order. '
                                   'Price reaching it only reopens analysis; confirmation is still required. '
@@ -573,7 +531,7 @@ class ContextEvaluator:
                                   'The text model chooses sizing_plan.margin_share for a Güçlü plan. Do not replace that share. '
                                   'A missing text share stays the 35% fallback. Do not invent a larger share. '
                                   'Chart annotations cannot replace candle references or mandatory price and risk checks. '
-                                  'Equity under 100 USDT still needs zone, touch, and closed CHoCH/MSS. It is not a reason to drop a real setup whose supplied target clears cost-adjusted R 1.25. Touch alone never places an order.')
+                                  'Equity under 100 USDT still needs zone, touch, and closed CHoCH/MSS. Touch alone never places an order.')
             review_account = account if prompt_account is None else prompt_account
             review_prompt = build_prompt(candidate, chart_context, memory, positions, review_account, mode, changes)
             payload = client.complete_json(system=review_policy, user=review_prompt,
@@ -736,19 +694,8 @@ class ContextEvaluator:
                 self.store.put(key,memory)
                 metadata['retry_at']=memory['last_failure']['retry_at']
             return EvaluationResult(action=GraphAction.HOLD,hold_reason='invalid_or_unavailable_model',metadata=metadata)
-        ready_setup_after_hold = False
-        if runner3 and decision.action == 'hold' and price_rules is not None:
-            promoted = _ready_hold_trade(
-                decision, candidate, options, chart_context, prior_watch,
-                entry=candidate.entry_price, fee=fee, slippage=slippage,
-                price_step=price_rules.price_step, now=time.time())
-            if promoted is not None:
-                decision = promoted
-                ready_setup_after_hold = True
         metadata['decision_mode']=decision_mode
-        trace['model_action']='hold' if ready_setup_after_hold else decision.action
-        if ready_setup_after_hold:
-            metadata['ready_setup_after_hold'] = True
+        trace['model_action']=decision.action
         source_candidate=candidate
         from trading.evaluation.setup_selection import validate_selection
         candidate,selection=validate_selection(decision,candidate,options,selection_enabled)
@@ -828,10 +775,8 @@ class ContextEvaluator:
             economic_basis['benchmarks']=chart_context['benchmarks']
         evaluation_key=digest(dict(policy=policy_version,market=fingerprint,scope=scope,economic_basis=economic_basis))
         reported_action='local_limit' if local_limit else decision.action
-        if ready_setup_after_hold:
-            trace['ready_setup_after_hold'] = True
         trace.update(status='completed',action=reported_action,
-            model_action='hold' if ready_setup_after_hold else reported_action,rationale=decision.rationale,
+            model_action=reported_action,rationale=decision.rationale,
             invalidation=decision.invalidation,watch_note=decision.watch_note,
             execution_status='not_opened' if local_limit or decision.action!='trade' else 'awaiting_risk')
         self._save_trace(trace)

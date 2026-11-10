@@ -470,8 +470,7 @@ class LiveRunner:
         private_risk=next(row for row in snapshot['risk_limits'][candidate.symbol] if row['side']==side)
         private_leverage=next(row for row in snapshot['leverage'][candidate.symbol] if row['side']==side)
         exchange_cap=min(rules.max_leverage,private_risk['max_leverage'],private_leverage['max_leverage'])
-        ready_hold = bool(result.metadata.get('ready_setup_after_hold'))
-        if self.cfg.live_leverage_mode=='exchange' and result.metadata.get('sizing_plan') is None and not ready_hold:
+        if self.cfg.live_leverage_mode=='exchange' and result.metadata.get('sizing_plan') is None:
             raise ValueError('model must explicitly choose live leverage and risk')
         ticker=self.quote(candidate.symbol)
         runner_id=control.get('runner_id','baseline-v1')
@@ -497,7 +496,7 @@ class LiveRunner:
         account_equity = snapshot['balance']['equity']
         model_sizing = runner3_policy.aggressive_model_sizing(
             self.cfg, self.risk.preset.profile, runner_id, account_equity)
-        if model_sizing and result.metadata.get('sizing_plan') is None and not ready_hold:
+        if model_sizing and result.metadata.get('sizing_plan') is None:
             raise PlanSizingError('aggressive_runner3_requires_explicit_sizing')
         risk_fraction = self._risk_fraction(control, account_equity)
         continuous = runner3_policy.continuous_aggressive(self.cfg, self.risk.preset.profile, runner_id)
@@ -556,10 +555,7 @@ class LiveRunner:
         if runner_id!='runner3':
             limits['available_margin']=snapshot['balance']['available']/margin_rate*.95
         if runner_id=='runner3':
-            supplied = runner3_policy.order_names_supplied_target(
-                setup, result.metadata.get('price_plan'),
-                stop=proposal.stop_loss.price, target=proposal.take_profit_price)
-            runner3_policy.validate_economics(gross_target,expected_net,unit_loss,supplied_target=supplied)
+            runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
             balance = snapshot['balance']
             available = balance['available']
             if model_sizing and balance.get('available_open') is not None:
@@ -599,6 +595,14 @@ class LiveRunner:
             if sized<proposal.notional-1e-8:
                 _,proposal.notional=rules.size_order(sized,entry,leverage)
             proposal.leverage=leverage
+            sized_quantity = proposal.notional / entry
+            failed = runner3_policy.judge_model_proposal(
+                side=candidate.side.value, entry=entry, stop=proposal.stop_loss.price,
+                target=proposal.take_profit_price, quantity=sized_quantity,
+                equity=snapshot['balance']['equity'], free_margin=free_margin,
+                margin_required=margin + proposal.notional * fee, fee=fee, slippage=slip)
+            if failed:
+                raise runner3_policy.EntryProposalRejected(failed)
             if sized<requested_notional-1e-6:
                 limiting_factor=('runner3_margin_policy' if allocation['target_margin_usdt']<=free_margin+1e-8
                                  else 'available_margin')

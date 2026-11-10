@@ -714,7 +714,9 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
         gate = packet['account']['runner3_entry_gate']
         assert 'Runner 3 minimum cost-adjusted R is 1.25.' in gate
         assert 'cost_adjusted_R = net / loss.' in gate
-        assert 'The continuous equity stop cap is 15% of equity.' in gate
+        assert 'at most 15% of equity' in gate
+        assert 'Propose an entry, a stop, and a target that pass all three.' in gate
+        assert 'free_margin' in gate
         return hold_answer('Hedef maliyet sonrası 1.25 R altında, bekliyorum.')
 
     def vision(model, packet):
@@ -733,42 +735,42 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
         'loss = abs(entry - stop_fill) + fee * (entry + stop_fill).',
         'net = direction * (target_fill - entry) - fee * (entry + target_fill).',
         'cost_adjusted_R = net / loss.',
-        'The engine rejects the proposal when loss <= 0, and when gross <= 0 or (gross - net) / gross > 0.30.',
-        'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
-        'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears 1.25, you must ENTER (action trade) at that supplied target.',
-        'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.',
-        'If your action is trade and the target you name is one of the supplied opposing levels, the engine does not reject that choice for cost-adjusted R.',
-        'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons.',
-        'These are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
-        'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
-        'The 15% equity stop cap still applies. Do not move the stop.',
-        'A silent or invalid answer opens nothing. When the selected setup is real and you hold, the engine enters the farthest supplied opposing target that clears 1.25 and keeps the stop. A hold with no such level stays a hold.',
-        'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
-        'Do not invent a trade when you are silent.',
-        'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target.',
-        'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.',
-        'A valid hold on that selected setup is entered at the farthest supplied level that clears 1.25. Silence still opens nothing.',
-        'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.',
+        'Before you answer, apply these three checks. Propose an entry, a stop, and a target that pass all three.',
+        'It does not replace them with a supplied opposing level.',
+        'The first check is cost_adjusted_r. The engine rejects the proposal when cost-adjusted R is below 1.25.',
+        'The second check is stop_loss_equity. The stop loss of the sized order must be at most 15% of equity.',
+        'The third check is free_margin. Balance and free margin must still be enough for the sized order.',
+        'If any check fails, the engine rejects the proposal and names the check that failed.',
+        'When the setup is real (zone, touch, and a closed CHoCH/MSS), these are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
+        'If you choose hold, that hold stands. The engine does not turn a hold into a trade.',
+        'A silent or invalid answer opens nothing. Do not invent a trade when you are silent.',
+        'Propose the entry, the stop, and the target. The engine accepts those prices or rejects the proposal and names the failed check.',
+        'A real setup is zone, touch, and a closed CHoCH/MSS. Propose an entry, a stop, and a target that pass the three checks.',
+        'If you choose hold, that hold stands. The engine does not turn it into a trade. Silence still opens nothing.',
+        'When the setup is real, account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons.',
     ):
         assert line in system
     assert 'first choose a farther target' not in system
     assert 'Equity under 100 USDT is not a reason to enter.' not in system
     assert 'You may drop the trade' not in system
+    assert 'you must ENTER (action trade)' not in system
+    assert 'must be ENTER at that target' not in system
+    assert 'A valid hold on that selected setup is entered' not in system
+    assert 'the engine enters the farthest' not in system
+    assert 'does not reject that choice for cost-adjusted R' not in system
     assert 'BEKLE only when confirmation is missing or none of the supplied levels clears 1.25.' not in system
     assert 'cost_adjusted_R < 1.25' not in system
-    assert system.index('you must ENTER (action trade)') < system.index('would otherwise block')
-    assert system.index('would otherwise block') < system.index('That choice stands')
-    assert system.index('Runner 3 minimum cost-adjusted R is 1.25.') < system.index('Runner 3 requires the selected READY')
-    assert system.index('Runner 3 requires the selected READY') < system.index('must be ENTER at that target')
-    assert system.index('must be ENTER at that target') < system.index('A valid hold on that selected setup is entered')
+    assert system.index('Propose an entry, a stop, and a target that pass all three.') < system.index('Runner 3 requires the selected READY')
+    assert system.index('Runner 3 requires the selected READY') < system.index('A real setup is zone, touch, and a closed CHoCH/MSS.')
     assert 'must be BEKLE (action hold) or a farther target' not in system
     for call in model.calls:
-        assert 'you must ENTER (action trade)' in call['system']
+        assert 'Propose an entry, a stop, and a target that pass all three.' in call['system']
+        assert 'you must ENTER (action trade)' not in call['system']
         assert 'You may drop the trade' not in call['system']
         if call.get('images'):
-            assert 'Do not drop or refuse a real setup when a supplied opposing target clears cost-adjusted R 1.25.' in call['system']
-            assert 'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.' in call['system']
-            assert 'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size.' in call['system']
+            assert 'If you choose hold, that hold stands.' in call['system']
+            assert 'It does not replace them with a supplied opposing level.' in call['system']
+            assert 'When the setup is real, balance, free margin, and leverage (the multiplier) stay in the packet so you can size.' in call['system']
             assert 'are not reasons to drop it.' in call['system']
     packet = json.loads(model.calls[0]['user'])
     account = packet['account']
@@ -787,9 +789,10 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
     assert account['capital_allocation']['equity_usdt'] == 11.58
     note = account['capital_allocation']['note']
     assert 'Equity under 100 USDT is not a reason to enter' not in note
-    assert 'It is not a BEKLE reason when a supplied target clears cost-adjusted R 1.25.' in note
-    assert 'Balance, free margin, and leverage (the multiplier) stay in this packet so you can size. They are not BEKLE reasons.' in note
-    assert 'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.' in note
+    assert 'Propose an entry, a stop, and a target that pass cost-adjusted R 1.25, a stop loss of at most 15% of equity, and free margin for the sized order.' in note
+    assert 'When the setup is real, balance, free margin, and leverage (the multiplier) are not BEKLE reasons.' in note
+    assert 'If you choose hold, that hold stands.' in note
+    assert 'does not replace your prices with a supplied opposing level' in note
     assert result.action.value == 'hold'
     assert result.proposal is None
 
@@ -817,9 +820,7 @@ def _select_ready(seed, market):
     _select_ready.setup = ready
 
 
-def test_valid_hold_on_the_selected_ready_setup_enters_the_farthest_clearing_target(tmp_path, monkeypatch):
-    from trading.runtime.runner3_policy import MIN_NET_TARGET_R, clearing_supplied_targets, cost_adjusted_r
-
+def test_a_hold_on_the_selected_ready_setup_is_not_converted_to_a_trade(tmp_path, monkeypatch):
     market = _ready_market()
 
     def text(packet):
@@ -833,24 +834,20 @@ def test_valid_hold_on_the_selected_ready_setup_enters_the_farthest_clearing_tar
     run, store = evaluator(tmp_path, monkeypatch, model, market=market, prepare=_select_ready)
     result = run()
     ready = _select_ready.setup
-    levels = clearing_supplied_targets(
-        ready, entry=100., fee=0.0006, slippage=0.0005, price_step=.01)
-    assert levels[0]['price'] == 120.
-    assert cost_adjusted_r(
-        side='long', entry=100., stop=ready['stop_loss_price'], target=101.,
-        fee=0.0006, slippage=0.0005) < MIN_NET_TARGET_R
-    assert result.action.value == 'trade'
-    assert result.proposal is not None
-    assert abs(result.proposal.stop_loss.price - ready['stop_loss_price']) < 1e-9
-    assert abs(result.proposal.take_profit_price - levels[0]['take_profit_price']) < 1e-9
-    assert abs(result.proposal.take_profit_price - 120.) < 1e-9
-    assert result.metadata['ready_setup_after_hold'] is True
+    assert ready['evidence']['zone']
+    assert ready['evidence']['touch_at']
+    assert ready['evidence']['shift']['kind'] in ('choch', 'mss')
+    assert result.action.value == 'hold'
+    assert result.proposal is None
+    assert result.hold_reason == 'hold'
+    assert result.metadata.get('ready_setup_after_hold') is not True
     assert result.metadata['rationale'].startswith('Üst zaman dilimi')
     trace = store.get('analysis_trace')
-    assert trace['action'] == 'trade'
+    assert trace['action'] == 'hold'
     assert trace['model_action'] == 'hold'
-    assert trace['ready_setup_after_hold'] is True
-    assert trace['execution_status'] == 'awaiting_risk'
+    assert trace.get('ready_setup_after_hold') is not True
+    assert trace['execution_status'] == 'not_opened'
+    assert trace.get('price_plan') is None
 
     def trading(packet):
         return ready_answer(packet, rationale='Model verilen yakın hedefi seçti.')
@@ -863,6 +860,7 @@ def test_valid_hold_on_the_selected_ready_setup_enters_the_farthest_clearing_tar
     assert traded.action.value == 'trade'
     assert traded.metadata.get('ready_setup_after_hold') is not True
     assert abs(traded.proposal.take_profit_price - named) < 1e-9
+    assert abs(traded.proposal.stop_loss.price - _select_ready.setup['stop_loss_price']) < 1e-9
     assert abs(named - 120.) > 1
 
     def silent(packet):
@@ -876,13 +874,3 @@ def test_valid_hold_on_the_selected_ready_setup_enters_the_farthest_clearing_tar
     assert missed.proposal is None
     assert missed.hold_reason == 'invalid_or_unavailable_model'
     assert silent_store.get('analysis_trace').get('ready_setup_after_hold') is not True
-
-    monkeypatch.setattr(
-        'trading.runtime.runner3_policy.clearing_supplied_targets', lambda *args, **kwargs: [])
-    held_model = DecisionModel(text, vision)
-    held_run, _held_store = evaluator(
-        tmp_path / 'below', monkeypatch, held_model, market=deepcopy(market), prepare=_select_ready)
-    held = held_run()
-    assert held.action.value == 'hold'
-    assert held.proposal is None
-    assert held.hold_reason == 'hold'

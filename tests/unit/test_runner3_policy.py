@@ -363,37 +363,34 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
         'loss = abs(entry - stop_fill) + fee * (entry + stop_fill).',
         'net = direction * (target_fill - entry) - fee * (entry + target_fill).',
         'cost_adjusted_R = net / loss.',
-        'gross = abs(target - entry).',
-        'The engine rejects the proposal when loss <= 0, and when gross <= 0 or (gross - net) / gross > 0.30.',
-        'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
-        'When continuous aggressive is off, aggressive model sizing uses the 10% equity stop cap.',
-        'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears 1.25, you must ENTER (action trade) at that supplied target.',
-        'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.',
-        'If your action is trade and the target you name is one of the supplied opposing levels, the engine does not reject that choice for cost-adjusted R.',
-        'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons.',
-        'These are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
+        'Before you answer, apply these three checks. Propose an entry, a stop, and a target that pass all three.',
+        'The engine accepts those prices or rejects the proposal. It does not replace them with a supplied opposing level.',
+        'The first check is cost_adjusted_r. The engine rejects the proposal when cost-adjusted R is below 1.25.',
+        'The second check is stop_loss_equity. The stop loss of the sized order must be at most 15% of equity. The engine rejects the proposal when the stop would lose more than that.',
+        'The third check is free_margin. Balance and free margin must still be enough for the sized order. The engine rejects the proposal when they are not.',
+        'If any check fails, the engine rejects the proposal and names the check that failed. It does not change your entry, stop, or target.',
+        'When the setup is real (zone, touch, and a closed CHoCH/MSS), these are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
-        'The 15% equity stop cap still applies. Do not move the stop.',
-        'A silent or invalid answer opens nothing. When the selected setup is real and you hold, the engine enters the farthest supplied opposing target that clears 1.25 and keeps the stop. A hold with no such level stays a hold.',
-        'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
-        'Do not invent a trade when you are silent.',
+        'If you choose hold, that hold stands. The engine does not turn a hold into a trade.',
+        'A silent or invalid answer opens nothing. Do not invent a trade when you are silent.',
     ):
         assert line in text
     assert 'must be BEKLE (action hold) or a farther target' not in text
     assert 'first choose a farther target' not in text
+    assert 'you must ENTER (action trade)' not in text
+    assert 'would otherwise block' not in text
+    assert 'does not reject that choice for cost-adjusted R' not in text
+    assert 'the engine enters the farthest' not in text
     assert 'BEKLE (action hold) only when none of the supplied levels clears 1.25.' not in text
     assert 'BEKLE (action hold) only when confirmation is missing' not in text
     assert 'cost_adjusted_R < 1.25' not in text
-    assert 'do not replace the cost-adjusted R check' not in text
-    assert 'If you BEKLE because no supplied level clears 1.25' not in text
-    assert text.index('you must ENTER (action trade)') < text.index('would otherwise block')
-    assert text.index('would otherwise block') < text.index('That choice stands')
-    assert text.index('That choice stands') < text.index('does not reject that choice for cost-adjusted R')
-    assert text.index('Balance, free margin, and leverage (the multiplier) stay in the packet') < text.index('Do not move the stop to manufacture R')
-    assert text.index('These are not BEKLE reasons') < text.index('Do not move the stop to manufacture R')
+    assert text.index('Propose an entry, a stop, and a target') < text.index('cost_adjusted_r')
+    assert text.index('cost_adjusted_r') < text.index('stop_loss_equity')
+    assert text.index('stop_loss_equity') < text.index('free_margin')
+    assert text.index('these are not BEKLE reasons') < text.index('that hold stands')
     compact_system = system_with_entry_gate(COMPACT_SYSTEM, 'full policy\n' + text + '\nmore')
     assert 'cost_adjusted_R = net / loss.' in compact_system
-    assert 'The continuous equity stop cap is 15% of equity.' in compact_system
+    assert 'at most 15% of equity' in compact_system
     assert system_with_entry_gate(COMPACT_SYSTEM, 'no gate here') == COMPACT_SYSTEM
     raw = json.dumps(dict(context_policy='pa-context-v4', account=dict(runner3_entry_gate=text, equity=10),
                           market=dict(symbol='LAB_USDT')), separators=(',', ':'))
@@ -435,7 +432,7 @@ def test_a_farther_supplied_target_is_allowed_and_the_floor_stays():
         validate_economics(1.5, 1.249, 1.)
 
 
-def test_a_model_chosen_supplied_target_is_not_rejected_for_r():
+def test_a_model_chosen_supplied_target_below_the_floor_is_rejected():
     from time import time
 
     from trading.evaluation.price_plan import CandleReference, MarketPricePlan
@@ -468,13 +465,16 @@ def test_a_model_chosen_supplied_target_is_not_rejected_for_r():
     assert loss > 0 and net / loss < MIN_NET_TARGET_R
     assert (gross - net) / gross <= 0.30
     assert order_names_supplied_target(setup, far_plan, stop=90, target=105) is True
-    validate_economics(gross, net, loss, supplied_target=True)
+    with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
+        validate_economics(gross, net, loss, supplied_target=True)
     with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
         validate_economics(gross, net, loss)
     with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
         validate_economics(1.0, 0.9, 0, supplied_target=True)
     with pytest.raises(ValueError, match='runner3_cost_share_too_high'):
-        validate_economics(1.0, 0.5, 1.0, supplied_target=True)
+        validate_economics(1.0, 0.69, 0.5, supplied_target=True)
+    assert far_plan.take_profit_price == 105
+    assert far_plan.stop_loss_price == 90
 
     near_plan = far_plan.model_copy(update={
         'take_profit_price': 110,
@@ -548,3 +548,35 @@ def test_a_hold_keeps_only_the_farthest_supplied_level_that_clears_the_floor():
     assert selected_closed_setup(SimpleNamespace(features={}), [setup]) is None
     assert selected_closed_setup(SimpleNamespace(features={'setup_id': 'other'}), [setup]) is None
     assert selected_closed_setup(chosen, [dict(setup, state='watch')]) is None
+
+
+def test_model_proposal_is_accepted_when_the_three_gates_pass_and_rejected_when_one_fails():
+    from trading.runtime.runner3_policy import EntryProposalRejected, judge_model_proposal
+
+    fee, slip = 0.0006, 0.0005
+    prices = dict(side='long', entry=100., stop=90., target=160.)
+    accepted = judge_model_proposal(
+        **prices, quantity=1., equity=100., free_margin=20., margin_required=5.,
+        fee=fee, slippage=slip)
+    assert accepted == ()
+    assert prices == dict(side='long', entry=100., stop=90., target=160.)
+
+    low_r = judge_model_proposal(
+        side='long', entry=100., stop=90., target=110., quantity=1., equity=1000.,
+        free_margin=50., margin_required=5., fee=fee, slippage=slip)
+    assert low_r == ('cost_adjusted_r',)
+    wide_stop = judge_model_proposal(
+        side='long', entry=100., stop=50., target=200., quantity=1., equity=100.,
+        free_margin=80., margin_required=10., fee=fee, slippage=slip)
+    assert wide_stop == ('stop_loss_equity',)
+    poor_margin = judge_model_proposal(
+        **prices, quantity=.1, equity=1000., free_margin=1., margin_required=5.,
+        fee=fee, slippage=slip)
+    assert poor_margin == ('free_margin',)
+    rejected = EntryProposalRejected(low_r)
+    assert rejected.checks == ('cost_adjusted_r',)
+    assert str(rejected) == 'runner3_proposal_rejected'
+    short_wide = judge_model_proposal(
+        side='short', entry=100., stop=150., target=20., quantity=1., equity=100.,
+        free_margin=80., margin_required=10., fee=fee, slippage=slip)
+    assert short_wide == ('stop_loss_equity',)

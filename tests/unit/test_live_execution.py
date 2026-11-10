@@ -679,7 +679,10 @@ def test_runner3_aggressive_rechecks_costed_loss_against_fresh_equity(tmp_path, 
     private.assets[0].update(equity=equity, availableBalance=equity)
     with pytest.raises(LiveExecutionError) as exc:
         executor._preflight(row)
-    assert 'MAX_LOSS_EXCEEDS_CAP' in exc.value.reason_codes
+    if continuous:
+        assert str(exc.value) == 'runner3_stop_loss_above_15pct_equity'
+    else:
+        assert 'MAX_LOSS_EXCEEDS_CAP' in exc.value.reason_codes
     assert not private.submits
 
 
