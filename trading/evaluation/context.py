@@ -145,9 +145,9 @@ def compact_decision_packet(user):
     Callers must not delete zone, touch, CHoCH/MSS, the supplied opposing
     target levels, entry, stop, why, BTC/ETH, equity, free margin, leverage,
     open positions, or the confirming candles to force a fit. The entry-gate
-    text keeps the fee, exit slippage, the 1.25 condition, the equity stop
-    cap, and the rule that a trade on a supplied opposing target is not
-    rejected for cost-adjusted R.
+    text keeps the fee, exit slippage, the 1.25 condition, the 15% equity
+    stop cap, and the free-margin check. The engine does not replace the
+    model's prices with a supplied opposing level.
     The full packet used for Gemini is never rewritten here.
     """
     if not isinstance(user, str) or not user.startswith('{'):

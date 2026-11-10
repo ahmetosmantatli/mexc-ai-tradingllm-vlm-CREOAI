@@ -15,6 +15,8 @@ CODES={
     'runner3_trigger_timeframe_mismatch':'RUNNER3_HTF_TRIGGER_TIMEFRAME',
     'runner3_target_reference_mismatch':'RUNNER3_HTF_TARGET_REFERENCE',
     'runner3_net_target_r_too_low':'RUNNER3_NET_TARGET_R',
+    'runner3_proposal_rejected':'RUNNER3_PROPOSAL_REJECTED',
+    'runner3_stop_loss_above_15pct_equity':'RUNNER3_STOP_LOSS_EQUITY',
     'runner3_cost_share_too_high':'RUNNER3_COST_SHARE',
     'runner3_margin_reserve':'RUNNER3_MARGIN_RESERVE',
     'runner3_margin_below_minimum':'RUNNER3_MARGIN_BELOW_MINIMUM',
@@ -68,6 +70,10 @@ def safe_execution_error(exc):
     if isinstance(exc, ContractQuantityError):
         result['contracts'] = {field: value for field in ('quantity','minimum','maximum','step')
             if isfinite(value := getattr(exc, field))}
+    checks = getattr(exc, 'checks', None)
+    if isinstance(checks, tuple) and checks and all(
+            item in ('cost_adjusted_r', 'stop_loss_equity', 'free_margin') for item in checks):
+        result['failed_checks'] = list(checks)
     drift = getattr(exc, 'price_drift', None)
     if (isinstance(drift, dict) and drift.get('stage') in ('planning', 'preflight')
             and all(type(drift.get(field)) in (int, float) and isfinite(drift[field])

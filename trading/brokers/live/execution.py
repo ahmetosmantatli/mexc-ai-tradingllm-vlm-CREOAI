@@ -243,10 +243,17 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             planned_loss=abs(worst_entry-worst_stop)*quantity+self.fee*quantity*(worst_entry+worst_stop)
         if planned_loss>proposal.max_loss_if_stopped+1e-8:raise LiveExecutionError('fees_slippage_exceed_approved_risk')
         if proposal.metadata.get('runner_id')=='runner3':
-            supplied = runner3_policy.order_names_supplied_target(
-                proposal.metadata.get('runner3_target_setup'), proposal.metadata.get('price_plan'),
-                stop=sl, target=tp)
-            runner3_policy.validate_economics(gross,net,unit_loss,supplied_target=supplied)
+            reserve = 0. if model_sizing else readiness.allowed_capital * runner3_policy.MARGIN_RESERVE_FRACTION
+            failed = runner3_policy.judge_model_proposal(
+                side=proposal.side.value, entry=entry, stop=sl, target=tp, quantity=quantity,
+                equity=equity, free_margin=available - reserve,
+                margin_required=readiness.planned_margin + notional * self.fee,
+                fee=self.fee, slippage=self.slip)
+            if 'cost_adjusted_r' in failed:
+                raise LiveExecutionError('runner3_net_target_r_too_low')
+            if 'stop_loss_equity' in failed:
+                raise LiveExecutionError('runner3_stop_loss_above_15pct_equity')
+            runner3_policy.validate_economics(gross, net, unit_loss)
         if notional/proposal.leverage+notional*self.fee>available:raise LiveExecutionError('insufficient_available_margin')
         side=1 if proposal.side.value=='long' else 2
         private_maintenance=max(row['maintenance_rate'] for group in ('risk_limits','leverage')

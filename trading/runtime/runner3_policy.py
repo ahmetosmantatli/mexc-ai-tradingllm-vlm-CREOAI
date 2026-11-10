@@ -329,16 +329,55 @@ def ioc_target_economics(*, side, entry, stop, target, fee, slippage):
 def validate_economics(gross, net, loss, *, supplied_target=False):
     """Reject a broken payoff.
 
-    ``supplied_target`` is true only for a trade whose target is one of the
-    supplied opposing levels on a setup that still has its zone, touch, and
-    closed CHoCH/MSS, and whose stop was not moved. That choice is not
-    rejected for cost-adjusted R. Loss, gross, and the cost share still
-    reject. The equity stop cap is a separate check.
+    A supplied opposing level does not waive the cost-adjusted R floor and
+    is not substituted for the model's target. ``supplied_target`` is ignored.
     """
-    if loss <= 0 or (not supplied_target and net / loss < MIN_NET_TARGET_R):
+    del supplied_target
+    if loss <= 0 or net / loss < MIN_NET_TARGET_R:
         raise ValueError('runner3_net_target_r_too_low')
     if gross <= 0 or (gross - net) / gross > MAX_COST_SHARE:
         raise ValueError('runner3_cost_share_too_high')
+
+
+class EntryProposalRejected(ValueError):
+    """The model's entry, stop, and target failed a gate. Prices stay as proposed."""
+
+    def __init__(self, checks):
+        self.checks = tuple(checks)
+        super().__init__('runner3_proposal_rejected')
+
+
+def judge_model_proposal(*, side, entry, stop, target, quantity, equity, free_margin,
+                         margin_required, fee, slippage):
+    """Accept the model's entry, stop, and target, or name each failed check.
+
+    The returned tuple is empty when every check passes. This function does
+    not rewrite entry, stop, or target, and it does not substitute a supplied
+    opposing level.
+    """
+    failed = []
+    fee = _cost_number(fee)
+    slippage = _cost_number(slippage)
+    prices_ok = (side in ('long', 'short') and fee is not None and slippage is not None
+                 and all(_positive_number(value) for value in (entry, stop, target)))
+    loss = None
+    if not prices_ok:
+        failed.append('cost_adjusted_r')
+    else:
+        _gross, net, loss = ioc_target_economics(
+            side=side, entry=entry, stop=stop, target=target, fee=fee, slippage=slippage)
+        if loss <= 0 or not isfinite(net) or not isfinite(loss) or net / loss < MIN_NET_TARGET_R:
+            failed.append('cost_adjusted_r')
+    if (loss is None or loss <= 0 or not _positive_number(quantity) or not _positive_number(equity)
+            or loss * quantity > equity * CONTINUOUS_STOP_RISK_CAP + 1e-9):
+        failed.append('stop_loss_equity')
+    margin_ok = (isinstance(free_margin, (int, float)) and not isinstance(free_margin, bool)
+                 and isfinite(free_margin) and isinstance(margin_required, (int, float))
+                 and not isinstance(margin_required, bool) and isfinite(margin_required)
+                 and margin_required >= 0 and margin_required <= free_margin + 1e-8)
+    if not margin_ok:
+        failed.append('free_margin')
+    return tuple(failed)
 
 def small_account_risk_target(equity, ceiling, grade):
     """Güçlü may use the whole per-trade loss ceiling. Standart stays at 80% of it."""
@@ -559,16 +598,11 @@ def clearing_supplied_targets(setup, *, entry, fee, slippage, price_step=0):
 
 
 def entry_gate_instruction(*, fee, slippage):
-    """Prompt for the cost gate.
+    """Prompt for the three entry checks.
 
-    The model knows the 1.25 condition, the balance, and the leverage
-    multiplier. It may choose a farther supplied opposing target when 1.25
-    would otherwise block, and that choice stands. A trade on a supplied
-    opposing level is not rejected for cost-adjusted R. Zone, touch, and a
-    closed CHoCH/MSS stay required. A silent or invalid answer opens nothing.
-    A valid hold on the selected real setup is entered at the farthest
-    supplied opposing target that clears 1.25, and the stop stays. A hold
-    with no such level stays a hold. The equity stop cap still applies.
+    The model proposes entry, stop, and target before it answers. The engine
+    accepts those prices or rejects the proposal and names the failed check.
+    It does not replace them with a supplied opposing level. A hold stays a hold.
     """
     fee = _cost_number(fee)
     slippage = _cost_number(slippage)
@@ -576,7 +610,8 @@ def entry_gate_instruction(*, fee, slippage):
         raise ValueError('runner3_entry_cost_assumptions')
     lines = (
         ENTRY_GATE_BEGIN,
-        'Before you propose an entry, apply this deterministic gate. The engine still runs it after you answer and still rejects a failure.',
+        'Before you answer, apply these three checks. Propose an entry, a stop, and a target that pass all three.',
+        'The engine accepts those prices or rejects the proposal. It does not replace them with a supplied opposing level.',
         f'Runner 3 minimum cost-adjusted R is {MIN_NET_TARGET_R:.2f}.',
         f'Fee assumption is {fee:.4f} per side. Exit-slippage assumption is {slippage:.4f} ({slippage * 10000:.0f} bps), applied to the stop and the target.',
         'direction is 1 for long and -1 for short.',
@@ -585,20 +620,14 @@ def entry_gate_instruction(*, fee, slippage):
         'loss = abs(entry - stop_fill) + fee * (entry + stop_fill).',
         'net = direction * (target_fill - entry) - fee * (entry + target_fill).',
         'cost_adjusted_R = net / loss.',
-        'gross = abs(target - entry).',
-        f'The engine rejects the proposal when loss <= 0, and when gross <= 0 or (gross - net) / gross > {MAX_COST_SHARE:.2f}.',
-        f'The continuous equity stop cap is {CONTINUOUS_STOP_RISK_CAP:.0%} of equity. One stop cannot lose more than that fraction of equity.',
-        f'When continuous aggressive is off, aggressive model sizing uses the {AGGRESSIVE_STOP_RISK_CAP:.0%} equity stop cap.',
-        f'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears {MIN_NET_TARGET_R:.2f}, you must ENTER (action trade) at that supplied target.',
-        f'When {MIN_NET_TARGET_R:.2f} would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.',
-        'If your action is trade and the target you name is one of the supplied opposing levels, the engine does not reject that choice for cost-adjusted R.',
-        'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons.',
-        'These are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
+        f'The first check is cost_adjusted_r. The engine rejects the proposal when cost-adjusted R is below {MIN_NET_TARGET_R:.2f}.',
+        f'The second check is stop_loss_equity. The stop loss of the sized order must be at most {CONTINUOUS_STOP_RISK_CAP:.0%} of equity. The engine rejects the proposal when the stop would lose more than that.',
+        'The third check is free_margin. Balance and free margin must still be enough for the sized order. The engine rejects the proposal when they are not.',
+        'If any check fails, the engine rejects the proposal and names the check that failed. It does not change your entry, stop, or target.',
+        'When the setup is real (zone, touch, and a closed CHoCH/MSS), these are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
-        f'The {CONTINUOUS_STOP_RISK_CAP:.0%} equity stop cap still applies. Do not move the stop.',
-        'A silent or invalid answer opens nothing. When the selected setup is real and you hold, the engine enters the farthest supplied opposing target that clears 1.25 and keeps the stop. A hold with no such level stays a hold.',
-        'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
-        'Do not invent a trade when you are silent.',
+        'If you choose hold, that hold stands. The engine does not turn a hold into a trade.',
+        'A silent or invalid answer opens nothing. Do not invent a trade when you are silent.',
         ENTRY_GATE_END,
     )
     return '\n'.join(lines)
