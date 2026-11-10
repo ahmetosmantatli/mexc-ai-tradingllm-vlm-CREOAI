@@ -2,21 +2,6 @@
 import time
 
 
-def zone_alert_text(event):
-    """Touch warns. A closed CHoCH/MSS is the turn. Neither text is an order."""
-    evidence = event.get('evidence') or {}
-    stage = evidence.get('stage')
-    symbol = event.get('symbol', '?')
-    lane = f"{event.get('context_timeframe', '?')} → {event.get('trigger_timeframe', '?')}"
-    if stage == 'awaiting_confirmation':
-        return (f"CANLI | {symbol} | Bölge veya blok teması ({lane}). "
-                "Algoritma uyardı; temas tek başına emir değil. Kapanmış CHoCH/MSS ile işlem sırası gelir.")
-    if stage == 'confirmed':
-        return (f"CANLI | {symbol} | Kapanmış CHoCH/MSS ({lane}). "
-                "İşlem sırası geldi; teyit olmadan emir yok.")
-    return None
-
-
 def live_risk_block_lines(blocks):
     labels = {'daily_loss_pct':'Günlük kayıp','weekly_loss_pct':'Haftalık kayıp','drawdown_pct':'Zirveden düşüş'}
     return [f"{label} {blocks[key]['observed']:.2%} | sınır {blocks[key]['limit']:.2%}."

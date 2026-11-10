@@ -405,6 +405,12 @@ def test_live_review_notices_deliver_start_and_hold_separately(tmp_path):
         runner.binding_id = 'binding'
         key = 'live:review_notices'
         notice = dict(id='review', symbol='GRAM_USDT', binding_id='binding', triggered=True)
+        zone_events = [
+            dict(symbol='ASTER_USDT', at=1, side='long', context_timeframe='1h', trigger_timeframe='5m',
+                 evidence=dict(stage=stage))
+            for stage in ('awaiting_confirmation', 'confirmed')
+        ]
+        runner.store.put('htf_zone_events', zone_events)
         runner.store.put(key, [
             dict(notice, phase='start'),
             dict(notice, phase='result', status='completed', action='hold',
@@ -413,7 +419,8 @@ def test_live_review_notices_deliver_start_and_hold_separately(tmp_path):
         ])
         f.publish(f.accounts[0])
         assert len(f.controller.messages) == 3
-        assert 'GRAM_USDT | Takip tetiklendi' in f.controller.messages[0][0][1]
+        assert runner.store.get('htf_zone_events') == zone_events
+        assert 'GRAM_USDT | Takip tetiklendi; AI incelemesi hazırlanıyor.' in f.controller.messages[0][0][1]
         assert 'AI beklemeyi seçti' in f.controller.messages[1][0][1]
         assert 'AI üretim isteği: 2' in f.controller.messages[1][0][1]
         assert 'Kaynak yapı taraması. Tetik zaman dilimi 15m.' in f.controller.messages[2][0][1]

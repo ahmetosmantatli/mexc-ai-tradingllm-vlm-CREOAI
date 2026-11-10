@@ -580,18 +580,6 @@ def test_unconfirmed_close_does_not_open_the_replacement(tmp_path, monkeypatch):
     assert [row[0] for row in executor.calls] == ['authorize', 'execute']
 
 
-def test_zone_alert_names_touch_and_confirmation_without_calling_either_an_order():
-    from trading.control.activity import zone_alert_text
-
-    touch = zone_alert_text(dict(symbol='BTC_USDT', context_timeframe='4h', trigger_timeframe='15m',
-                                 evidence=dict(stage='awaiting_confirmation')))
-    confirmed = zone_alert_text(dict(symbol='ETH_USDT', context_timeframe='1h', trigger_timeframe='5m',
-                                     evidence=dict(stage='confirmed')))
-    assert 'temas tek başına emir değil' in touch
-    assert 'emir yok' in confirmed
-    assert zone_alert_text(dict(evidence=dict(stage='awaiting_touch'))) is None
-
-
 def test_confirmed_plans_rank_by_evidence_and_payoff():
     from trading.runtime.runner3_policy import rank_confirmed_plans
 

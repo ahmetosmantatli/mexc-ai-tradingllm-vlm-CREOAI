@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from trading.agents.telemetry import human_reason
 from trading.control.accounts import load_accounts
-from trading.control.activity import live_risk_block_lines, zone_alert_text
+from trading.control.activity import live_risk_block_lines
 from trading.control.vault import Vault
 from trading.control.connections import ConnectionFlow
 from trading.exchange.errors import ConnectionIssue
@@ -405,7 +405,6 @@ class LiveFleet:
         if runner is not None:
             self._publish_review_notices(ident, runner)
             self._publish_entry_rejections(ident, runner)
-            self._publish_zone_alerts(ident, runner)
         executor=getattr(runner,'executor',None)
         if executor is not None and callable(getattr(executor,'intents',None)):
             halt=snapshot.get('live_halt') or {}
@@ -466,25 +465,6 @@ class LiveFleet:
                                     event_id=f'live-gate:{ident}:{sequence}')
         self.control_store.put(key, dict(gate=gate, sequence=sequence, risk_keys=risk_keys))
 
-    def _publish_zone_alerts(self, ident, runner):
-        events = runner.store.get('htf_zone_events', [])
-        if not events:
-            return
-        seen = runner.store.get('htf_zone_alert_ids', [])
-        known = set(seen)
-        fresh = []
-        for event in events:
-            key = f"{event.get('symbol')}:{event.get('at')}:{event.get('side')}:{(event.get('evidence') or {}).get('stage')}"
-            if key in known:
-                continue
-            known.add(key)
-            fresh.append(key)
-            text = zone_alert_text(event)
-            if text:
-                self.controller.enqueue(ident, text, event_id=f"live-zone:{getattr(runner, 'binding_id', ident)}:{key}")
-        if fresh:
-            runner.store.put('htf_zone_alert_ids', (list(seen) + fresh)[-200:])
-
     def _publish_review_notices(self, ident, runner):
         key = 'live:review_notices'
         decisions = {
@@ -503,16 +483,16 @@ class LiveFleet:
                     strategies = {'trend':'trend taraması', 'momentum':'ivme taraması',
                                   'mean_reversion':'ortalamaya dönüş taraması', 'structure_setup':'yapı taraması'}
                     if notice.get('review_reason') == 'watch_structure_changed':
-                        text = 'Takip planındaki piyasa yapısı değişti; yeniden inceleniyor.'
+                        text = 'Takip planındaki piyasa yapısı değişti; AI incelemesi hazırlanıyor.'
                     elif notice['triggered']:
-                        text = 'Takip tetiklendi; parite yeniden inceleniyor.'
+                        text = 'Takip tetiklendi; AI incelemesi hazırlanıyor.'
                     else:
-                        text = 'Aday incelemeye alındı.'
+                        text = 'Aday AI incelemesine alındı.'
                         source = strategies.get(notice.get('strategy'))
                         if source:
                             text += f" Kaynak {source}."
                         frame = notice.get('seed_timeframe')
-                        if frame in ('5m', '15m', '4h'):
+                        if frame in ('5m', '15m', '1h', '4h'):
                             text += f" Tetik zaman dilimi {frame}."
                 elif notice['status'] == 'provider_wait':
                     text = 'Bu inceleme için uygun AI rotası bekleniyor.'
