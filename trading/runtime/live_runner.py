@@ -68,9 +68,11 @@ class LiveRunner:
         preset=get_preset(self.cfg.risk_profile)
         limit=self.cfg.live_aggressive_daily_loss_limit_pct
         if preset.profile==RiskProfile.AGGRESSIVE_GROWTH:
+            continuous = runner3_policy.continuous_aggressive(self.cfg, preset.profile, self.runner_id)
             preset=replace(preset,
+                daily_loss_halt_enabled=not continuous,
                 daily_loss_halt_pct=preset.daily_loss_halt_pct if limit is None else limit,
-                weekly_loss_halt_enabled=self.cfg.live_aggressive_weekly_loss_limit_enabled)
+                weekly_loss_halt_enabled=not continuous and self.cfg.live_aggressive_weekly_loss_limit_enabled)
         return RiskEngine(settings=self.cfg,preset=preset)
 
     def configure(self,control):
@@ -88,6 +90,8 @@ class LiveRunner:
             self.executor.risk=self.risk
 
     def _risk_fraction(self,control,equity=0):
+        if runner3_policy.continuous_aggressive(self.cfg, self.risk.preset.profile, control.get('runner_id')):
+            return runner3_policy.CONTINUOUS_STOP_RISK_CAP
         if runner3_policy.aggressive_model_sizing(self.cfg, self.risk.preset.profile, control.get('runner_id'), equity):
             return runner3_policy.AGGRESSIVE_STOP_RISK_CAP
         requested=control.get('risk_per_trade_pct',self.cfg.risk_per_trade_pct)
@@ -413,6 +417,8 @@ class LiveRunner:
             live_context=self._live_context(snapshot,control)
             live_context['runner_id']=control.get('runner_id','baseline-v1')
             account_equity = snapshot['balance']['equity']
+            live_context['continuous_aggressive'] = runner3_policy.continuous_aggressive(
+                self.cfg, self.risk.preset.profile, live_context['runner_id'])
             live_context['aggressive_model_sizing'] = runner3_policy.aggressive_model_sizing(
                 self.cfg, self.risk.preset.profile, live_context['runner_id'], account_equity)
             # Other parallel candidates' leverage rows are not this symbol's
@@ -485,7 +491,8 @@ class LiveRunner:
         if model_sizing and result.metadata.get('sizing_plan') is None:
             raise PlanSizingError('aggressive_runner3_requires_explicit_sizing')
         risk_fraction = self._risk_fraction(control, account_equity)
-        if model_sizing and setup['family'] == 'countertrend_sweep_reclaim':
+        continuous = runner3_policy.continuous_aggressive(self.cfg, self.risk.preset.profile, runner_id)
+        if model_sizing and not continuous and setup['family'] == 'countertrend_sweep_reclaim':
             risk_fraction *= .5
         proposal=apply_decision_sizing(planning_candidate,result.metadata.get('sizing_plan'),self._capital(snapshot,control),
             risk_fraction,self._leverage_cap(control,exchange_cap),exchange_cap)
@@ -651,7 +658,9 @@ class LiveRunner:
             return finish('HOLD_LIVE_SYMBOL_OPEN')
         position_limit = min(control.get('max_positions', self.cfg.live_max_positions),
                              self.cfg.live_max_positions, self.risk.preset.max_concurrent_positions)
-        if (runner3_policy.uses_fixed_position_limit(control.get('runner_id'), snapshot['balance']['equity'])
+        continuous = runner3_policy.continuous_aggressive(self.cfg, self.risk.preset.profile, control.get('runner_id'))
+        if (runner3_policy.uses_fixed_position_limit(control.get('runner_id'), snapshot['balance']['equity'],
+                                                     continuous=continuous)
                 and len(snapshot['positions']) >= position_limit):
             return finish('HOLD_LIVE_POSITION_LIMIT')
         selected=result.selected_signal
@@ -783,7 +792,7 @@ class LiveRunner:
                 return self.status('HOLD_LIVE_NO_FUNDS')
             risk=observe_risk_reference(self.store,self.binding_id,snapshot['balance']['equity'])
             preset = self.risk.preset
-            limits = {'daily_loss_pct': preset.daily_loss_halt_pct}
+            limits = {'daily_loss_pct': preset.daily_loss_halt_pct} if preset.daily_loss_halt_enabled else {}
             if preset.weekly_loss_halt_enabled:
                 limits['weekly_loss_pct'] = preset.weekly_loss_halt_pct
             risk_blocks = {key: dict(observed=risk[key], limit=limit) for key, limit in limits.items() if risk[key] >= limit}
@@ -941,7 +950,9 @@ class LiveRunner:
             runner_id=self.runner_id,
             aggressive_model_sizing=runner3_policy.aggressive_model_sizing(
                 self.cfg, self.risk.preset.profile, self.runner_id, (account.get('balance') or {}).get('equity')),
+            continuous_aggressive=runner3_policy.continuous_aggressive(self.cfg, self.risk.preset.profile, self.runner_id),
             entry_risk_policy=dict(profile=self.risk.preset.profile.value,daily_loss_limit_pct=self.risk.preset.daily_loss_halt_pct,
+                daily_loss_limit_enabled=self.risk.preset.daily_loss_halt_enabled,
                 weekly_loss_limit_enabled=self.risk.preset.weekly_loss_halt_enabled,
                 weekly_loss_limit_pct=self.risk.preset.weekly_loss_halt_pct),
             ai_status=getattr(self.llm,'last_status','not_called'),live_halt=self.store.get('live:halt'),is_simulated=False)

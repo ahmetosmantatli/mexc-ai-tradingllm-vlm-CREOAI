@@ -540,3 +540,33 @@ def test_runner3_aggressive_keeps_explicit_standard_size_and_leverage(tmp_path):
     decision.metadata['sizing_plan']['risk_per_trade_pct'] = .101
     with pytest.raises(ValueError, match='model_risk_exceeds_policy'):
         runner._final_proposal(signal, decision, snapshot, control)
+
+
+def test_continuous_aggressive_runner3_uses_fifteen_percent_and_disables_loss_gates(tmp_path):
+    from trading.risk.engine import RiskContext
+
+    runner, private, _, control = prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled = True
+    runner.cfg.live_runner3_continuous_aggressive_enabled = True
+    control.update(runner_id='runner3', risk_profile='aggressive_growth', max_leverage=10)
+    runner.configure(control)
+    private.equity = private.available = 50.
+    signal = candidate()
+    decision = _runner3_decision(runner, signal, 'htf_zone_mss', margin_share=.8)
+    decision.metadata['setup_selection']['family'] = 'countertrend_sweep_reclaim'
+    decision.metadata['sizing_plan'].update(leverage=10, risk_per_trade_pct=.15)
+    sized = runner._final_proposal(signal, decision, runner._refresh([signal.symbol]), control)
+    assert sized.max_loss_if_stopped == pytest.approx(7.5)
+    assert not runner.risk.preset.daily_loss_halt_enabled
+    assert not runner.risk.preset.weekly_loss_halt_enabled
+    ctx = RiskContext(equity=50., starting_capital=100., capital_floor=0.,
+                      daily_loss_pct=.30, weekly_loss_pct=.50, open_risk=35.,
+                      aggressive_model_sizing=True, continuous_aggressive=True)
+    assert runner.risk.evaluate(sized, ctx).accepted
+    too_risky = sized.model_copy(update={'max_loss_if_stopped': 7.51})
+    assert 'MAX_LOSS_EXCEEDS_CAP' in runner.risk.evaluate(too_risky, ctx).reason_codes
+
+    control['runner_id'] = 'runner2'
+    runner.configure(control)
+    assert runner.risk.preset.daily_loss_halt_enabled
+    assert runner.risk.preset.weekly_loss_halt_enabled

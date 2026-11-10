@@ -159,7 +159,7 @@ def audit(path,*,since=0,now=None,include_performance=False):
             intent_states=dict(Counter(r.get('status','unknown') for r in intents)),watch_states=dict(watches),
             latest_trade_proposals=detail,candidate_error_types=dict(Counter(r.get('code',r.get('type','unknown')) for r in errors)),
             snapshot_age_seconds=max(0,now-account.get('observed_at',0)) if account.get('observed_at') else None,
-            start_grant_present=bool(grant),start_grant_revoked=grant.get('revoked'),start_grant_expired=grant.get('expires_at',0)<=now,
+            start_grant_present=bool(grant),start_grant_revoked=grant.get('revoked'),start_grant_expired=(grant.get('expires_at') or 0)<=now if grant.get('continuous') is not True else False,
             halt=bool(state('live:halt')),last_entry_reason=entry_status.get('reason'), entry_risk_blocks=entry_status.get('risk_blocks',{}),
             last_scan_at=scan.get('at'),
             last_entry_review={k:latest.get(k) for k in ('symbol','status','started_at','completed_at')} if latest else None,

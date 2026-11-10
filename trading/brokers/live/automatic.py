@@ -8,7 +8,7 @@ from time import time
 from math import isfinite
 
 from trading.brokers.live.execution import ApprovedLiveExecutor,LiveExecutionError
-from trading.runtime.runner3_policy import uses_fixed_position_limit
+from trading.runtime.runner3_policy import continuous_aggressive, uses_fixed_position_limit
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,10 @@ class AutomaticLiveExecutor(ApprovedLiveExecutor):
         if self.policy.enabled is not True or self.account_id not in self.policy.allowed_accounts:
             raise LiveExecutionError('automatic_live_policy_disabled')
 
+    def _continuous_start(self, control):
+        return continuous_aggressive(getattr(self.risk, 'settings', None),
+                                     control.get('risk_profile'), control.get('runner_id'))
+
     def grant_start(self,operator_id,control_revision,*,ttl_seconds=604800):
         self._gate()
         self._policy_gate()
@@ -43,8 +47,11 @@ class AutomaticLiveExecutor(ApprovedLiveExecutor):
         control=self.control_provider()
         if not control.get('enabled') or control.get('updated_at')!=control_revision:
             raise LiveExecutionError('automatic_start_control_changed')
+        now = time()
+        continuous = self._continuous_start(control)
         grant=dict(account_id=self.account_id,binding_id=self.binding_id,control_revision=control_revision,
-            granted_by=str(operator_id),expires_at=time()+ttl_seconds,created_at=time(),revoked=False)
+            granted_by=str(operator_id),expires_at=None if continuous else now+ttl_seconds,
+            continuous=continuous,created_at=now,revoked=False)
         self.store.put(self._grant_key(),grant)
         return grant
 
@@ -57,8 +64,12 @@ class AutomaticLiveExecutor(ApprovedLiveExecutor):
         self._policy_gate()
         grant=self.store.get(self._grant_key(),{})
         control=self.control_provider()
+        expires_at = grant.get('expires_at')
+        current_time = (grant.get('continuous') is True and self._continuous_start(control)
+                        if expires_at is None else type(expires_at) in (int, float)
+                        and isfinite(expires_at) and expires_at > time())
         if (grant.get('account_id')!=self.account_id or grant.get('binding_id')!=self.binding_id
-                or grant.get('revoked') or grant.get('expires_at',0)<=time()
+                or grant.get('revoked') or not current_time
                 or not control.get('enabled') or control.get('stopped')
                 or control.get('updated_at')!=grant.get('control_revision')):
             raise LiveExecutionError('automatic_start_grant_not_current')
@@ -108,7 +119,8 @@ class AutomaticLiveExecutor(ApprovedLiveExecutor):
         return super()._preflight(row)
 
     def _enforce_position_limit(self, proposal, equity, managed):
-        limited = uses_fixed_position_limit(proposal.metadata.get('runner_id'), equity)
+        limited = uses_fixed_position_limit(proposal.metadata.get('runner_id'), equity,
+                                            continuous=self._continuous_start(self.control_provider()))
         if limited and len(managed) >= self.policy.max_positions:
             raise LiveExecutionError('automatic_position_cap')
         return limited

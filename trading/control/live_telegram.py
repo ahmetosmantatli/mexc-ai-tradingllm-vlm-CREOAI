@@ -101,9 +101,13 @@ class LiveTelegramController(TelegramController):
         mode=next((v for v in TRADER_MODES.values() if v['risk_profile']==state['risk_profile']),{})
         leverage_mode=snapshot.get('leverage_mode','profile')
         risk_policy=snapshot.get('entry_risk_policy') or {}
+        continuous = bool(snapshot.get('continuous_aggressive') and selected=='runner3'
+                          and state.get('risk_profile')=='aggressive_growth')
         daily_limit=risk_policy.get('daily_loss_limit_pct') if risk_policy.get('profile')==state['risk_profile'] else None
         daily_text=f'Günlük kayıp eşiği: %{daily_limit*100:g}\n' if daily_limit is not None else ''
-        if daily_limit is not None:
+        if continuous:
+            daily_text='Günlük ve haftalık kayıp durdurmaları kapalı.\n'
+        elif daily_limit is not None:
             if risk_policy.get('weekly_loss_limit_enabled') is False:
                 daily_text+='Haftalık kayıp durdurması kapalı.\n'
             elif risk_policy.get('weekly_loss_limit_pct') is not None:
@@ -113,11 +117,14 @@ class LiveTelegramController(TelegramController):
         price_planning=snapshot.get('price_planning_enabled',False)
         price_text=('Giriş/SL/TP: AI kapanmış mumlara referanslı plan önerebilir; piyasa ve risk doğrulaması zorunlu.\n'
             if price_planning else 'Giriş/SL/TP: algoritma seviyeleri.\n')
+        stop_cap = 15 if continuous else 10 if snapshot.get('aggressive_model_sizing') and selected=='runner3' else state['risk_per_trade_pct']*100
+        grant_text = ('Başlat yetkisi durdurulana veya ayarlar değişene kadar geçerlidir.\n' if continuous else
+                      'Başlat yetkisi 7 gün geçerlidir.\n')
         return (text+f"Analiz: {'VLM' if state['version']=='vlm' else 'Görselsiz'} | Profil: {mode.get('label','?')}\n"
-            f"Planlanan işlem riski üst sınırı: %{state['risk_per_trade_pct']*100:g}\n"
+            f"Planlanan işlem riski üst sınırı: %{stop_cap:g}\n"
             +daily_text+leverage_text+price_text+('Açık pozisyon: olay bazlı AI stop taşıma/kısmi kapatma/kapatma yönetimi etkin.\n'
                 if snapshot.get('position_management_enabled') else '')+
-            'Başlat sonrasında model ve risk motoru işlem başına Telegram onayı beklemez. Başlat yetkisi 7 gün geçerlidir.\n'
+            'Başlat sonrasında model ve risk motoru işlem başına Telegram onayı beklemez. '+grant_text+
             'Durdur yeni girişleri/AI çağrılarını keser; açık pozisyonların uzlaştırması ve borsa koruması sürer.')
 
     def request_capital(self,account_id,mode,amount=None,allocation_mode='fixed'):
@@ -174,7 +181,15 @@ class LiveTelegramController(TelegramController):
             text+=f'Seçili yeni işlem runner’ı: {RUNNER_LABELS[selected]}\n'
         else:
             text+='Seçili runner kullanılamıyor. Ayarlar’dan yeniden seç.\n'
-        if selected == 'runner3' and snapshot.get('aggressive_model_sizing'):
+        if selected == 'runner3' and snapshot.get('continuous_aggressive'):
+            grant = snapshot.get('automatic_grant') or {}
+            if (grant.get('continuous') is True and not grant.get('revoked')
+                    and grant.get('control_revision')==state.get('updated_at')):
+                grant_label = 'Başlat izni süresiz.'
+            else:
+                grant_label = 'Süresiz izin için durdurup yeniden Başlat.'
+            text+=f'Sürekli agresif mod: açık | Stop tavanı %15 | Günlük ve haftalık kayıp durdurmaları kapalı. {grant_label}\n'
+        elif selected == 'runner3' and snapshot.get('aggressive_model_sizing'):
             text+='Agresif model boyutlandırması: açık | İşlem başına stop kaybı tavanı %10.\n'
         effective=snapshot.get('runner_id')
         if effective in RUNNER_LABELS and effective!=selected:

@@ -654,25 +654,29 @@ def test_automatic_position_count_exemption_uses_fresh_equity_and_keeps_total_ri
             assert error.value.reason_codes == ('TOTAL_OPEN_RISK_CAP',)
 
 
-def test_runner3_aggressive_rechecks_costed_loss_against_fresh_equity(tmp_path):
+@pytest.mark.parametrize("continuous", [False, True])
+def test_runner3_aggressive_rechecks_costed_loss_against_fresh_equity(tmp_path, continuous):
     from trading.config import RiskProfile, Settings
     from trading.risk.engine import RiskEngine
 
     executor, private, _, _, _ = ioc_case(tmp_path)
     executor.risk = RiskEngine(Settings(
         _env_file=None, risk_profile=RiskProfile.AGGRESSIVE_GROWTH,
-        live_runner3_aggressive_model_sizing_enabled=True))
+        live_runner3_aggressive_model_sizing_enabled=True,
+        live_runner3_continuous_aggressive_enabled=continuous))
     planned = proposal(stop_loss=StopLossSpec(price=94.), take_profit_price=112.,
                        max_loss_if_stopped=8.,
                        metadata={'runner_id': 'runner3',
                                  'runner3_allocation': {'aggressive_model_sizing': True}})
     row = approve(executor, planned)
-    private.assets[0].update(equity=80., availableBalance=80.)
+    equity = 50. if continuous else 80.
+    private.assets[0].update(equity=equity, availableBalance=equity)
     executor._preflight(row)
-    assert row['entry_stop_loss_cap_usdt'] == 8.
-    assert 6. < row['planned_loss'] < 8.
+    assert row['entry_stop_loss_cap_usdt'] == (7.5 if continuous else 8.)
+    assert 6. < row['planned_loss'] < row['entry_stop_loss_cap_usdt']
 
-    private.assets[0].update(equity=50., availableBalance=50.)
+    equity = 40. if continuous else 50.
+    private.assets[0].update(equity=equity, availableBalance=equity)
     with pytest.raises(LiveExecutionError) as exc:
         executor._preflight(row)
     assert 'MAX_LOSS_EXCEEDS_CAP' in exc.value.reason_codes
@@ -700,3 +704,29 @@ def test_runner3_aggressive_uses_available_margin_without_local_reserve_or_floor
         executor._preflight(row)
     assert 'INSUFFICIENT_FREE_MARGIN' in exc.value.reason_codes
     assert not private.submits
+
+
+def test_continuous_runner3_grant_requires_explicit_start_and_can_be_revoked(tmp_path, monkeypatch):
+    import trading.brokers.live.automatic as automatic
+    from trading.config import RiskProfile, Settings
+    from trading.risk.engine import RiskEngine
+
+    control = dict(enabled=True, updated_at=1, runner_id='runner3', risk_profile='aggressive_growth')
+    executor, _, _ = setup(tmp_path, automatic=True, control=control)
+    settings = Settings(_env_file=None, risk_profile=RiskProfile.AGGRESSIVE_GROWTH,
+                        live_runner3_continuous_aggressive_enabled=True)
+    executor.risk = RiskEngine(settings)
+    old_grant = executor.store.get(executor._grant_key())
+    monkeypatch.setattr(automatic, 'time', lambda: old_grant['expires_at'] + 1)
+    assert not executor.entry_ready()
+    control['updated_at'] = 2
+    grant = executor.grant_start('7', 2)
+    assert grant['continuous'] is True and grant['expires_at'] is None
+    monkeypatch.setattr(automatic, 'time', lambda: grant['created_at'] + 30 * 86400)
+    assert executor.entry_ready()
+    assert not executor._enforce_position_limit(proposal(metadata={'runner_id': 'runner3'}), 120., [{}] * 8)
+    settings.live_runner3_continuous_aggressive_enabled = False
+    assert not executor.entry_ready()
+    settings.live_runner3_continuous_aggressive_enabled = True
+    executor.revoke_start()
+    assert not executor.entry_ready()

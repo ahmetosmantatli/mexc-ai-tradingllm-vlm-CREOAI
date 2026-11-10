@@ -76,7 +76,7 @@ SYSTEM_POLICY = (
     'Trend continuation needs confirmed directional BOS and structural invalidation; pullback needs a macro-direction retest/reclaim, '
     'so 5m may temporarily oppose 4h. Countertrend needs an actual sweep plus closed reclaim and explicit invalidation, not an overextended indicator. '
     'Universal agreement of 4h/15m/5m is NOT required: explain the relationship for the selected family. '
-    'A countertrend selection must choose risk_per_trade_pct no more than half the supplied max_risk_fraction. '
+    'A countertrend selection must stay within setup_selection.countertrend_max_risk_fraction. '
     'READY hypotheses are evidence, not a command to trade; WATCH hypotheses lack the named trigger and cannot be traded yet. '
     'A watch_review candidate is an independent watch/structure event, not a fresh SMA/ROC signal. '
     'Its old SL/TP are context only. Trading watch_review requires a new validated price_plan; otherwise HOLD or update the watch. '
@@ -249,13 +249,15 @@ class ContextEvaluator:
                 options=[setup for frame in frames for setup in build_structure_setups(chart_context,
                     current_price=candidate.entry_price,price_step=price_rules.price_step,trigger_timeframe=frame)]
         model_sizing = bool(runner3 and live_account.get('aggressive_model_sizing'))
+        continuous = bool(runner3 and live_account.get('continuous_aggressive'))
+        countertrend_cap = risk_per_trade_pct if continuous else risk_per_trade_pct * .5
         if runner3:
             balance=live_account['current_equity']
             for option in options:
                 grade=runner3_policy.evidence_grade(option)
                 allocation=runner3_policy.margin_policy(balance,equity,live_account['available_usdt'],
                     grade,option['horizon'],model_sizing=model_sizing)
-                ceiling=risk_per_trade_pct*(.5 if option['family']=='countertrend_sweep_reclaim' else 1)
+                ceiling=countertrend_cap if option['family']=='countertrend_sweep_reclaim' else risk_per_trade_pct
                 target_risk=None if model_sizing else runner3_policy.small_account_risk_target(balance,ceiling,grade)
                 option['allocation']=dict(allocation,
                     suggested_risk_fraction=target_risk if target_risk is not None else ceiling*(.8 if grade=='strong' else .5),
@@ -283,13 +285,16 @@ class ContextEvaluator:
                       'release_symbol closes one different open position only when its thesis is invalidated and free margin cannot fund the new plan. '
                       'The close uses the single writer and the new entry waits until the exchange confirms that close.'))
         account['setup_selection']=dict(enabled=selection_enabled,options=options,
-            countertrend_max_risk_fraction=risk_per_trade_pct*.5,
+            countertrend_max_risk_fraction=countertrend_cap,
             note='Select setup_id and provide a fresh grounded price_plan for TRADE. No hypothesis means no forced trade.')
         economic_basis=economic_review_key(account,positions)
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
         if runner2:
             economic_basis['benchmarks']=chart_context['benchmarks']
-        policy_version=(runner3_policy.MODEL_SIZING_COHORT if model_sizing else runner3_policy.COHORT) if runner3 else POLICY_VERSION
+        policy_version=POLICY_VERSION
+        if runner3:
+            policy_version=(runner3_policy.CONTINUOUS_COHORT if continuous else
+                            runner3_policy.MODEL_SIZING_COHORT if model_sizing else runner3_policy.COHORT)
         evaluation_key=digest(dict(policy=policy_version,market=fingerprint,scope=scope,economic_basis=economic_basis))
         if memory.get('last_evaluation_key')==evaluation_key:
             self.store.put('stage','unchanged_closed_candles')
@@ -344,7 +349,7 @@ class ContextEvaluator:
             from trading.evaluation.setup_selection import validate_selection
             chosen,option=validate_selection(decision,candidate,options,selection_enabled)
             if (option and option['family']=='countertrend_sweep_reclaim' and decision.action=='trade'
-                    and (decision.sizing_plan is None or decision.sizing_plan.risk_per_trade_pct>risk_per_trade_pct*.5)):
+                    and (decision.sizing_plan is None or decision.sizing_plan.risk_per_trade_pct>countertrend_cap)):
                 raise ValueError('countertrend sizing exceeds reduced risk limit')
             if decision.action=='cancel_watch':
                 if (prior_watch.get('status') not in ACTIVE or decision.reviewed_watch_revision!=prior_watch['revision']

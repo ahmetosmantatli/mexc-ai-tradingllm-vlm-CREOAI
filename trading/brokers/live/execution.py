@@ -260,11 +260,15 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             open_positions=len(snapshot['positions']),open_risk=sum(r.get('planned_loss',r['proposal']['max_loss_if_stopped']) for r in managed),
             daily_loss_pct=state['daily_loss_pct'],weekly_loss_pct=state['weekly_loss_pct'],drawdown_pct=state['drawdown_pct'],
             enforce_position_limit=enforce_position_limit,
-            aggressive_model_sizing=model_sizing)
+            aggressive_model_sizing=model_sizing,
+            continuous_aggressive=model_sizing and runner3_policy.continuous_aggressive(
+                self.risk.settings, self.risk.preset.profile, proposal.metadata.get('runner_id')))
         checked_proposal = proposal
         if context.aggressive_model_sizing:
             checked_proposal = proposal.model_copy(update={'max_loss_if_stopped': planned_loss})
-            row['entry_stop_loss_cap_usdt'] = equity * runner3_policy.AGGRESSIVE_STOP_RISK_CAP
+            stop_cap = (runner3_policy.CONTINUOUS_STOP_RISK_CAP if context.continuous_aggressive
+                        else runner3_policy.AGGRESSIVE_STOP_RISK_CAP)
+            row['entry_stop_loss_cap_usdt'] = equity * stop_cap
         decision=self.risk.evaluate(checked_proposal,context)
         if not decision.accepted:raise LiveExecutionError('deterministic_risk_rejected',reason_codes=getattr(decision,'reason_codes',()))
         row['entry_executable_quote']=entry

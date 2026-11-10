@@ -390,7 +390,7 @@ class LiveFleet:
         if callable(getattr(llm,'snapshot',None)):snapshot['provider_pool']=llm.snapshot()
         if runner is not None:
             grant=runner.store.get('live:automatic_grant:'+ident,{})
-            snapshot['automatic_grant']={key:grant.get(key) for key in ('expires_at','revoked','control_revision')}
+            snapshot['automatic_grant']={key:grant.get(key) for key in ('expires_at','continuous','revoked','control_revision')}
         now=time.time()
         delayed=[]
         for kind in ('analysis','scan','monitor','management'):

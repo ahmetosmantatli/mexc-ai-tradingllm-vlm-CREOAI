@@ -6,7 +6,9 @@ from zoneinfo import ZoneInfo
 
 COHORT = 'runner3-htf-zone-v3'
 MODEL_SIZING_COHORT = 'runner3-htf-zone-v3-aggressive-market-margin'
+CONTINUOUS_COHORT = 'runner3-htf-zone-v3-aggressive-continuous'
 AGGRESSIVE_STOP_RISK_CAP = .10
+CONTINUOUS_STOP_RISK_CAP = .15
 MARGIN_RESERVE_FRACTION = .15
 MIN_NET_TARGET_R = 1.25
 MAX_COST_SHARE = .30
@@ -26,14 +28,21 @@ GUCLU_MARGIN_INSTRUCTION = (
 )
 
 
+def continuous_aggressive(settings, profile, runner_id):
+    return (getattr(settings, 'live_runner3_continuous_aggressive_enabled', False)
+            and profile == 'aggressive_growth' and runner_id == 'runner3')
+
+
 def aggressive_model_sizing(settings, profile, runner_id, equity):
+    if continuous_aggressive(settings, profile, runner_id):
+        return type(equity) in (int, float) and isfinite(equity) and equity > 0
     return (getattr(settings, 'live_runner3_aggressive_model_sizing_enabled', False)
             and profile == 'aggressive_growth' and runner_id == 'runner3'
             and type(equity) in (int, float) and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT)
 
 
-def uses_fixed_position_limit(runner_id, equity):
-    return not (runner_id == 'runner3' and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT)
+def uses_fixed_position_limit(runner_id, equity, *, continuous=False):
+    return not continuous and not (runner_id == 'runner3' and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT)
 
 
 def evidence_grade(setup):
@@ -133,7 +142,9 @@ def apply_guclu_margin_share(allocation, *, equity, available, raw_share, allow_
     strong = allocation.get('grade') == 'strong'
     if not (strong or allow_standard):
         return allocation
-    if isinstance(equity, bool) or not isinstance(equity, (int, float)) or not 0 < equity < SMALL_ACCOUNT_EQUITY_USDT:
+    if type(equity) not in (int, float) or not isfinite(equity) or equity <= 0:
+        return allocation
+    if not allow_standard and equity >= SMALL_ACCOUNT_EQUITY_USDT:
         return allocation
     fraction, source = resolve_guclu_margin_share(raw_share)
     if not strong and source != 'model':

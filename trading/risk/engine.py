@@ -26,6 +26,7 @@ class RiskContext:
     halt_new_risk: bool = False
     enforce_position_limit: bool = True
     aggressive_model_sizing: bool = False
+    continuous_aggressive: bool = False
 
 
 @dataclass
@@ -89,15 +90,15 @@ class RiskEngine:
 
         risk_cap = min(preset.risk_per_trade_pct, preset.abs_max_loss_pct, self.settings.abs_max_loss_pct, self.settings.risk_per_trade_pct)
         if context.aggressive_model_sizing:
-            from trading.runtime.runner3_policy import AGGRESSIVE_STOP_RISK_CAP
-            risk_cap = AGGRESSIVE_STOP_RISK_CAP
+            from trading.runtime.runner3_policy import AGGRESSIVE_STOP_RISK_CAP, CONTINUOUS_STOP_RISK_CAP
+            risk_cap = CONTINUOUS_STOP_RISK_CAP if context.continuous_aggressive else AGGRESSIVE_STOP_RISK_CAP
         max_allowed_loss = equity * risk_cap
         if proposal.max_loss_if_stopped > max_allowed_loss + 1e-9:
             reasons.append("MAX_LOSS_EXCEEDS_CAP")
 
         residual = equity - proposal.max_loss_if_stopped - max(context.open_risk, 0.0)
         residual_floor = equity * max(preset.residual_min_pct, self.settings.residual_min_pct)
-        if residual < residual_floor - 1e-9:
+        if not context.continuous_aggressive and residual < residual_floor - 1e-9:
             reasons.append("RESIDUAL_CAPITAL_TOO_LOW")
 
         # Single-trade wipe ban: stop must leave tradeable residual (> 0 and above residual_min).
@@ -123,7 +124,7 @@ class RiskEngine:
                 and context.open_risk + proposal.max_loss_if_stopped > equity * preset.total_open_risk_pct + 1e-9):
             reasons.append("TOTAL_OPEN_RISK_CAP")
 
-        if context.daily_loss_pct >= preset.daily_loss_halt_pct:
+        if preset.daily_loss_halt_enabled and context.daily_loss_pct >= preset.daily_loss_halt_pct:
             reasons.append("DAILY_LOSS_HALT")
 
         if preset.weekly_loss_halt_enabled and context.weekly_loss_pct >= preset.weekly_loss_halt_pct:

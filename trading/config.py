@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     live_runner2_enabled: bool = False
     live_runner3_enabled: bool = False
     live_runner3_aggressive_model_sizing_enabled: bool = False
+    live_runner3_continuous_aggressive_enabled: bool = False
     live_runner3_daily_net_target_usdt: float | None = Field(default=None, gt=0)
     live_management_min_interval_seconds: float = Field(default=60, ge=15, le=3600)
     live_leverage_mode: str = Field(default='profile',pattern='^(profile|exchange)$')
