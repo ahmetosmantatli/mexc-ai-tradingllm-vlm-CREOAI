@@ -482,6 +482,82 @@ def order_names_supplied_target(setup, plan, *, stop, target, action='trade'):
     return _same_price(stop, plan_stop) and _same_price(target, plan_target)
 
 
+def selected_closed_setup(candidate, options):
+    """The ready setup this live entry already selected.
+
+    The candidate carries that setup id. A missing id, a different id, or a
+    setup without zone, touch, and a closed CHoCH/MSS is not a trade.
+    """
+    features = getattr(candidate, 'features', None)
+    if not isinstance(features, dict) or not isinstance(options, list):
+        return None
+    ident = features.get('setup_id')
+    if not isinstance(ident, str) or not ident:
+        return None
+    for row in options:
+        if isinstance(row, dict) and row.get('setup_id') == ident and closed_entry_structure(row):
+            return row
+    return None
+
+
+def _tick_toward_entry(price, step, *, long):
+    """One tick toward the entry, matching the setup builder. No new price."""
+    if not step:
+        return float(price)
+    from trading.quant.structure_setups import _tick
+    return _tick(price, step, up=not long)
+
+
+def clearing_supplied_targets(setup, *, entry, fee, slippage, price_step=0):
+    """Supplied opposing levels whose cost-adjusted R clears the floor, farthest first.
+
+    The stop is the setup stop. A price that is not on ``opposing_target_levels``
+    is ignored. The R check stays: a level under the floor is not returned.
+    """
+    if not closed_entry_structure(setup):
+        return []
+    stop = setup.get('stop_loss_price')
+    if not _positive_number(entry) or not _positive_number(stop):
+        return []
+    if isinstance(price_step, bool) or not isinstance(price_step, (int, float)) or not isfinite(price_step) or price_step < 0:
+        return []
+    long = setup['side'] == 'long'
+    if long and not stop < entry:
+        return []
+    if not long and not entry < stop:
+        return []
+    levels = setup.get('opposing_target_levels')
+    if not isinstance(levels, list):
+        return []
+    identities = set(supplied_target_identities(setup))
+    found = []
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        identity = _target_identity(level)
+        price = level.get('price')
+        if identity is None or identity not in identities or not _positive_number(price):
+            continue
+        target = _tick_toward_entry(price, price_step, long=long)
+        if not _positive_number(target):
+            continue
+        if long and not entry < target:
+            continue
+        if not long and not target < entry:
+            continue
+        gross, net, loss = ioc_target_economics(
+            side=setup['side'], entry=entry, stop=stop, target=target, fee=fee, slippage=slippage)
+        try:
+            validate_economics(gross, net, loss)
+        except ValueError:
+            continue
+        found.append(dict(level, take_profit_price=target))
+    found.sort(key=lambda level: (
+        level['take_profit_price'] if long else -level['take_profit_price'],
+        level.get('open_time') or 0), reverse=True)
+    return found
+
+
 def entry_gate_instruction(*, fee, slippage):
     """Prompt for the cost gate.
 
@@ -489,8 +565,10 @@ def entry_gate_instruction(*, fee, slippage):
     multiplier. It may choose a farther supplied opposing target when 1.25
     would otherwise block, and that choice stands. A trade on a supplied
     opposing level is not rejected for cost-adjusted R. Zone, touch, and a
-    closed CHoCH/MSS stay required. A silent answer or BEKLE opens nothing.
-    The equity stop cap still applies, and the stop is not moved.
+    closed CHoCH/MSS stay required. A silent or invalid answer opens nothing.
+    A valid hold on the selected real setup is entered at the farthest
+    supplied opposing target that clears 1.25, and the stop stays. A hold
+    with no such level stays a hold. The equity stop cap still applies.
     """
     fee = _cost_number(fee)
     slippage = _cost_number(slippage)
@@ -518,7 +596,7 @@ def entry_gate_instruction(*, fee, slippage):
         'These are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
         f'The {CONTINUOUS_STOP_RISK_CAP:.0%} equity stop cap still applies. Do not move the stop.',
-        'A silent answer or BEKLE (action hold) opens nothing.',
+        'A silent or invalid answer opens nothing. When the selected setup is real and you hold, the engine enters the farthest supplied opposing target that clears 1.25 and keeps the stop. A hold with no such level stays a hold.',
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
         ENTRY_GATE_END,

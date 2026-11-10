@@ -496,6 +496,8 @@ class LiveFleet:
                             text += f" Tetik zaman dilimi {frame}."
                 elif notice['status'] == 'provider_wait':
                     text = 'Bu inceleme için uygun AI rotası bekleniyor.'
+                elif notice['status'] == 'completed' and notice.get('ready_setup_after_hold'):
+                    text = 'Giriş, hazır kurulumdan alındı. Model BEKLE seçmişti.'
                 elif notice['status'] == 'completed':
                     text = decisions.get(notice['action'], 'AI incelemesi tamamlandı.')
                 else:
