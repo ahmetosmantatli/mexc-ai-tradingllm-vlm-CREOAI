@@ -97,6 +97,24 @@ def test_gemini_structured_daily_failure_waits_until_next_pacific_day():
     assert gemini_retry(short,now=now)==(5,False)
 
 
+def test_catalog_names_the_third_gemini_slot_and_skips_it_when_empty():
+    def answer(req):
+        assert req.method == 'GET' and 'SECRET' not in str(req.url)
+        return httpx.Response(200, json={'models': [{'name': 'models/test-gem', 'supportedGenerationMethods': ['generateContent']}]})
+
+    present = SimpleNamespace(groq_api_key='', groq_api_key_2='', gemini_api_key='SECRET-1',
+                              gemini_api_key_2='SECRET-2', gemini_api_key_3='SECRET-3')
+    with httpx.Client(transport=httpx.MockTransport(answer)) as client:
+        named = catalog(present, client)
+    assert [row['credential'] for row in named] == ['gemini-1', 'gemini-2', 'gemini-3']
+    assert 'SECRET' not in json.dumps(named)
+    missing = SimpleNamespace(groq_api_key='', groq_api_key_2='', gemini_api_key='SECRET-1',
+                              gemini_api_key_2='SECRET-2', gemini_api_key_3='')
+    with httpx.Client(transport=httpx.MockTransport(answer)) as client:
+        kept = catalog(missing, client)
+    assert [row['credential'] for row in kept] == ['gemini-1', 'gemini-2']
+
+
 def test_catalog_only_uses_get_and_never_claims_free_access():
     calls=[]
     def answer(req):

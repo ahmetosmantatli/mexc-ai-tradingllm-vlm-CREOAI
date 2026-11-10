@@ -19,7 +19,7 @@ def settings(**updates):
     defaults.update(updates)
     cfg=Settings(**defaults)
     # model_copy keeps tests usable while root adds these settings concurrently.
-    pool_defaults=dict(groq_api_key_2='',gemini_api_key_2='',groq_quota_group='groq-main',groq_quota_group_2='groq-main',
+    pool_defaults=dict(groq_api_key_2='',gemini_api_key_2='',gemini_api_key_3='',groq_quota_group='groq-main',groq_quota_group_2='groq-main',
         gemini_quota_group='gemini-main',gemini_quota_group_2='gemini-main',groq_rpm=30,groq_tpm=8000,groq_rpd=1000,groq_tpd=200000,
         gemini_rpm=15,gemini_tpm=250000,gemini_rpd=500,gemini_tpd=0,ai_pool_retry_seconds=0,ai_pool_max_retry_attempts=0)
     pool_defaults.update({key:value for key,value in updates.items() if key in pool_defaults})
@@ -784,6 +784,70 @@ def test_oversized_packet_skips_8k_model(tmp_path):
     assert hosts==['generativelanguage.googleapis.com']
     groq=next(row for row in provider.snapshot()['groups'] if row['provider']=='groq')
     assert groq['requests_daily_remaining']==1000
+
+
+def test_configured_gemini_keys_are_first_and_groq_waits(tmp_path):
+    from trading.evaluation.service import ModelDecision
+
+    calls = []
+
+    def transport(request):
+        calls.append(request.headers.get('authorization', ''))
+        if len(calls) == 1:
+            return httpx.Response(503, json={'error': {'message': 'down'}})
+        return _decision_hold()
+
+    cfg = settings(gemini_api_key='gemini-key-1', gemini_api_key_2='gemini-key-2',
+                   gemini_api_key_3='gemini-key-3', ai_primary_provider='groq',
+                   anthropic_api_key='paid', ai_claude_fallback_enabled=True)
+    provider, _store = pool(tmp_path, cfg, transport)
+    provider.response_validator = ModelDecision.model_validate
+    provider.claude.complete_json = lambda **kwargs: pytest.fail('valid BEKLE must not start fallback')
+    assert [slot.label for slot in provider._slots if slot.provider == 'gemini'] == ['gemini-1', 'gemini-2', 'gemini-3']
+    assert provider.complete_json(system='s', user='u')['action'] == 'hold'
+    assert calls == ['Bearer gemini-key-1', 'Bearer gemini-key-2']
+    assert [row['credential_id'] for row in provider.last_trace['attempts']] == ['gemini-1', 'gemini-2']
+    assert provider.last_provider == 'gemini'
+
+
+def test_groq_is_next_after_every_configured_gemini_key(tmp_path):
+    calls = []
+
+    def transport(request):
+        calls.append(request.url.host)
+        if request.url.host == 'integrate.api.nvidia.com':
+            return response()
+        return httpx.Response(503, json={'error': {'message': 'down'}})
+
+    cfg = settings(gemini_api_key='gemini-key-1', gemini_api_key_2='gemini-key-2',
+                   gemini_api_key_3='gemini-key-3', ai_primary_provider='groq',
+                   ai_pool_max_generation_requests=8, nvidia_api_key='nvidia-test-key',
+                   nvidia_models=json.dumps(_nvidia_models('last')), nvidia_local_rpm=40)
+    provider, _store = pool(tmp_path, cfg, transport)
+    provider.claude.complete_json = lambda **kwargs: pytest.fail('NVIDIA answered before paid fallback')
+    assert provider.complete_json(system='s', user='u') == {'action': 'hold'}
+    assert calls == ['generativelanguage.googleapis.com', 'generativelanguage.googleapis.com',
+                     'generativelanguage.googleapis.com', 'api.groq.com', 'integrate.api.nvidia.com']
+    assert [row['credential_id'] for row in provider.last_trace['attempts'] if row.get('provider') in ('gemini', 'groq')] == [
+        'gemini-1', 'gemini-2', 'gemini-3', 'groq-1']
+    assert provider.last_provider == 'nvidia'
+
+
+def test_missing_gemini3_key_does_not_break_the_first_two(tmp_path):
+    calls = []
+
+    def transport(request):
+        calls.append(request.headers.get('authorization', ''))
+        if len(calls) == 1:
+            return httpx.Response(503, json={'error': {'message': 'down'}})
+        return response()
+
+    cfg = settings(gemini_api_key='gemini-key-1', gemini_api_key_2='gemini-key-2', ai_primary_provider='groq')
+    provider, _store = pool(tmp_path, cfg, transport)
+    assert [slot.label for slot in provider._slots if slot.provider == 'gemini'] == ['gemini-1', 'gemini-2']
+    assert provider.complete_json(system='s', user='u') == {'action': 'hold'}
+    assert calls == ['Bearer gemini-key-1', 'Bearer gemini-key-2']
+    assert provider.last_credential_id == 'gemini-2'
 
 
 def test_groq_daily_probe_accepts_a_valid_decision_without_calling_another_route(tmp_path):

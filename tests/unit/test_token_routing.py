@@ -1,5 +1,6 @@
 """A packet that does not fit one model must not close the other free routes."""
 import json
+import time
 
 import httpx
 
@@ -135,11 +136,15 @@ def test_413_does_not_set_free_capacity_to_zero(tmp_path):
                 'type': 'request_token_budget'}})
         return _hold()
     cfg=settings(gemini_api_key='gemini-key', groq_text_model='custom-free-model', groq_tpm=100000)
-    p,_store=pool(tmp_path, cfg, transport)
-    assert p.complete_json(system='s', user='medium packet')=={'action': 'hold'}
-    assert calls==['api.groq.com', 'generativelanguage.googleapis.com']
-    assert p.last_trace['attempts'][0]['error_category']=='does-not-fit'
-    assert p.last_trace['attempts'][0]['http_status']==413
+    p,store=pool(tmp_path, cfg, transport)
+    # Gemini is first whenever it can answer. Hold it only so the wide Groq model can observe a 413.
+    gemini=next(slot for slot in p._slots if slot.provider=='gemini')
+    store.put(p._quota_key(gemini, None), dict(rows=[], lease=dict(id='busy', until=time.time()+60)))
+    assert p.complete_json(system='s', user='medium packet') is None
+    assert calls==['api.groq.com']
+    groq_attempt=next(row for row in p.last_trace['attempts'] if row.get('http_status')==413)
+    assert groq_attempt['provider']=='groq' and groq_attempt['error_category']=='does-not-fit'
+    store.put(p._quota_key(gemini, None), dict(rows=[]))
     capacity=p.analysis_capacity(prompt_bytes=100)
     assert capacity['free_slots']>=1
     groq=next(row for row in p.snapshot()['groups'] if row['provider']=='groq')
@@ -154,7 +159,7 @@ def test_fitting_model_receives_the_full_packet_and_groq_receives_the_compact_on
     sent=[]
     def transport(request):
         sent.append((request.url.host, _text(request)))
-        if 'groq' in request.url.host:
+        if 'generativelanguage' in request.url.host:
             return httpx.Response(429, headers={'retry-after': '60'}, json={'error': {'message': 'minute'}})
         return _hold()
     cfg=settings(gemini_api_key='gemini-key')
@@ -163,6 +168,7 @@ def test_fitting_model_receives_the_full_packet_and_groq_receives_the_compact_on
     assert p.complete_json(system='full policy', user=raw)=={'action': 'hold'}
     groq=[text for host, text in sent if 'groq' in host]
     gemini=[text for host, text in sent if 'generativelanguage' in host]
+    assert [host for host, _body in sent]==['generativelanguage.googleapis.com', 'api.groq.com']
     assert len(groq)==1 and len(gemini)==1
     compact=json.loads(groq[0])
     assert compact['context_policy']=='pa-context-v4-compact'

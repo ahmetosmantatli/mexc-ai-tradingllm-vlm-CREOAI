@@ -6,14 +6,15 @@ import re
 import httpx
 from trading.config import get_settings
 from trading.runtime.store import RuntimeStore
-from trading.agents.provider_pool import ProviderPool
+from trading.agents.provider_pool import ProviderPool, key_slot_numbers
 
 
 def catalog(settings,client):
     results=[];seen=set()
     for provider in ('gemini','groq'):
-        for number in (1,2):
-            key=getattr(settings,provider+'_api_key'+('_2' if number==2 else ''),'')
+        for number in key_slot_numbers(provider):
+            suffix='' if number==1 else '_'+str(number)
+            key=getattr(settings,provider+'_api_key'+suffix,'')
             if not key or (provider,key) in seen:continue
             seen.add((provider,key))
             row=dict(credential=provider+'-'+str(number),free_access_verified=False,quota_verified=False)
