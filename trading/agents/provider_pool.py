@@ -6,6 +6,8 @@ window or daily count is full. Local estimates are not live quota telemetry.
 8K TPM models may receive a compact packet. Wider models receive the full packet.
 Valid HOLD never triggers fallback. A local free-route estimate of zero is not
 proof those routes are exhausted, and a does-not-fit skip is not exhaustion.
+Gemini and Groq are tried before NVIDIA, OpenRouter, Cloudflare, and Anthropic.
+Two NVIDIA network timeouts end that review.
 """
 from dataclasses import dataclass, field
 from datetime import datetime,timedelta
@@ -30,6 +32,7 @@ from trading.evaluation.context import COMPACT_SYSTEM, compact_decision_packet, 
 
 GROQ_DAILY_PROBE_KEY = 'pool:groq:daily_probe_at'
 GROQ_DAILY_PROBE_INTERVAL = 60
+NVIDIA_REVIEW_CAP = 2
 
 
 class PrefixStore:
@@ -373,9 +376,7 @@ class ProviderPool:
                 utilization=max((len(recent)/rpm if rpm else 0),
                     minute_tokens/tpm if tpm else 0,len(daily)/rpd if rpd else 0,
                     daily_tokens/tpd if tpd else 0)
-                priority=-1 if probe else int(slot.provider!=getattr(self,'_preferred_provider','groq'))
-                if not probe and slot.provider == 'nvidia':
-                    priority = 2
+                priority=self._route_priority(slot,probe)
                 same_model=0 if self._model(slot,images)==preferred_model else 1
                 # A due Groq check uses an existing analysis, even when another provider is available.
                 if daily_probe:
@@ -799,6 +800,35 @@ class ProviderPool:
         # Do not bypass a provider's Retry-After. Longer delays use future cycles.
         return status!=429 or self._cooldown(slot,images)<=time.time()+seconds
 
+    def _route_priority(self,slot,probe):
+        """Gemini and Groq first. NVIDIA is last among the free routes."""
+        if probe:
+            return -1
+        if slot.provider in ('gemini','groq'):
+            return 0 if slot.provider==getattr(self,'_preferred_provider','groq') else 1
+        if slot.provider=='nvidia':
+            return 3
+        return 2
+
+    def _nvidia_calls(self):
+        """Sent NVIDIA reviews, including a timeout that never returned a status."""
+        return sum(1 for attempt in self.last_trace.get('attempts',[])
+                   if attempt.get('provider')=='nvidia' and (
+                       attempt.get('generation_requests')
+                       or attempt.get('error_category') in ('network_timeout','network_error')
+                       or isinstance(attempt.get('http_status'),int)))
+
+    def _nvidia_timeouts(self):
+        return sum(1 for attempt in self.last_trace.get('attempts',[])
+                   if attempt.get('provider')=='nvidia'
+                   and attempt.get('error_category') in ('network_timeout','network_error'))
+
+    def _nvidia_review_stopped(self):
+        if self._nvidia_timeouts()<NVIDIA_REVIEW_CAP:
+            return False
+        self.last_fallback_reason='nvidia_timeout_cap'
+        return True
+
     def _generation_requests(self):
         return sum(attempt.get('generation_requests', 0) for attempt in self.last_trace['attempts'])
 
@@ -926,6 +956,12 @@ class ProviderPool:
                       and generation_limit>1)
         free_limit=generation_limit-int(bool(reserve_paid))
         while remaining and self._allowed() and self._generation_requests()<free_limit:
+            if self._nvidia_review_stopped():
+                return self._finish(None)
+            if self._nvidia_calls()>=NVIDIA_REVIEW_CAP:
+                remaining=[slot for slot in remaining if slot.provider!='nvidia']
+                if not remaining:
+                    break
             reservation=self._reserve(remaining,system,user,max_tokens,images)
             if reservation is None:
                 self.last_fallback_reason='free_pool_quota_or_cooldown'
@@ -951,6 +987,8 @@ class ProviderPool:
             if result is not None:
                 self.successful_calls+=1
                 return self._finish(result)
+            if self._nvidia_review_stopped():
+                return self._finish(None)
             attempts=self.last_trace['attempts']
             if attempts and is_model_output_failure(attempts[-1]):
                 # Changing a credential cannot fix this response's output contract.
@@ -963,10 +1001,13 @@ class ProviderPool:
                 retry=slot
         if vision_probe:
             return self._finish(None)
+        if self._nvidia_review_stopped():
+            return self._finish(None)
         if not self._allowed():
             self.last_status='stopped'
             return self._finish(None)
-        if (retry is not None and getattr(self.settings,'ai_pool_max_retry_attempts',1)
+        if (retry is not None and not (retry.provider=='nvidia' and self._nvidia_calls()>=NVIDIA_REVIEW_CAP)
+                and getattr(self.settings,'ai_pool_max_retry_attempts',1)
                 and self._generation_requests()<free_limit):
             delay=max(0,min(10,getattr(self.settings,'ai_pool_retry_seconds',5)))
             if not self._wait(delay):
@@ -983,6 +1024,8 @@ class ProviderPool:
                 if result is not None:
                     self.successful_calls+=1
                     return self._finish(result)
+                if self._nvidia_review_stopped():
+                    return self._finish(None)
         if not self._allowed():
             self.last_status='stopped'
             return self._finish(None)
