@@ -441,9 +441,9 @@ class ContextEvaluator:
                               'BTC/ETH relative returns and recent_trade_flow are optional context, never an automatic veto. The flow is a bounded exchange trade-side sample; null means unavailable.' if runner2 else '')
         if runner3:
             policy+='\n'+account['runner3_entry_gate']+'\n'
-            policy+=('Runner 3 requires the selected READY setup ID and its exact stop and target references. '
+            policy+=('Runner 3 requires the selected READY setup ID, its exact stop, and a target that is one of the supplied opposing target levels. '
                      'Use the selected 4h→15m or 1h→5m lane. Require the valid HTF zone, a closed LTF touch, '
-                     'and a later closed LTF CHoCH/MSS; use the supplied LTF stop and HTF target. '
+                     'and a later closed LTF CHoCH/MSS; use the supplied LTF stop and one supplied opposing HTF target level. '
                      'Optional 1m timing evidence never substitutes for the 5m confirmation or supplies price references. '
                      'A zone awaiting touch or confirmation can only be watched. Preserve its supplied trigger and '
                      'invalidation. BTC/ETH structure provides context; an altcoin can diverge if its own closed evidence supports it. '
@@ -464,7 +464,7 @@ class ContextEvaluator:
                      'For a long, the initial stop is just beyond the low of the CHoCH candle that confirmed the entry. '
                      'For a short, it is just beyond that CHoCH candle high. A 4h setup uses the 15m CHoCH. '
                      'A 1h setup uses the 5m CHoCH. Do not use another candle wick on that timeframe. '
-                     'The target stays the opposing higher-timeframe level. Later management may only tighten that stop, '
+                     'The target is one of the supplied opposing higher-timeframe levels. Do not invent a level. Later management may only tighten that stop, '
                      'never widen it past this invalidation. Do not open a hedge. '
                      'Decide from the numeric setup: zone, touch, closed CHoCH/MSS, price-action and ICT labels, and the algorithm reason. '
                      'Swing stays 4h zone then 15m confirmation. Intraday stays 1h zone then 5m confirmation. Touch alone is not an entry. '

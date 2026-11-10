@@ -733,10 +733,28 @@ def test_live_entry_prompt_states_the_cost_gate_before_a_proposal(tmp_path, monk
         'cost_adjusted_R = net / loss.',
         'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < 1.25, and when gross <= 0 or (gross - net) / gross > 0.30.',
         'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
-        'A proposal whose target fails that R must be BEKLE (action hold) or a farther target on the supplied target reference that clears 1.25, not ENTER (action trade).',
+        'When the setup is real (zone, touch, and a later closed CHoCH/MSS), first choose a farther target that is one of the supplied opposing target levels and whose cost-adjusted R clears 1.25.',
+        'BEKLE (action hold) only when none of the supplied levels clears 1.25.',
+        'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
     ):
         assert line in system
+    assert system.index('first choose a farther target') < system.index('BEKLE (action hold) only when none')
     assert system.index('Runner 3 minimum cost-adjusted R is 1.25.') < system.index('Runner 3 requires the selected READY')
+    assert 'must be BEKLE (action hold) or a farther target' not in system
+    packet = json.loads(model.calls[0]['user'])
+    account = packet['account']
+    option = next(row for row in account['setup_selection']['options'] if row['state'] == 'ready')
+    assert option['evidence']['zone']
+    assert option['evidence']['touch_at']
+    assert option['evidence']['shift']['kind'] in ('choch', 'mss')
+    assert option['entry_reference'] > 0
+    assert option['stop_loss_price'] > 0
+    assert option['opposing_target_levels']
+    assert option['target_reference'] == {
+        key: option['opposing_target_levels'][0][key] for key in ('timeframe', 'open_time', 'field')}
+    assert account['equity'] == 11.58
+    assert account['capital_allocation']['available_usdt'] == 11.58
+    assert account['capital_allocation']['equity_usdt'] == 11.58
     assert result.action.value == 'hold'
     assert result.proposal is None

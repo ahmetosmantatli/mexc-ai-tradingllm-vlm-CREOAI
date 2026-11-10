@@ -247,10 +247,32 @@ def test_htf_zone_touch_then_ltf_shift_keeps_different_entry_stop_and_target_tim
     assert setup['side'] == ('short' if short else 'long')
     assert setup['stop_reference']['timeframe'] == trigger_tf
     assert setup['target_reference']['timeframe'] == context_tf
+    assert setup['opposing_target_levels']
+    assert setup['target_reference'] == {
+        key: setup['opposing_target_levels'][0][key] for key in ('timeframe', 'open_time', 'field')}
+    assert all(level['timeframe'] == context_tf for level in setup['opposing_target_levels'])
+    assert all(level['field'] == ('low' if short else 'high') for level in setup['opposing_target_levels'])
+    entry = setup['entry_reference']
+    assert all((level['price'] < entry if short else level['price'] > entry) for level in setup['opposing_target_levels'])
     assert setup['evidence']['zone']['confirmed_at'] < setup['evidence']['touch_at'] < setup['evidence']['confirmation_at']
     assert setup['evidence']['kind'] == 'htf_zone_mss'
     ctx['benchmarks'] = {'BTC_USDT': {'trend': 'bullish' if short else 'bearish'}}
     assert build_htf_zone_setups(ctx, current_price=99. if short else 101., price_step=.01)[0]['setup_id'] == setup['setup_id']
+
+
+def test_farther_opposing_high_is_supplied_after_the_nearest():
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context('4h', '15m')
+    higher = view(ctx, '4h')
+    higher['recent_ohlcv'][1][2] = 120.
+    higher['features']['swings'].append(dict(
+        kind='high', price=120., pivot_at=higher['recent_ohlcv'][1][0],
+        confirmed_at=higher['recent_ohlcv'][4][0]))
+    setup, = build_htf_zone_setups(ctx, current_price=101., price_step=.01)
+    assert [level['price'] for level in setup['opposing_target_levels']] == [110., 120.]
+    assert setup['take_profit_price'] == pytest.approx(110.)
+    assert setup['target_reference']['open_time'] == setup['opposing_target_levels'][0]['open_time']
 
 
 @pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
