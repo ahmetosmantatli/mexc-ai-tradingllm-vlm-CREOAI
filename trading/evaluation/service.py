@@ -248,6 +248,7 @@ class ContextEvaluator:
                 frames=('5m','15m','4h') if runner2 else (None,)
                 options=[setup for frame in frames for setup in build_structure_setups(chart_context,
                     current_price=candidate.entry_price,price_step=price_rules.price_step,trigger_timeframe=frame)]
+        model_sizing = bool(runner3 and live_account.get('aggressive_model_sizing'))
         if runner3:
             balance=live_account['current_equity']
             for option in options:
@@ -255,10 +256,12 @@ class ContextEvaluator:
                 allocation=runner3_policy.margin_policy(balance,equity,live_account['available_usdt'],
                     grade,option['horizon'])
                 ceiling=risk_per_trade_pct*(.5 if option['family']=='countertrend_sweep_reclaim' else 1)
-                target_risk=runner3_policy.small_account_risk_target(balance,ceiling,grade)
+                target_risk=None if model_sizing else runner3_policy.small_account_risk_target(balance,ceiling,grade)
                 option['allocation']=dict(allocation,
                     suggested_risk_fraction=target_risk if target_risk is not None else ceiling*(.8 if grade=='strong' else .5),
                     **({'margin_fraction_role':'silent_fallback'} if grade=='strong' else {}))
+                if model_sizing:
+                    continue
                 choice=runner3_policy.guclu_margin_request(
                     option, equity=balance,
                     free_margin=max(0., float(live_account['available_usdt'])-allocation['reserve_usdt']),
@@ -286,7 +289,7 @@ class ContextEvaluator:
         economic_basis['account']['canonical_watch']=watch_review_key(prior_watch)
         if runner2:
             economic_basis['benchmarks']=chart_context['benchmarks']
-        policy_version=runner3_policy.COHORT if runner3 else POLICY_VERSION
+        policy_version=(runner3_policy.MODEL_SIZING_COHORT if model_sizing else runner3_policy.COHORT) if runner3 else POLICY_VERSION
         evaluation_key=digest(dict(policy=policy_version,market=fingerprint,scope=scope,economic_basis=economic_basis))
         if memory.get('last_evaluation_key')==evaluation_key:
             self.store.put('stage','unchanged_closed_candles')
@@ -328,7 +331,7 @@ class ContextEvaluator:
             market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))
         if runner2:
-            trace['strategy_cohort']=runner3_policy.COHORT if runner3 else 'runner2-multihorizon-ict-v1'
+            trace['strategy_cohort']=policy_version if runner3 else 'runner2-multihorizon-ict-v1'
         publish_progress(self.store,trace)
         if live_account is not None and self.on_live_review is not None:
             self.on_live_review(trace)
@@ -336,6 +339,8 @@ class ContextEvaluator:
         deadline=started+self.cfg.decision_ttl_seconds
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
+            if model_sizing and decision.action == 'trade' and decision.sizing_plan is None:
+                raise ValueError('aggressive Runner 3 requires explicit sizing')
             from trading.evaluation.setup_selection import validate_selection
             chosen,option=validate_selection(decision,candidate,options,selection_enabled)
             if (option and option['family']=='countertrend_sweep_reclaim' and decision.action=='trade'
@@ -435,10 +440,14 @@ class ContextEvaluator:
                      'invalidation. BTC/ETH structure provides context; an altcoin can diverge if its own closed evidence supports it. '
                      'There is no separate balance split and no numeric confidence score. '
                      'Güçlü is only a liquidity sweep plus MSS plus an FVG retest, or a closed break in the higher-timeframe direction with at least 2R. Every other valid setup is Standart. '
-                     + runner3_policy.GUCLU_MARGIN_INSTRUCTION +
-                     'A Güçlü setup may use more of the existing per-trade loss ceiling. '
-                     'Do not ask for a margin below 1 USDT while equity is under 100. Do not pick 10x because it is a default, '
-                     'and do not pick the exchange maximum. Leverage is the lowest value that fits that share and the CHoCH stop. '
+                     + ('Choose sizing_plan.margin_share and integer leverage for either evidence grade. '
+                        'A valid share is an equity fraction and a margin target. The executor prefers your leverage '
+                        'when it fits verified exchange limits, available margin, and the liquidation buffer. '
+                        'Choose risk per trade within the supplied ceiling, including fees and estimated exit slippage. '
+                        if model_sizing else runner3_policy.GUCLU_MARGIN_INSTRUCTION +
+                        'A Güçlü setup may use more of the existing per-trade loss ceiling. '
+                        'Leverage is the lowest value that fits that share and the CHoCH stop. ') +
+                     'Do not ask for a margin below 1 USDT while equity is under 100. '
                      'Do not narrow or move the CHoCH stop to make the position bigger. '
                      'For a long, the initial stop is just beyond the low of the CHoCH candle that confirmed the entry. '
                      'For a short, it is just beyond that CHoCH candle high. A 4h setup uses the 15m CHoCH. '
@@ -770,7 +779,7 @@ class ContextEvaluator:
             watch_note=decision.watch_note,sizing_plan=decision.sizing_plan.model_dump(exclude_none=True) if decision.sizing_plan else None,
             release_symbol=decision.release_symbol,
             thesis_invalidated=bool(decision.release_symbol and decision.thesis_invalidated))
-        if runner3:
+        if runner3 and not model_sizing:
             text_plan = getattr(share_decision, 'sizing_plan', None) if share_decision is not None else None
             metadata['guclu_margin_share'] = None if text_plan is None else text_plan.margin_share
         if local_limit:

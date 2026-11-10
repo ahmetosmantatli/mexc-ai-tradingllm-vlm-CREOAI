@@ -155,3 +155,12 @@ def test_preset_always_on_scan_flag_for_ag() -> None:
     assert preset.always_on_scan is True
     assert preset.stop_required is True
     assert preset.capital_floor_enabled is True
+
+
+def test_aggressive_runner3_checks_single_stop_separately_from_existing_open_risk():
+    engine = RiskEngine(settings=Settings(_env_file=None), preset=get_preset(RiskProfile.AGGRESSIVE_GROWTH))
+    context = _context(equity=80., open_risk=7., aggressive_model_sizing=True)
+    assert engine.evaluate(_proposal(max_loss_if_stopped=8.), context).accepted
+    assert 'MAX_LOSS_EXCEEDS_CAP' in engine.evaluate(_proposal(max_loss_if_stopped=8.01), context).reason_codes
+    context.aggressive_model_sizing = False
+    assert 'TOTAL_OPEN_RISK_CAP' in engine.evaluate(_proposal(max_loss_if_stopped=8.), context).reason_codes

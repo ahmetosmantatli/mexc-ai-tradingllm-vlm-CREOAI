@@ -510,3 +510,27 @@ def test_runner3_guclu_uses_the_text_share_and_falls_back_without_inventing_one(
         runner._final_proposal(
             signal, _runner3_decision(runner, signal, 'htf_zone_choch', higher_break='bullish', margin_share=.01),
             snapshot, control)
+
+
+def test_runner3_aggressive_keeps_explicit_standard_size_and_leverage(tmp_path):
+    runner, private, _, control = prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled = True
+    runner.cfg.live_runner3_aggressive_model_sizing_enabled = True
+    control.update(runner_id='runner3', risk_profile='aggressive_growth', max_leverage=10)
+    runner.configure(control)
+    private.equity = private.available = 50.
+    signal = candidate()
+    decision = _runner3_decision(runner, signal, 'htf_zone_mss', margin_share=.60)
+    decision.metadata['sizing_plan'].update(leverage=10, risk_per_trade_pct=.10)
+    snapshot = runner._refresh([signal.symbol])
+    sized = runner._final_proposal(signal, decision, snapshot, control)
+    assert sized.leverage == 10
+    assert sized.max_loss_if_stopped == pytest.approx(5.)
+    assert sized.stop_loss.price == 98.
+    allocation = sized.metadata['runner3_allocation']
+    assert allocation['grade'] == 'standard'
+    assert allocation['target_margin_usdt'] == pytest.approx(30.)
+    assert allocation['aggressive_model_sizing']
+    decision.metadata['sizing_plan']['risk_per_trade_pct'] = .101
+    with pytest.raises(ValueError, match='model_risk_exceeds_policy'):
+        runner._final_proposal(signal, decision, snapshot, control)

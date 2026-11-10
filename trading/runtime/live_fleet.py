@@ -600,6 +600,12 @@ class LiveFleet:
                 quality='Güçlü' if allocation['grade']=='strong' else 'Standart'
                 text+=f"Teminat hedefi: {allocation['target_margin_usdt']:.4f} USDT | Boyutu sınırlayan: {factor}\n"
                 text+=f"Kanıt kalitesi: {quality} | Kalibre olasılık: ölçülmedi\n"
+                if allocation.get('aggressive_model_sizing') and allocation.get('model_leverage') is not None:
+                    model_leverage = allocation['model_leverage']
+                    chosen = allocation['chosen_leverage']
+                    text += f"Model kaldıracı: {model_leverage:g}x | Uygulanan: {chosen:g}x"
+                    text += (" · Teminat veya likidasyon tamponu modeli sınırlandırdı.\n"
+                             if chosen != model_leverage else "\n")
                 if 'model_risk_fraction' in allocation:
                     text+=(f"Model riski: {allocation['model_risk_fraction']:.2%} | "
                            f"Uygulanan stop bütçesi: {allocation['effective_risk_fraction']:.2%} | "

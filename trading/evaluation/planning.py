@@ -29,15 +29,15 @@ def _usable_margin_share(value):
 class PlanSizing(BaseModel):
     """Leverage and risk are required when a model supplies a sizing plan.
 
-    margin_share is the text model's Güçlü margin as a fraction of equity.
-    A missing or unusable value stays empty so the engine can fall back to 35%.
+    margin_share is a Runner 3 margin target as a fraction of equity.
+    A missing or unusable value stays empty so the policy can select its default.
     It does not reject the rest of the plan and it cannot move the stop.
     """
 
     model_config = ConfigDict(extra='forbid', strict=True, allow_inf_nan=False)
     leverage: int = Field(ge=1)
     risk_per_trade_pct: float = Field(gt=0, le=1, description='Account risk fraction; .01 means 1%.')
-    margin_share: float | None = Field(default=None, description='Güçlü margin as a fraction of equity.')
+    margin_share: float | None = Field(default=None, description='Margin target as a fraction of equity when supported by the active policy.')
 
     @model_validator(mode='before')
     @classmethod

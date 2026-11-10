@@ -257,8 +257,15 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             exchange_max_leverage=verified_leverage_cap,
             open_positions=len(snapshot['positions']),open_risk=sum(r.get('planned_loss',r['proposal']['max_loss_if_stopped']) for r in managed),
             daily_loss_pct=state['daily_loss_pct'],weekly_loss_pct=state['weekly_loss_pct'],drawdown_pct=state['drawdown_pct'],
-            enforce_position_limit=enforce_position_limit)
-        decision=self.risk.evaluate(proposal,context)
+            enforce_position_limit=enforce_position_limit,
+            aggressive_model_sizing=(proposal.metadata.get('runner3_allocation') or {}).get('aggressive_model_sizing') is True
+                and runner3_policy.aggressive_model_sizing(
+                    self.risk.settings, self.risk.preset.profile, proposal.metadata.get('runner_id'), equity))
+        checked_proposal = proposal
+        if context.aggressive_model_sizing:
+            checked_proposal = proposal.model_copy(update={'max_loss_if_stopped': planned_loss})
+            row['entry_stop_loss_cap_usdt'] = equity * runner3_policy.AGGRESSIVE_STOP_RISK_CAP
+        decision=self.risk.evaluate(checked_proposal,context)
         if not decision.accepted:raise LiveExecutionError('deterministic_risk_rejected',reason_codes=getattr(decision,'reason_codes',()))
         row['entry_executable_quote']=entry
         row.update(planned_loss=planned_loss,equity_before=equity,entry_notional=notional,contract_size=rules.size,margin=readiness.planned_margin)
@@ -546,9 +553,11 @@ class ApprovedLiveExecutor(PositionManagementMixin):
                     estimated_target_net_usdt=target_net,
                     estimated_target_r=target_net/actual_risk if actual_risk>0 else None,
                 )
-            if liquidation<=0 or stop_buffer<self.liq_buffer or actual_risk>row['proposal']['max_loss_if_stopped']+1e-8:
+            approved_loss = row['proposal']['max_loss_if_stopped']
+            fill_loss_cap = min(approved_loss, row.get('entry_stop_loss_cap_usdt', approved_loss))
+            if liquidation<=0 or stop_buffer<self.liq_buffer or actual_risk>fill_loss_cap+1e-8:
                 row['fill_risk_check']=dict(
-                    stop_risk_usdt=actual_risk,loss_budget_usdt=row['proposal']['max_loss_if_stopped'],
+                    stop_risk_usdt=actual_risk,loss_budget_usdt=fill_loss_cap,
                     liquidation_price=liquidation,stop_buffer=stop_buffer,min_stop_buffer=self.liq_buffer,
                 )
                 self._halt(row,'filled_position_risk_exceeds_plan')

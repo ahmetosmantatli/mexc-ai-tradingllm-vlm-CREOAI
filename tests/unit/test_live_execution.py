@@ -652,3 +652,28 @@ def test_automatic_position_count_exemption_uses_fresh_equity_and_keeps_total_ri
             executor._preflight(row)
         if expected == 'deterministic_risk_rejected':
             assert error.value.reason_codes == ('TOTAL_OPEN_RISK_CAP',)
+
+
+def test_runner3_aggressive_rechecks_costed_loss_against_fresh_equity(tmp_path):
+    from trading.config import RiskProfile, Settings
+    from trading.risk.engine import RiskEngine
+
+    executor, private, _, _, _ = ioc_case(tmp_path)
+    executor.risk = RiskEngine(Settings(
+        _env_file=None, risk_profile=RiskProfile.AGGRESSIVE_GROWTH,
+        live_runner3_aggressive_model_sizing_enabled=True))
+    planned = proposal(stop_loss=StopLossSpec(price=94.), take_profit_price=112.,
+                       max_loss_if_stopped=8.,
+                       metadata={'runner_id': 'runner3',
+                                 'runner3_allocation': {'aggressive_model_sizing': True}})
+    row = approve(executor, planned)
+    private.assets[0].update(equity=80., availableBalance=80.)
+    executor._preflight(row)
+    assert row['entry_stop_loss_cap_usdt'] == 8.
+    assert 6. < row['planned_loss'] < 8.
+
+    private.assets[0].update(equity=50., availableBalance=50.)
+    with pytest.raises(LiveExecutionError) as exc:
+        executor._preflight(row)
+    assert 'MAX_LOSS_EXCEEDS_CAP' in exc.value.reason_codes
+    assert not private.submits

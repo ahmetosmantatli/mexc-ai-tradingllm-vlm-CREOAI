@@ -174,6 +174,8 @@ class LiveTelegramController(TelegramController):
             text+=f'Seçili yeni işlem runner’ı: {RUNNER_LABELS[selected]}\n'
         else:
             text+='Seçili runner kullanılamıyor. Ayarlar’dan yeniden seç.\n'
+        if selected == 'runner3' and snapshot.get('aggressive_model_sizing'):
+            text+='Agresif model boyutlandırması: açık | İşlem başına stop kaybı tavanı %10.\n'
         effective=snapshot.get('runner_id')
         if effective in RUNNER_LABELS and effective!=selected:
             text+=f'Worker’ın son bildirdiği runner: {RUNNER_LABELS[effective]}\n'

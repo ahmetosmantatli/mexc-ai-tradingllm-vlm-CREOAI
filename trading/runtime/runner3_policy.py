@@ -5,6 +5,8 @@ from time import time
 from zoneinfo import ZoneInfo
 
 COHORT = 'runner3-htf-zone-v3'
+MODEL_SIZING_COHORT = 'runner3-htf-zone-v3-aggressive-model-sizing'
+AGGRESSIVE_STOP_RISK_CAP = .10
 MARGIN_RESERVE_FRACTION = .15
 MIN_NET_TARGET_R = 1.25
 MAX_COST_SHARE = .30
@@ -22,6 +24,12 @@ GUCLU_MARGIN_INSTRUCTION = (
     'At or above 100 USDT the engine keeps its profile margin target. '
     'You do not place the order. One writer does. '
 )
+
+
+def aggressive_model_sizing(settings, profile, runner_id, equity):
+    return (getattr(settings, 'live_runner3_aggressive_model_sizing_enabled', False)
+            and profile == 'aggressive_growth' and runner_id == 'runner3'
+            and type(equity) in (int, float) and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT)
 
 
 def uses_fixed_position_limit(runner_id, equity):
@@ -116,17 +124,20 @@ def chosen_margin_share(metadata):
     return getattr(plan, 'margin_share', None)
 
 
-def apply_guclu_margin_share(allocation, *, equity, available, raw_share):
+def apply_guclu_margin_share(allocation, *, equity, available, raw_share, allow_standard=False):
     """Use the text model's Güçlü share under 100 USDT.
 
-    Standart stays 20% of equity. At or above 100 the profile target stays.
+    Standart defaults to 20%; the opt-in model policy can honor its explicit share.
     Silence or an unusable share falls back to 35% of equity.
     """
-    if allocation.get('grade') != 'strong':
+    strong = allocation.get('grade') == 'strong'
+    if not (strong or allow_standard):
         return allocation
     if isinstance(equity, bool) or not isinstance(equity, (int, float)) or not 0 < equity < SMALL_ACCOUNT_EQUITY_USDT:
         return allocation
     fraction, source = resolve_guclu_margin_share(raw_share)
+    if not strong and source != 'model':
+        return allocation
     target = equity * fraction
     updated = dict(allocation)
     updated.update(
@@ -221,7 +232,7 @@ def drift_respects_choch_risk(*, side, fresh_entry, stop, target, choch_extreme,
 
 
 def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_leverage,
-                            maintenance, initial_rate, fee, liquidation_buffer, margin_target=None):
+                            maintenance, initial_rate, fee, liquidation_buffer, margin_target=None, preferred_leverage=None):
     """Lowest leverage that posts the tightest of the loss budget, margin target, and free margin.
 
     ``notional`` is the CHoCH stop-loss budget. It is a ceiling, not a reason to
@@ -266,6 +277,14 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
         if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and margin < MIN_OPEN_MARGIN_USDT:
             return None
         return leverage, margin, size
+
+    if isinstance(preferred_leverage, (int, float)) and 1 <= preferred_leverage <= cap and preferred_leverage == int(preferred_leverage):
+        leverage = int(preferred_leverage)
+        margin_rate = max(1 / leverage, initial_rate)
+        fitted = min(notional, margin_cap / (margin_rate + fee))
+        selected = fit(leverage, fitted)
+        if selected is not None:
+            return selected
 
     for leverage in range(1, cap + 1):
         selected = fit(leverage, notional)

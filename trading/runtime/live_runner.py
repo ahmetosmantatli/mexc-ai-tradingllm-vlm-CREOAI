@@ -87,7 +87,9 @@ class LiveRunner:
         if self.executor is not None:
             self.executor.risk=self.risk
 
-    def _risk_fraction(self,control):
+    def _risk_fraction(self,control,equity=0):
+        if runner3_policy.aggressive_model_sizing(self.cfg, self.risk.preset.profile, control.get('runner_id'), equity):
+            return runner3_policy.AGGRESSIVE_STOP_RISK_CAP
         requested=control.get('risk_per_trade_pct',self.cfg.risk_per_trade_pct)
         if isinstance(requested,bool) or not isinstance(requested,(int,float)) or not isfinite(requested) or requested<=0:
             raise ValueError('invalid live risk')
@@ -410,6 +412,9 @@ class LiveRunner:
             capital=self._capital(snapshot,control)
             live_context=self._live_context(snapshot,control)
             live_context['runner_id']=control.get('runner_id','baseline-v1')
+            account_equity = snapshot['balance']['equity']
+            live_context['aggressive_model_sizing'] = runner3_policy.aggressive_model_sizing(
+                self.cfg, self.risk.preset.profile, live_context['runner_id'], account_equity)
             # Other parallel candidates' leverage rows are not this symbol's
             # decision evidence. Portfolio positions/risk remain fully supplied.
             for field in ('risk_limits','leverage'):
@@ -438,7 +443,7 @@ class LiveRunner:
                     briefs.append(brief)
                 live_context['open_position_briefs']=briefs
                 live_context['queued_confirmed_plans']=self._queued_confirmed_plans()
-            return evaluator.evaluate_candidates([candidate],equity=capital,risk_per_trade_pct=self._risk_fraction(control),
+            return evaluator.evaluate_candidates([candidate],equity=capital,risk_per_trade_pct=self._risk_fraction(control, account_equity),
                 target_leverage=self._leverage_cap(control,exchange_cap),risk_profile=self.cfg.risk_profile.value,
                 live_account_context=live_context,live_positions=live_positions)
         finally:
@@ -474,8 +479,16 @@ class LiveRunner:
                 drift_cap=abs(planned-planned_stop)/planned
             planning_candidate=apply_market_price_plan(candidate,result.metadata['price_plan'],result.metadata.get('price_evidence') or {},
                 price_step=rules.price_step,current_price=fresh_quote,now=time.time(),max_entry_drift=drift_cap)
+        account_equity = snapshot['balance']['equity']
+        model_sizing = runner3_policy.aggressive_model_sizing(
+            self.cfg, self.risk.preset.profile, runner_id, account_equity)
+        if model_sizing and result.metadata.get('sizing_plan') is None:
+            raise PlanSizingError('aggressive_runner3_requires_explicit_sizing')
+        risk_fraction = self._risk_fraction(control, account_equity)
+        if model_sizing and setup['family'] == 'countertrend_sweep_reclaim':
+            risk_fraction *= .5
         proposal=apply_decision_sizing(planning_candidate,result.metadata.get('sizing_plan'),self._capital(snapshot,control),
-            self._risk_fraction(control),self._leverage_cap(control,exchange_cap),exchange_cap)
+            risk_fraction,self._leverage_cap(control,exchange_cap),exchange_cap)
         if runner_id!='runner3':
             drift_limit = min(planning_candidate.stop_distance_pct / 2, .005)
             if abs(ticker.last_price / planning_candidate.entry_price - 1) > drift_limit:
@@ -508,10 +521,12 @@ class LiveRunner:
         if runner_id == 'runner3':
             grade = runner3_policy.evidence_grade(setup)
             model_fraction = proposal.metadata['risk_per_trade_pct']
-            ceiling = self._risk_fraction(control) * (.5 if setup['family'] == 'countertrend_sweep_reclaim' else 1.)
+            ceiling = risk_fraction
+            if not model_sizing and setup['family'] == 'countertrend_sweep_reclaim':
+                ceiling *= .5
             target_risk = runner3_policy.small_account_risk_target(snapshot['balance']['equity'], ceiling, grade)
             effective = model_fraction
-            if target_risk is not None and not any(row['side'] == side for row in snapshot['positions']):
+            if not model_sizing and target_risk is not None and not any(row['side'] == side for row in snapshot['positions']):
                 effective = max(model_fraction, target_risk)
             if effective > model_fraction:
                 multiplier = effective / model_fraction
@@ -530,7 +545,7 @@ class LiveRunner:
                 runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
                     snapshot['balance']['available'],grade,setup['horizon']),
                 equity=snapshot['balance']['equity'], available=snapshot['balance']['available'],
-                raw_share=runner3_policy.chosen_margin_share(result.metadata))
+                raw_share=runner3_policy.chosen_margin_share(result.metadata), allow_standard=model_sizing)
             free_margin=snapshot['balance']['available']-allocation['reserve_usdt']
             if free_margin<=0:
                 raise ValueError('runner3_margin_reserve')
@@ -550,12 +565,14 @@ class LiveRunner:
             proposal.notional=quantity*entry
             proposal.entry_price=entry
             requested_notional=proposal.notional
+            model_leverage = (proposal.metadata.get('sizing_plan') or {}).get('leverage')
             leverage,margin,sized=runner3_policy.leverage_for_choch_loss(
                 notional=proposal.notional,entry=entry,stop=proposal.stop_loss.price,free_margin=free_margin,
                 margin_target=allocation['target_margin_usdt'],
                 equity=snapshot['balance']['equity'],max_leverage=min(self._leverage_cap(control,exchange_cap),exchange_cap),
                 maintenance=max(rules.maintenance,private_risk['maintenance_rate'],private_leverage['maintenance_rate']),
-                initial_rate=private_risk['initial_rate'],fee=fee,liquidation_buffer=self.cfg.liquidation_buffer_pct)
+                initial_rate=private_risk['initial_rate'],fee=fee,liquidation_buffer=self.cfg.liquidation_buffer_pct,
+                preferred_leverage=model_leverage if model_sizing else None)
             if sized<proposal.notional-1e-8:
                 _,proposal.notional=rules.size_order(sized,entry,leverage)
             proposal.leverage=leverage
@@ -566,6 +583,7 @@ class LiveRunner:
                 limiting_factor=min(limits,key=limits.get)
             proposal.metadata['runner3_allocation']=dict(allocation,limiting_factor=limiting_factor,
                 free_margin_usdt=free_margin,initial_margin_usdt=margin,chosen_leverage=leverage,
+                aggressive_model_sizing=model_sizing,model_leverage=model_leverage,
                 setup_id=setup['setup_id'],evidence_expires_at=setup['evidence'].get('expires_at'),
                 calibrated_probability=None,expected_target_net_r=expected_net/unit_loss,**risk_adjustment)
         proposal.rationale=result.metadata.get('rationale',candidate.rationale)
@@ -917,6 +935,8 @@ class LiveRunner:
             watchlist=watch_snapshot(self.store),leverage_mode=self.cfg.live_leverage_mode,analysis_version=self.cfg.analysis_version,
             htf_zone_scan=self.store.get('htf_zone_scan', {}) if self.runner_id == 'runner3' else {},
             runner_id=self.runner_id,
+            aggressive_model_sizing=runner3_policy.aggressive_model_sizing(
+                self.cfg, self.risk.preset.profile, self.runner_id, (account.get('balance') or {}).get('equity')),
             entry_risk_policy=dict(profile=self.risk.preset.profile.value,daily_loss_limit_pct=self.risk.preset.daily_loss_halt_pct,
                 weekly_loss_limit_enabled=self.risk.preset.weekly_loss_halt_enabled,
                 weekly_loss_limit_pct=self.risk.preset.weekly_loss_halt_pct),

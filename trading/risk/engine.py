@@ -25,6 +25,7 @@ class RiskContext:
     always_on_scan: bool = True
     halt_new_risk: bool = False
     enforce_position_limit: bool = True
+    aggressive_model_sizing: bool = False
 
 
 @dataclass
@@ -87,6 +88,9 @@ class RiskEngine:
             reasons.append("EQUITY_ZERO_HALT")
 
         risk_cap = min(preset.risk_per_trade_pct, preset.abs_max_loss_pct, self.settings.abs_max_loss_pct, self.settings.risk_per_trade_pct)
+        if context.aggressive_model_sizing:
+            from trading.runtime.runner3_policy import AGGRESSIVE_STOP_RISK_CAP
+            risk_cap = AGGRESSIVE_STOP_RISK_CAP
         max_allowed_loss = equity * risk_cap
         if proposal.max_loss_if_stopped > max_allowed_loss + 1e-9:
             reasons.append("MAX_LOSS_EXCEEDS_CAP")
@@ -115,7 +119,8 @@ class RiskEngine:
         if context.enforce_position_limit and context.open_positions >= preset.max_concurrent_positions:
             reasons.append("MAX_CONCURRENT_POSITIONS")
 
-        if context.open_risk + proposal.max_loss_if_stopped > equity * preset.total_open_risk_pct + 1e-9:
+        if (not context.aggressive_model_sizing
+                and context.open_risk + proposal.max_loss_if_stopped > equity * preset.total_open_risk_pct + 1e-9):
             reasons.append("TOTAL_OPEN_RISK_CAP")
 
         if context.daily_loss_pct >= preset.daily_loss_halt_pct:
