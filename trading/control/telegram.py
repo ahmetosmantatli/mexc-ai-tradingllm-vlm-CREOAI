@@ -244,6 +244,8 @@ class TelegramController:
             text+=(f"{group['provider']} / {group['model']} / {group['quota_group']}\n"
                    f"Kalan günlük istek {group.get('requests_daily_remaining','?')} | dk istek {group.get('requests_minute_remaining','?')} | "
                    f"dk token tahmini {group.get('tokens_minute_remaining_estimate','?')} | Meşgul: {'evet' if group.get('in_flight') else 'hayır'}\n")
+            if group.get('provider')=='groq':
+                text+=f"Günlük kalan token (tahmini): {group.get('tokens_daily_remaining_estimate', '?')}\n"
             if group.get('provider')=='cloudflare':
                 text+=f"Neuron ayrılan/tahmini: {group.get('neurons_reserved_or_estimated',0):.1f} / yerel bütçe {group.get('neuron_budget',0):.0f}; sağlayıcı faturası değil.\n"
         resets=sorted({g['next_daily_reset_at'] for g in groups if g.get('provider')=='gemini' and g.get('next_daily_reset_at')})

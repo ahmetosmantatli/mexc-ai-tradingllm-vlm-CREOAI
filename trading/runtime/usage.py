@@ -6,7 +6,7 @@ TRACE_FIELDS += ('runner_id','account_id','task','queued_at','strategy_cohort','
 ATTEMPT_FIELDS=('provider','model','provider_reported','status','phase','http_status','error_category','error_code','error_param','latency_ms','generation_requests','count_requests','input_tokens','output_tokens','estimated_cost_usd','pending_usd','estimated_input_tokens','token_budget','completion_token_limit','output_stop_reason','validation_issues','credential_id','quota_group','retry_number','retry_after_seconds','daily_quota_exhausted')
 
 
-ATTEMPT_FIELDS += ('neuron_reserved_estimate','review_mode')
+ATTEMPT_FIELDS += ('neuron_reserved_estimate','review_mode','local_daily_probe')
 
 
 def usage_task(trace):

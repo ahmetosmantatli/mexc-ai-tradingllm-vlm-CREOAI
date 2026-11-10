@@ -657,3 +657,58 @@ def test_nvidia_text_fallback_after_primary_failure(tmp_path):
     provider, _ = pool(tmp_path, cfg, transport)
     assert provider.complete_json(system='s', user='u') == {'action': 'hold'}
     assert hosts == ['api.groq.com', 'integrate.api.nvidia.com']
+
+
+def test_groq_local_daily_probe_checks_real_route_once_even_when_gemini_is_available(tmp_path):
+    from trading.agents.provider_pool import GROQ_DAILY_PROBE_KEY
+
+    calls = []
+
+    def transport(request):
+        calls.append(request.url.host)
+        if request.url.host == 'api.groq.com':
+            return httpx.Response(429, headers={'Retry-After': '120'}, json={})
+        return response()
+
+    cfg = settings(groq_daily_probe_enabled=True, groq_tpd=12_000,
+                   gemini_api_key='gemini-test', ai_primary_provider='gemini')
+    provider, store = pool(tmp_path, cfg, transport)
+    groq = next(slot for slot in provider._slots if slot.provider == 'groq')
+    key = provider._quota_key(groq, False)
+    store.put(key, dict(rows=[dict(id='prior', at=time.time()-90, tokens=12_000)]))
+    assert provider.complete_json(system='s', user='u') == {'action': 'hold'}
+    assert calls[0] == 'api.groq.com'
+    probe, gemini = provider.last_trace['attempts']
+    assert probe['local_daily_probe'] is True and probe['http_status'] == 429
+    assert gemini['provider'] == 'gemini' and gemini['status'] == 'success'
+    assert provider.fork().complete_json(system='s', user='u') == {'action': 'hold'}
+    # Expire only the local probe throttle, not the provider's Retry-After.
+    store.put(GROQ_DAILY_PROBE_KEY, time.time()-61)
+    assert provider.fork().complete_json(system='s', user='u') == {'action': 'hold'}
+    assert calls.count('api.groq.com') == 1
+
+
+def test_groq_daily_probe_preserves_request_size_and_minute_guards(tmp_path):
+    provider, store = pool(tmp_path, settings(groq_daily_probe_enabled=True, groq_tpd=12_000),
+                           lambda request: pytest.fail('ineligible probe was sent'))
+    slot = provider._slots[0]
+    key = provider._quota_key(slot, False)
+    rows = [dict(id='prior', at=time.time()-90, tokens=12_000)]
+    store.put(key, dict(rows=rows))
+    assert provider.complete_json(system='s', user='x'*50_000) is None
+    rows.append(dict(id='recent', at=time.time(), tokens=8_000))
+    store.put(key, dict(rows=rows))
+    assert provider.complete_json(system='s', user='u') is None
+
+
+def test_groq_daily_probe_accepts_a_valid_decision_without_calling_another_route(tmp_path):
+    calls = []
+    provider, store = pool(tmp_path, settings(groq_daily_probe_enabled=True, groq_tpd=12_000),
+                           lambda request: calls.append(request.url.host) or response())
+    slot = provider._slots[0]
+    store.put(provider._quota_key(slot, False), dict(rows=[dict(id='prior', at=time.time()-90, tokens=12_000)]))
+    assert provider.analysis_capacity(prompt_bytes=100)['parallel_candidates'] == 1
+    assert provider.complete_json(system='s', user='u') == {'action': 'hold'}
+    assert provider.last_trace['attempts'][0]['local_daily_probe'] is True
+    assert provider.fork().complete_json(system='s', user='u') is None
+    assert calls == ['api.groq.com']

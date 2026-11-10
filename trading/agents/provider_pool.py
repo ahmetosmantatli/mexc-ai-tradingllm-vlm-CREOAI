@@ -28,6 +28,10 @@ from trading.agents.telemetry import is_model_output_failure
 from trading.evaluation.context import COMPACT_SYSTEM, compact_decision_packet
 
 
+GROQ_DAILY_PROBE_KEY = 'pool:groq:daily_probe_at'
+GROQ_DAILY_PROBE_INTERVAL = 60
+
+
 class PrefixStore:
     """Namespace subrouter cooldown/usage; outer regulator owns all quota SQL."""
     def __init__(self, store, prefix):
@@ -318,6 +322,10 @@ class ProviderPool:
         state['used']=True
         self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',('pool:capacity_probe',json.dumps(state)))
 
+    def _groq_daily_probe_due(self, now):
+        return (self.settings.groq_daily_probe_enabled
+                and now >= self.store.get(GROQ_DAILY_PROBE_KEY, 0) + GROQ_DAILY_PROBE_INTERVAL)
+
     def _reserve(self, candidates, system, user, max_tokens, images):
         """Choose and lease one model pool atomically; never hold DB locks during HTTP."""
         now=time.time()
@@ -326,10 +334,11 @@ class ProviderPool:
         with self.store.lock,self.store.db:
             self.store.db.execute('BEGIN IMMEDIATE')
             admit=self._admitted_probe()
+            daily_probe_due=self._groq_daily_probe_due(now)
             choices=[]
             for slot in candidates:
                 if not self._supports(slot,images):continue
-                probe=slot.label==admit
+                probe=slot.label==admit and not (slot.provider=='groq' and self.settings.groq_daily_probe_enabled)
                 if not probe and hasattr(slot.router,'capacity_available') and not slot.router.capacity_available():continue
                 if hasattr(slot.router,'request_fits'):
                     slot.router.decision_schema=self.decision_schema
@@ -354,8 +363,11 @@ class ProviderPool:
                 rpm,tpm,rpd,tpd=self._limits(slot,images)
                 minute_tokens=sum(row['tokens'] for row in recent)
                 daily_tokens=sum(row['tokens'] for row in daily)
-                if not probe and ((rpm and len(recent)+1>rpm) or (tpm and minute_tokens+tokens>tpm)
-                        or (rpd and len(daily)+1>rpd) or (tpd and daily_tokens+tokens>tpd)):
+                minute_full = (rpm and len(recent)>=rpm) or (tpm and minute_tokens+tokens>tpm)
+                daily_full = (rpd and len(daily)>=rpd) or (tpd and daily_tokens+tokens>tpd)
+                daily_probe = bool(not probe and daily_full and slot.provider=='groq' and not images
+                                   and daily_probe_due)
+                if not probe and (minute_full or (daily_full and not daily_probe)):
                     continue
                 utilization=max((len(recent)/rpm if rpm else 0),
                     minute_tokens/tpm if tpm else 0,len(daily)/rpd if rpd else 0,
@@ -364,17 +376,23 @@ class ProviderPool:
                 if not probe and slot.provider == 'nvidia':
                     priority = 2
                 same_model=0 if self._model(slot,images)==preferred_model else 1
-                choices.append((priority,same_model,utilization,state.get('last_used',0),slot.label,slot,key,state,rows,tokens))
+                # A due Groq check uses an existing analysis, even when another provider is available.
+                if daily_probe:
+                    priority, same_model, utilization = -1, 0, 0
+                choices.append((priority,same_model,utilization,state.get('last_used',0),slot.label,slot,key,state,rows,tokens,daily_probe))
             if not choices:
                 return None
-            _,_,_,_,_,slot,key,state,rows,tokens=min(choices,key=lambda row:row[:5])
+            _,_,_,_,_,slot,key,state,rows,tokens,daily_probe=min(choices,key=lambda row:row[:5])
+            if daily_probe:
+                self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',
+                                      (GROQ_DAILY_PROBE_KEY,json.dumps(now)))
             if slot.label==admit:
                 self._consume_probe_locked(slot.label)
             lease_id=uuid4().hex
             state.update(rows=rows+[dict(id=lease_id,at=now,tokens=tokens)],last_used=now,
                 lease=dict(id=lease_id,until=now+self.settings.ai_provider_timeout_seconds+15))
             self.store.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(key,json.dumps(state)))
-            return slot,key,lease_id,tokens
+            return slot,key,lease_id,tokens,daily_probe
 
     def _release(self,key,lease_id,attempt=None,cooldown=0,*,forget=False,hold_slot=None):
         with self.store.lock,self.store.db:
@@ -533,7 +551,8 @@ class ProviderPool:
             return dict(admitted=state['label'], probed=False)
         slots=[]
         for slot in self._slots:
-            if slot.provider == 'nvidia' or not self._supports(slot, images):
+            if (slot.provider == 'nvidia' or not self._supports(slot, images)
+                    or slot.provider == 'groq' and self.settings.groq_daily_probe_enabled):
                 continue
             if prompt_bytes is not None:
                 tokens=self._sized(slot, '', '', 1100, images, prompt_bytes=prompt_bytes)
@@ -589,6 +608,7 @@ class ProviderPool:
         """
         self._reload_external()
         now=time.time();free=0;details=[];seen=set();admit=self._admitted_probe()
+        daily_probe_due=self._groq_daily_probe_due(now)
         for slot in self._slots:
             if not self._supports(slot,images):continue
             key=self._quota_key(slot,images)
@@ -609,13 +629,19 @@ class ProviderPool:
             if external_ok and hasattr(slot.router,'request_fits'):
                 external_ok=slot.router.request_fits('','x'*min(200000,max(0,int(prompt_bytes))+5000),max_tokens,[None]*3 if images else None)
             fits=self._fits_model(slot, estimate, images, state)
-            opened=fits and slot.label==admit and not busy
-            quota_ok=(not rpm or len(minute)<rpm) and (not tpm or sum(row['tokens'] for row in minute)+estimate<=tpm) and (not rpd or len(day)<rpd) and (not tpd or sum(row['tokens'] for row in day)+estimate<=tpd)
-            allowed=opened or (fits and external_ok and not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now) and quota_ok)
+            opened=(fits and slot.label==admit and not busy
+                    and not (slot.provider=='groq' and self.settings.groq_daily_probe_enabled))
+            minute_ok=(not rpm or len(minute)<rpm) and (not tpm or sum(row['tokens'] for row in minute)+estimate<=tpm)
+            daily_ok=(not rpd or len(day)<rpd) and (not tpd or sum(row['tokens'] for row in day)+estimate<=tpd)
+            daily_probe = not daily_ok and slot.provider=='groq' and not images and daily_probe_due
+            allowed=opened or (fits and external_ok and not busy and not cooling and not blocked(state.get('provider_reported',{}),estimate,now)
+                               and minute_ok and (daily_ok or daily_probe))
             free+=int(allowed)
+            if allowed and daily_probe and not opened:
+                daily_probe_due=False
             if not fits:reason='does-not-fit'
             elif opened:reason='probe_admitted'
-            elif allowed:reason='available'
+            elif allowed:reason='local_daily_probe' if daily_probe else 'available'
             elif busy:reason='in_flight'
             elif cooling or blocked(state.get('provider_reported',{}),estimate,now) or (rpm and len(minute)>=rpm) or (tpm and sum(row['tokens'] for row in minute)+estimate>tpm):reason='window-full'
             elif (rpd and len(day)>=rpd) or (tpd and sum(row['tokens'] for row in day)+estimate>tpd):reason='daily-full'
@@ -663,7 +689,7 @@ class ProviderPool:
         return result
 
     def _attempt(self,reservation,system,user,max_tokens,images,*,vision_probe=False):
-        slot,key,lease_id,tokens=reservation
+        slot,key,lease_id,tokens,daily_probe=reservation
         self.last_credential_id=slot.label
         self.last_quota_group=self._group_label(slot, images)
         self.last_provider=slot.provider
@@ -678,6 +704,8 @@ class ProviderPool:
             attempts=copy.deepcopy(trace.get('attempts',[]))
             for item in attempts:
                 item.update(slot=slot.label,credential_id=slot.label,quota_group=self._group_label(slot, images),quota_estimated_tokens=tokens)
+                if daily_probe:
+                    item['local_daily_probe'] = True
             self.last_trace['attempts']=self.last_trace['attempts'][:base]+attempts
             self._notify()
         router.on_trace=progress

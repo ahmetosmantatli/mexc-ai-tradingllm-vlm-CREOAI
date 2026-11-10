@@ -214,6 +214,7 @@ class Settings(BaseSettings):
     groq_tpm: int = Field(default=8000,ge=1)
     groq_rpd: int = Field(default=1000,ge=1)
     groq_tpd: int = Field(default=200000,ge=1)
+    groq_daily_probe_enabled: bool = False
     gemini_rpm: int = Field(default=15,ge=1)
     gemini_tpm: int = Field(default=250000,ge=1)
     gemini_rpd: int = Field(default=500,ge=1)
