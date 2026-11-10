@@ -701,6 +701,91 @@ def test_groq_daily_probe_preserves_request_size_and_minute_guards(tmp_path):
     assert provider.complete_json(system='s', user='u') is None
 
 
+def _decision_hold():
+    body=dict(action='hold', signal_id=None, rationale='Geçerli bekleme kararı.',
+              invalidation='Kurulum bozulursa bekleme biter.', watch_note='')
+    return httpx.Response(200, json=dict(choices=[dict(message=dict(content=json.dumps(body)))],
+                                          usage=dict(prompt_tokens=100, completion_tokens=20)))
+
+
+def _nvidia_models(*names):
+    return [dict(model=f'nvidia/{name}', context_length=65536, max_output=2048, format='json_object')
+            for name in names]
+
+
+def test_gemini_is_selected_before_any_nvidia_model(tmp_path):
+    from trading.agents.external_catalog import CF_MODELS, ExternalRoute
+    from trading.evaluation.service import ModelDecision
+
+    ident=next(iter(CF_MODELS))
+    context, vision, neuron_input, neuron_output=CF_MODELS[ident]
+    route=ExternalRoute(provider='cloudflare', model=ident, context_length=context, max_output=8192,
+                        vision=vision, format='json_schema', neuron_input=neuron_input, neuron_output=neuron_output)
+    manifest=tmp_path/'external-models.json'
+    manifest.write_text(json.dumps(dict(version=1, observed_at=time.time(), routes=[route.model_dump()], reports=[])))
+    hosts=[]
+
+    def transport(request):
+        hosts.append(request.url.host)
+        return _decision_hold()
+
+    cfg=settings(groq_api_key='', gemini_api_key='gemini-key', ai_primary_provider='groq',
+                 nvidia_api_key='nvidia-test-key', nvidia_models=json.dumps(_nvidia_models('a', 'b', 'c', 'd')),
+                 nvidia_local_rpm=40, external_models_enabled=True, external_models_file=str(manifest),
+                 cloudflare_api_token='secret-cf', cloudflare_account_id='a'*32, cloudflare_free_plan_confirmed=True,
+                 anthropic_api_key='paid', ai_claude_fallback_enabled=True)
+    provider, store=pool(tmp_path, cfg, transport)
+    assert any(slot.provider=='nvidia' for slot in provider._slots)
+    assert any(slot.provider=='cloudflare' for slot in provider._slots)
+    gemini=next(slot for slot in provider._slots if slot.provider=='gemini')
+    store.put(provider._quota_key(gemini, False), dict(rows=[], last_used=time.time(), lease=None))
+    provider.response_validator=ModelDecision.model_validate
+    provider.claude.complete_json=lambda **kwargs: pytest.fail('valid BEKLE must not start fallback')
+    assert provider.complete_json(system='s', user='u')['action']=='hold'
+    assert hosts==['generativelanguage.googleapis.com']
+    assert provider.last_provider=='gemini'
+
+
+def test_two_nvidia_timeouts_stop_the_review(tmp_path):
+    models=[]
+
+    def transport(request):
+        models.append(json.loads(request.content)['model'])
+        raise httpx.ReadTimeout('timed out', request=request)
+
+    cfg=settings(groq_api_key='', gemini_api_key='', nvidia_api_key='nvidia-test-key',
+                 nvidia_models=json.dumps(_nvidia_models('a', 'b', 'c', 'd', 'e', 'f')),
+                 nvidia_local_rpm=40, ai_pool_max_generation_requests=8, ai_pool_max_retry_attempts=1,
+                 anthropic_api_key='paid', ai_claude_fallback_enabled=True)
+    provider, _store=pool(tmp_path, cfg, transport)
+    provider.claude.complete_json=lambda **kwargs: pytest.fail('two NVIDIA timeouts must stop the review')
+    assert provider.complete_json(system='s', user='u') is None
+    assert len(models)==2 and len(set(models))==2
+    assert provider.last_fallback_reason=='nvidia_timeout_cap'
+    assert [row['error_category'] for row in provider.last_trace['attempts']]==['network_timeout', 'network_timeout']
+
+
+def test_oversized_packet_skips_8k_model(tmp_path):
+    from trading.evaluation.service import ModelDecision
+
+    hosts=[]
+
+    def transport(request):
+        hosts.append(request.url.host)
+        return _decision_hold()
+
+    cfg=settings(gemini_api_key='gemini-key', ai_primary_provider='groq',
+                 nvidia_api_key='nvidia-test-key', nvidia_models=json.dumps(_nvidia_models('wide')),
+                 anthropic_api_key='paid', ai_claude_fallback_enabled=True)
+    provider, _store=pool(tmp_path, cfg, transport)
+    provider.response_validator=ModelDecision.model_validate
+    provider.claude.complete_json=lambda **kwargs: pytest.fail('valid BEKLE must not start fallback')
+    assert provider.complete_json(system='s', user='x'*38400)['action']=='hold'
+    assert hosts==['generativelanguage.googleapis.com']
+    groq=next(row for row in provider.snapshot()['groups'] if row['provider']=='groq')
+    assert groq['requests_daily_remaining']==1000
+
+
 def test_groq_daily_probe_accepts_a_valid_decision_without_calling_another_route(tmp_path):
     calls = []
     provider, store = pool(tmp_path, settings(groq_daily_probe_enabled=True, groq_tpd=12_000),
