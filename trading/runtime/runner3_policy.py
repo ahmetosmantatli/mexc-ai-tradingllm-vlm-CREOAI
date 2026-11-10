@@ -348,6 +348,64 @@ def cost_adjusted_r(*, side, entry, stop, target, fee, slippage):
     return net / loss
 
 
+ENTRY_GATE_BEGIN = 'Runner 3 entry gate, checked before you propose and again by the engine:'
+ENTRY_GATE_END = 'End Runner 3 entry gate.'
+
+
+def _cost_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
+        return None
+    return float(value)
+
+
+def prompt_entry_costs(settings, costs=None):
+    """Fee and exit slippage the live entry prompt must state.
+
+    A supplied executor pair wins. Otherwise the settings pair is the same
+    default the executor uses when it is constructed without an override.
+    """
+    fee = _cost_number(getattr(settings, 'paper_fee_rate', None))
+    bps = _cost_number(getattr(settings, 'paper_slippage_bps', None))
+    slippage = None if bps is None else bps / 10000
+    if isinstance(costs, dict):
+        supplied_fee = _cost_number(costs.get('fee'))
+        supplied_slip = _cost_number(costs.get('slippage'))
+        if supplied_fee is not None and supplied_slip is not None:
+            return supplied_fee, supplied_slip
+    if fee is None or slippage is None:
+        raise ValueError('runner3_entry_cost_assumptions')
+    return fee, slippage
+
+
+def entry_gate_instruction(*, fee, slippage):
+    """Prompt text for the cost gate validate_economics still enforces."""
+    fee = _cost_number(fee)
+    slippage = _cost_number(slippage)
+    if fee is None or slippage is None:
+        raise ValueError('runner3_entry_cost_assumptions')
+    lines = (
+        ENTRY_GATE_BEGIN,
+        'Before you propose an entry, apply this deterministic gate. The engine still runs it after you answer and still rejects a failure.',
+        f'Runner 3 minimum cost-adjusted R is {MIN_NET_TARGET_R:.2f}.',
+        f'Fee assumption is {fee:.4f} per side. Exit-slippage assumption is {slippage:.4f} ({slippage * 10000:.0f} bps), applied to the stop and the target.',
+        'direction is 1 for long and -1 for short.',
+        'stop_fill = stop * (1 - direction * slippage).',
+        'target_fill = target * (1 - direction * slippage).',
+        'loss = abs(entry - stop_fill) + fee * (entry + stop_fill).',
+        'net = direction * (target_fill - entry) - fee * (entry + target_fill).',
+        'cost_adjusted_R = net / loss.',
+        'gross = abs(target - entry).',
+        f'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < {MIN_NET_TARGET_R:.2f}, and when gross <= 0 or (gross - net) / gross > {MAX_COST_SHARE:.2f}.',
+        f'The continuous equity stop cap is {CONTINUOUS_STOP_RISK_CAP:.0%} of equity. One stop cannot lose more than that fraction of equity.',
+        f'When continuous aggressive is off, aggressive model sizing uses the {AGGRESSIVE_STOP_RISK_CAP:.0%} equity stop cap.',
+        f'A proposal whose target fails that R must be BEKLE (action hold) or a farther target on the supplied target reference that clears {MIN_NET_TARGET_R:.2f}, not ENTER (action trade).',
+        'Do not move the stop to manufacture R. Do not invent a setup or a target reference.',
+        'Do not invent a trade when you are silent.',
+        ENTRY_GATE_END,
+    )
+    return '\n'.join(lines)
+
+
 def thesis_invalidated(position, price):
     """The open thesis is invalidated only when price has crossed its structural level."""
     if not isinstance(position, dict):

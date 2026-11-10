@@ -439,6 +439,13 @@ class LiveRunner:
                 note='Maximum is an upper bound, not a target. Use a validated grounded price plan only when price planning is enabled, otherwise keep quant levels. Preserve loss budget and liquidation buffer; choose lower leverage or HOLD when incompatible.')
             live_positions=self._positions(snapshot)
             if control.get('runner_id')=='runner3':
+                fee=self.cfg.paper_fee_rate
+                slip=self.cfg.paper_slippage_bps/10000
+                executor=self.executor
+                if executor is not None:
+                    fee=getattr(executor,'fee',fee)
+                    slip=getattr(executor,'slip',slip)
+                live_context['runner3_entry_costs']=dict(fee=fee,slippage=slip)
                 briefs=[]
                 for row in live_positions.values():
                     brief=runner3_policy.position_brief(row)
