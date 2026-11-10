@@ -1056,10 +1056,14 @@ def test_summary_packet_sends_closed_choch_and_the_fast_path_reads_it(tmp_path, 
     user = model.calls[0]['user']
     assert '424242.5' not in user
     compact = json.loads(compact_decision_packet(user))
-    assert compact['summary']['kind'] == 'closed_choch_at_block_or_flow'
-    assert compact['zone'] and compact['closed_choch_mss']
-    assert compact['entry'] and compact['stop'] and compact['opposing_target_levels']
+    assert compact['setups']
+    assert any(row.get('closed_choch_price') for row in compact['setups'])
+    assert any(row.get('stop') for row in compact['setups'])
+    assert any((row.get('block_or_flow') or {}).get('kind') in ('block', 'flow') for row in compact['setups'])
+    assert any(row.get('next_target') for row in compact['setups'])
+    assert compact['atr'] and isinstance(compact['swings'], list)
     assert '424242.5' not in json.dumps(compact)
+    assert 'recent_ohlcv' not in json.dumps(compact)
     routed, _routed_store = pool(tmp_path / 'pool', settings())
     _system, outbound = routed._prepared(routed._slots[0], model.calls[0]['system'], user, 700, None)
     assert json.loads(outbound)['context_policy'] == 'pa-context-v4-compact'

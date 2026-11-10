@@ -406,8 +406,11 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
     raw = json.dumps(dict(context_policy='pa-context-v4', account=dict(runner3_entry_gate=text, equity=10),
                           market=dict(symbol='LAB_USDT')), separators=(',', ':'))
     packet = json.loads(compact_decision_packet(raw))
-    assert packet['entry_gates'] == text
+    assert packet['gates']['cost_adjusted_r'] == 1.25
+    assert packet['gates']['equity_stop'] == '15%'
+    assert 'free_margin' in packet['gates']
     assert packet['symbol'] == 'LAB_USDT'
+    assert 'stop_fill' not in compact_decision_packet(raw)
 
 
 def test_a_farther_supplied_target_is_allowed_and_the_floor_stays():
