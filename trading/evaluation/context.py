@@ -142,8 +142,10 @@ def compact_decision_packet(user):
     """Smaller user packet for an 8K TPM model. Required decision fields stay intact.
 
     Returns canonical JSON, or None when the text is not a decision packet.
-    Callers must not delete zone, touch, CHoCH/MSS, why, BTC/ETH, equity,
-    free margin, open positions, or the confirming candles to force a fit.
+    Callers must not delete zone, touch, CHoCH/MSS, the supplied opposing
+    target levels, entry, stop, why, BTC/ETH, equity, free margin, open
+    positions, or the confirming candles to force a fit. The entry-gate text
+    keeps the fee, exit slippage, 1.25 floor, and equity stop cap.
     The full packet used for Gemini is never rewritten here.
     """
     if not isinstance(user, str) or not user.startswith('{'):
@@ -172,11 +174,14 @@ def compact_decision_packet(user):
         trigger = option.get('trigger_timeframe')
         if trigger:
             confirm.add(trigger)
+        levels = option.get('opposing_target_levels')
         kept.append(dict(setup_id=option.get('setup_id'), state=option.get('state'), side=option.get('side'),
                          horizon=option.get('horizon'), context_timeframe=option.get('context_timeframe'),
                          trigger_timeframe=trigger, zone=evidence.get('zone'), touch_at=evidence.get('touch_at'),
-                         closed_choch_mss=shift, stop=option.get('stop_loss_price', option.get('stop')),
+                         closed_choch_mss=shift, entry=option.get('entry_reference', option.get('entry')),
+                         stop=option.get('stop_loss_price', option.get('stop')),
                          target=option.get('take_profit_price', option.get('target')),
+                         opposing_target_levels=levels if isinstance(levels, list) else [],
                          reason=option.get('caveat') or evidence.get('kind')))
     if not confirm:
         confirm = {'15m', '5m'}
@@ -207,7 +212,9 @@ def compact_decision_packet(user):
     packet = dict(context_policy='pa-context-v4-compact',
                   symbol=(data.get('candidate') or {}).get('symbol') if isinstance(data.get('candidate'), dict) else market.get('symbol'),
                   zone=[row.get('zone') for row in kept], touch=[row.get('touch_at') for row in kept],
-                  closed_choch_mss=[row.get('closed_choch_mss') for row in kept], why=why,
+                  closed_choch_mss=[row.get('closed_choch_mss') for row in kept],
+                  entry=[row.get('entry') for row in kept], stop=[row.get('stop') for row in kept],
+                  opposing_target_levels=[row.get('opposing_target_levels') for row in kept], why=why,
                   text_decision_why=text.get('rationale'), benchmarks=benchmarks, equity=equity,
                   free_margin=free_margin, open_positions=positions if positions is not None else [],
                   confirming_candles=candles, setups=kept)

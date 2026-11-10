@@ -367,11 +367,14 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
         'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < 1.25, and when gross <= 0 or (gross - net) / gross > 0.30.',
         'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
         'When continuous aggressive is off, aggressive model sizing uses the 10% equity stop cap.',
-        'A proposal whose target fails that R must be BEKLE (action hold) or a farther target on the supplied target reference that clears 1.25, not ENTER (action trade).',
-        'Do not move the stop to manufacture R. Do not invent a setup or a target reference.',
+        'When the setup is real (zone, touch, and a later closed CHoCH/MSS), first choose a farther target that is one of the supplied opposing target levels and whose cost-adjusted R clears 1.25.',
+        'BEKLE (action hold) only when none of the supplied levels clears 1.25.',
+        'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
     ):
         assert line in text
+    assert 'must be BEKLE (action hold) or a farther target' not in text
+    assert text.index('first choose a farther target') < text.index('BEKLE (action hold) only when none')
     compact_system = system_with_entry_gate(COMPACT_SYSTEM, 'full policy\n' + text + '\nmore')
     assert 'cost_adjusted_R = net / loss.' in compact_system
     assert 'The continuous equity stop cap is 15% of equity.' in compact_system
@@ -381,3 +384,36 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
     packet = json.loads(compact_decision_packet(raw))
     assert packet['entry_gates'] == text
     assert packet['symbol'] == 'LAB_USDT'
+
+
+def test_a_farther_supplied_target_is_allowed_and_the_floor_stays():
+    from time import time
+
+    from trading.evaluation.price_plan import CandleReference, MarketPricePlan
+    from trading.runtime.runner3_policy import MIN_NET_TARGET_R, validate_evidence
+
+    assert MIN_NET_TARGET_R == 1.25
+    near = dict(timeframe='4h', open_time=2, field='high', price=110.)
+    far = dict(timeframe='4h', open_time=3, field='high', price=130.)
+    stop = CandleReference(timeframe='15m', open_time=1, field='low')
+    setup = dict(
+        side='long', state='ready', context_timeframe='4h', trigger_timeframe='15m',
+        evidence=dict(kind='htf_zone_mss', stage='confirmed', expires_at=time() + 60),
+        stop_loss_price=90., stop_reference=stop.model_dump(),
+        target_reference={key: near[key] for key in ('timeframe', 'open_time', 'field')},
+        opposing_target_levels=[near, far])
+    plan = MarketPricePlan(
+        entry_type='market', entry_price=100, stop_loss_price=90, take_profit_price=130,
+        entry_timeframe='15m', stop_reference=stop,
+        target_reference=CandleReference(timeframe='4h', open_time=3, field='high'),
+        reason='Daha uzak verilen seviye maliyeti aşıyor.')
+    validate_evidence(setup, plan)
+    invented = plan.model_copy(update={
+        'target_reference': CandleReference(timeframe='4h', open_time=9, field='high')})
+    with pytest.raises(ValueError, match='runner3_target_reference_mismatch'):
+        validate_evidence(setup, invented)
+    with pytest.raises(ValueError, match='runner3_structural_stop_too_tight'):
+        validate_evidence(setup, plan.model_copy(update={'stop_loss_price': 95}))
+    validate_economics(1.5, 1.25, 1.)
+    with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
+        validate_economics(1.5, 1.249, 1.)

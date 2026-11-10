@@ -39,7 +39,10 @@ def _packet():
                                              open_positions=[{'symbol': 'BNB_USDT', 'side': 'long'}]),
                      setup_selection=dict(options=[dict(
                          setup_id='setup-1', state='ready', side='long', trigger_timeframe='15m',
-                         context_timeframe='4h', stop_loss_price=9.5, take_profit_price=14,
+                         context_timeframe='4h', entry_reference=11, stop_loss_price=9.5, take_profit_price=14,
+                         opposing_target_levels=[
+                             dict(timeframe='4h', open_time=80, field='high', price=14),
+                             dict(timeframe='4h', open_time=40, field='high', price=18)],
                          evidence=dict(zone=zone, touch_at=280, shift=shift))])),
         open_positions=[{'symbol': 'BNB_USDT', 'side': 'long', 'margin': 5}],
         what_changed=dict(summary='algoritma nedeni'),
@@ -53,6 +56,13 @@ def test_compact_packet_keeps_the_decision_fields_and_drops_the_padded_history()
     assert compact['zone']==[dict(timeframe='4h', direction='bullish', low=10.5, high=12.25, open_time=100, confirmed_at=200)]
     assert compact['touch']==[280]
     assert compact['closed_choch_mss']==[dict(kind='choch', at=300, direction='bullish', level=11)]
+    assert compact['entry']==[11]
+    assert compact['stop']==[9.5]
+    assert compact['opposing_target_levels']==[[
+        dict(timeframe='4h', open_time=80, field='high', price=14),
+        dict(timeframe='4h', open_time=40, field='high', price=18)]]
+    assert compact['setups'][0]['opposing_target_levels']==compact['opposing_target_levels'][0]
+    assert compact['equity']==80 and compact['free_margin']==42.5
     assert compact['why']=='Bölge tuttu ve teyit mumu kapandı.'
     assert compact['text_decision_why']==compact['why']
     assert compact['benchmarks']['BTC_USDT']['4h']['trend']=='bullish'

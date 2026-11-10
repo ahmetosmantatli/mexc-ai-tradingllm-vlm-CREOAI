@@ -303,6 +303,9 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     possible = [ref for ref in targets if (ref['price'] > entry if long else ref['price'] < entry)]
     if not possible:
         return None
+    # Nearest opposing level stays the default. Farther supplied levels stay on
+    # the setup so the model can clear the cost floor without inventing a price.
+    ordered = sorted(possible, key=lambda ref: (ref['price'] if long else -ref['price'], ref['open_time']))
     target_ref = min(possible, key=lambda ref: abs(ref['price'] - entry))
     target = _tick(target_ref['price'], price_step, up=not long)
     if not (0 < stop < entry < target if long else 0 < target < entry < stop):
@@ -326,7 +329,8 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
                     trigger=trigger, state=state, stop=stop, target=target)
     ident = sha256(json.dumps(material, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:24]
     reference = lambda ref: {key: ref[key] for key in ('timeframe', 'open_time', 'field')}
-    return dict(setup_id=ident, **material, macro_trend=macro,
+    opposing_target_levels = [{key: ref[key] for key in ('timeframe', 'open_time', 'field', 'price')} for ref in ordered]
+    return dict(setup_id=ident, **material, macro_trend=macro, opposing_target_levels=opposing_target_levels,
                 context_timeframe=zone['timeframe'], trigger_timeframe=trigger_tf,
                 source_closed_at=lower['closed_at'], requires_full_context=False,
                 entry_reference=entry, stop_loss_price=stop, take_profit_price=target,
@@ -343,7 +347,8 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0):
 
     A ready long stops just beyond the low of that CHoCH candle. A ready short
     stops just beyond its high. Swing uses the 15m candle; intraday uses the 5m
-    candle. The target remains the opposing higher-timeframe level.
+    candle. The default target remains the nearest opposing higher-timeframe
+    level. Every opposing level beyond entry is supplied with it.
     A touch or a future level can produce a watch. The LTF trigger must close
     after the touch candle, so same-candle intrabar ordering is never inferred.
     BTC/ETH context stays independent of the symbol's executable evidence.

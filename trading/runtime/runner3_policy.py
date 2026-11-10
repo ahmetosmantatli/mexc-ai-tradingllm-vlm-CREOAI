@@ -171,7 +171,7 @@ def validate_evidence(setup, plan, now=None):
             raise ValueError('runner3_requires_verified_setup')
         if plan.entry_timeframe != setup['trigger_timeframe']:
             raise ValueError('runner3_trigger_timeframe_mismatch')
-        if plan.target_reference.model_dump() != setup['target_reference']:
+        if _target_identity(plan.target_reference) not in supplied_target_identities(setup):
             raise ValueError('runner3_target_reference_mismatch')
     if plan.stop_reference.model_dump() != setup['stop_reference']:
         raise ValueError('runner3_stop_reference_mismatch')
@@ -377,8 +377,39 @@ def prompt_entry_costs(settings, costs=None):
     return fee, slippage
 
 
+def _target_identity(reference):
+    if hasattr(reference, 'model_dump'):
+        reference = reference.model_dump()
+    if not isinstance(reference, dict):
+        return None
+    identity = tuple(reference.get(key) for key in ('timeframe', 'open_time', 'field'))
+    if any(part is None for part in identity):
+        return None
+    return identity
+
+
+def supplied_target_identities(setup):
+    """Supplied opposing targets the model may name. The nearest stays first."""
+    found = []
+    if not isinstance(setup, dict):
+        return found
+    primary = _target_identity(setup.get('target_reference'))
+    if primary is not None:
+        found.append(primary)
+    levels = setup.get('opposing_target_levels')
+    for level in levels if isinstance(levels, list) else []:
+        identity = _target_identity(level)
+        if identity is not None and identity not in found:
+            found.append(identity)
+    return found
+
+
 def entry_gate_instruction(*, fee, slippage):
-    """Prompt text for the cost gate validate_economics still enforces."""
+    """Prompt text for the cost gate validate_economics still enforces.
+
+    A real setup tries a farther supplied level before BEKLE. The 1.25 floor
+    is unchanged: the engine still rejects cost-adjusted R under that floor.
+    """
     fee = _cost_number(fee)
     slippage = _cost_number(slippage)
     if fee is None or slippage is None:
@@ -398,8 +429,9 @@ def entry_gate_instruction(*, fee, slippage):
         f'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < {MIN_NET_TARGET_R:.2f}, and when gross <= 0 or (gross - net) / gross > {MAX_COST_SHARE:.2f}.',
         f'The continuous equity stop cap is {CONTINUOUS_STOP_RISK_CAP:.0%} of equity. One stop cannot lose more than that fraction of equity.',
         f'When continuous aggressive is off, aggressive model sizing uses the {AGGRESSIVE_STOP_RISK_CAP:.0%} equity stop cap.',
-        f'A proposal whose target fails that R must be BEKLE (action hold) or a farther target on the supplied target reference that clears {MIN_NET_TARGET_R:.2f}, not ENTER (action trade).',
-        'Do not move the stop to manufacture R. Do not invent a setup or a target reference.',
+        f'When the setup is real (zone, touch, and a later closed CHoCH/MSS), first choose a farther target that is one of the supplied opposing target levels and whose cost-adjusted R clears {MIN_NET_TARGET_R:.2f}.',
+        f'BEKLE (action hold) only when none of the supplied levels clears {MIN_NET_TARGET_R:.2f}.',
+        'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
         ENTRY_GATE_END,
     )
