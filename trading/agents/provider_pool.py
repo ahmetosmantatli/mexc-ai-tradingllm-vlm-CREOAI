@@ -114,6 +114,21 @@ class ProviderPool:
                     child=ProviderRouter(extra,None,PrefixStore(store,'pool:route:'+group_id+':'+route_label+':'),self.client)
                     self._slots.append(_Slot(provider,route_label,group_id,child,route.model,tuple(route.modes),
                         (route.rpm,route.tpm,route.rpd,route.tpd),route.quota_bucket,key_id))
+        if settings.nvidia_api_key:
+            from trading.agents.external_catalog import ExternalRoute
+            from trading.agents.external_client import ExternalClient
+            models = json.loads(settings.nvidia_models)
+            if not isinstance(models, list):
+                raise ValueError('NVIDIA_MODELS must be a JSON list')
+            for model in models:
+                route = ExternalRoute(provider='nvidia', **model)
+                label = 'nvidia-' + hashlib.sha256(route.model.encode()).hexdigest()[:8]
+                if any(slot.label == label for slot in self._slots):
+                    raise ValueError('Duplicate NVIDIA model')
+                router = ExternalClient(settings, route, self.store, self.client)
+                self._slots.append(_Slot('nvidia', label, 'nvidia-account', router, route.model,
+                    ('text', 'vlm') if route.vision else ('text',),
+                    (settings.nvidia_local_rpm, 0, 0, 0), 'account-all-models'))
         self._reload_external()
 
     def _reload_external(self):
@@ -346,6 +361,8 @@ class ProviderPool:
                     minute_tokens/tpm if tpm else 0,len(daily)/rpd if rpd else 0,
                     daily_tokens/tpd if tpd else 0)
                 priority=-1 if probe else int(slot.provider!=getattr(self,'_preferred_provider','groq'))
+                if not probe and slot.provider == 'nvidia':
+                    priority = 2
                 same_model=0 if self._model(slot,images)==preferred_model else 1
                 choices.append((priority,same_model,utilization,state.get('last_used',0),slot.label,slot,key,state,rows,tokens))
             if not choices:
@@ -516,7 +533,7 @@ class ProviderPool:
             return dict(admitted=state['label'], probed=False)
         slots=[]
         for slot in self._slots:
-            if not self._supports(slot, images):
+            if slot.provider == 'nvidia' or not self._supports(slot, images):
                 continue
             if prompt_bytes is not None:
                 tokens=self._sized(slot, '', '', 1100, images, prompt_bytes=prompt_bytes)
@@ -631,7 +648,7 @@ class ProviderPool:
                 row['successes']+=int(attempt.get('status')=='success')
                 row['failures']+=int(attempt.get('status') in ('failed','rejected','invalid_schema','error_or_invalid_output','provider_credit_exhausted','output_truncated','model_refusal'))
             self.store.put('ai_request_stats',stats)
-            for provider in ('groq','gemini','openrouter','cloudflare'):
+            for provider in ('groq','gemini','openrouter','cloudflare','nvidia'):
                 usage=self.store.get(provider+'_usage',dict(successful_calls=0,input_tokens=0,output_tokens=0))
                 for attempt in self.last_trace['attempts']:
                     if attempt.get('provider')!=provider:
@@ -683,9 +700,9 @@ class ProviderPool:
                 attempt['error_category']='does-not-fit'
                 if self.last_trace.get('attempts'):
                     self.last_trace['attempts'][-1]['error_category']='does-not-fit'
-                self._release(key,lease_id,attempt,forget=True)
+                self._release(key,lease_id,attempt,forget=slot.provider!='nvidia')
             else:
-                cooldown=self._cooldown(slot,images) if attempt.get('http_status')==429 else 0
+                cooldown=self._cooldown(slot,images) if attempt.get('http_status')==429 and slot.provider!='nvidia' else 0
                 self._release(key,lease_id,attempt,cooldown,hold_slot=slot if cooldown else None)
 
     def _wait(self,seconds):

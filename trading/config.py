@@ -189,6 +189,9 @@ class Settings(BaseSettings):
     ai_free_model_routes: str = '[]'
     external_models_enabled: bool = False
     external_models_file: str = 'data/external-models.json'
+    nvidia_api_key: str = Field(default='', repr=False)
+    nvidia_models: str = '[]'
+    nvidia_local_rpm: int = Field(default=6, ge=1, le=40)
     openrouter_api_key: str = Field(default='',repr=False)
     cloudflare_api_token: str = Field(default='',repr=False)
     cloudflare_account_id: str = Field(default='',repr=False)

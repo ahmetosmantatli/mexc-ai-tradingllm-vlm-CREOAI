@@ -32,7 +32,7 @@ class CatalogHTTPError(ValueError):
 
 class ExternalRoute(BaseModel):
     model_config=ConfigDict(extra='forbid',strict=True,allow_inf_nan=False)
-    provider: Literal['openrouter','cloudflare']
+    provider: Literal['openrouter','cloudflare','nvidia']
     model: str=Field(pattern=r'^[A-Za-z0-9@._/:-]{1,150}$')
     context_length: int=Field(ge=MIN_CONTEXT,le=10000000)
     max_output: int=Field(ge=700,le=1000000)
@@ -163,6 +163,7 @@ def load_routes(path,now=None):
         if data.get('version')!=1 or not 0<=now-data['observed_at']<86400 or len(data['routes'])>64:return []
         result=[ExternalRoute.model_validate(r) for r in data['routes']]
         for route in result:
+            if route.provider=='nvidia':return []
             if route.provider=='openrouter' and not route.model.endswith(':free'):return []
             if route.provider=='cloudflare':
                 expected=CF_MODELS.get(route.model)

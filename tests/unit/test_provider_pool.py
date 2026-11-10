@@ -610,3 +610,50 @@ def test_failed_capacity_probe_does_not_admit_or_call_paid_claude(tmp_path):
     assert p.analysis_capacity(prompt_bytes=100)['free_slots']==0
     assert p.probe_free_capacity()['admitted'] is None
     assert calls==['Bearer private-groq-key-1', 'Bearer private-groq-key-2']
+
+
+def test_nvidia_uses_other_models_after_429_under_shared_rpm_guard(tmp_path):
+    calls = []
+
+    def transport(request):
+        assert request.url.host == 'integrate.api.nvidia.com'
+        payload = json.loads(request.content)
+        calls.append(payload)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={'retry-after': '120'}, json={})
+        return response()
+
+    models = [
+        dict(model=f'nvidia/{name}', context_length=65536, max_output=2048,
+             vision=True, format='json_object')
+        for name in ('vision1', 'vision2')
+    ]
+    cfg = settings(groq_api_key='', nvidia_api_key='nvidia-test-key',
+                   nvidia_models=json.dumps(models), nvidia_local_rpm=2)
+    provider, _ = pool(tmp_path, cfg, transport)
+    chart = tmp_path / 'chart.png'
+    chart.write_bytes(b'test-image')
+    assert provider.complete_json(system='s', user='u', images=[chart]) == {'action': 'hold'}
+    assert len({call['model'] for call in calls}) == 2
+    assert calls[1]['messages'][1]['content'][1]['type'] == 'image_url'
+    assert provider.fork().complete_json(system='s', user='u') is None
+    assert len(calls) == 2
+    assert provider.snapshot()['groups'][0]['requests_minute_remaining'] == 0
+
+
+def test_nvidia_text_fallback_after_primary_failure(tmp_path):
+    hosts = []
+
+    def transport(request):
+        hosts.append(request.url.host)
+        if request.url.host == 'api.groq.com':
+            return httpx.Response(503, json={})
+        assert json.loads(request.content)['messages'][1]['content'] == 'u'
+        return response()
+
+    models = [dict(model='nvidia/text', context_length=65536, max_output=2048,
+                   format='json_object')]
+    cfg = settings(nvidia_api_key='nvidia-test-key', nvidia_models=json.dumps(models))
+    provider, _ = pool(tmp_path, cfg, transport)
+    assert provider.complete_json(system='s', user='u') == {'action': 'hold'}
+    assert hosts == ['api.groq.com', 'integrate.api.nvidia.com']

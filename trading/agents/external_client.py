@@ -7,6 +7,7 @@ import base64
 import copy
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 import hashlib
 import json
 import math
@@ -181,6 +182,8 @@ class ExternalClient:
                 raise ValueError('external_context_or_neuron_budget')
             content = [{'type': 'text', 'text': user}]
             for png in images or []:
+                if isinstance(png, (str, Path)):
+                    png = Path(png).read_bytes()
                 content.append(dict(type='image_url', image_url=dict(url='data:image/png;base64,' + base64.b64encode(png).decode())))
             payload = dict(model=self.route.model, stream=False, max_tokens=completion,
                            messages=[dict(role='system', content=system), dict(role='user', content=content)])
@@ -198,6 +201,14 @@ class ExternalClient:
                 payload['provider'] = dict(require_parameters=True)
                 url = 'https://openrouter.ai/api/v1/chat/completions'
                 token = self.settings.openrouter_api_key
+            elif self.provider == 'nvidia':
+                url = 'https://integrate.api.nvidia.com/v1/chat/completions'
+                token = self.settings.nvidia_api_key
+                if not images:
+                    payload['messages'][1]['content'] = user
+                if self.route.format == 'json_object':
+                    payload.pop('response_format', None)
+                    payload['messages'][0]['content'] += '\nReturn only a JSON object matching this schema: ' + json.dumps(schema)
             else:
                 if not re.fullmatch('[a-fA-F0-9]{32}', self.settings.cloudflare_account_id):
                     raise ValueError('external_invalid_account_id')
@@ -211,7 +222,7 @@ class ExternalClient:
                 else:
                     neuron_id, estimate = self._reserve_neurons(system, user, completion, images)
                 a['neuron_reserved_estimate'] = estimate
-            else:
+            elif self.provider == 'openrouter':
                 # Pool serializes the account bucket. Failed generations count too.
                 cached = copy.deepcopy(cached)
                 cached['quota']['remaining'] = max(0, cached['quota']['remaining'] - 1)
@@ -232,7 +243,7 @@ class ExternalClient:
                         if not math.isfinite(delay): delay = 60
                     except Exception: delay = 60
                 delay = max(1, min(86400, delay))
-                if status in (401, 402, 403, 429):
+                if status in (401, 402, 403) or (status == 429 and self.provider != 'nvidia'):
                     self.store.put(self.prefix + 'retry_at', time.time() + delay)
                 else:
                     self.store.put(self.provider + ':retry_at:' + self.route.model, time.time() + delay)
