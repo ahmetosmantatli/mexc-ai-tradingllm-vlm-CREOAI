@@ -11,6 +11,7 @@ AGGRESSIVE_STOP_RISK_CAP = .10
 CONTINUOUS_STOP_RISK_CAP = .15
 MARGIN_RESERVE_FRACTION = .15
 MIN_NET_TARGET_R = 1.25
+ENGINE_R_SLACK = 1.10
 MAX_COST_SHARE = .30
 SMALL_ACCOUNT_EQUITY_USDT = 100.
 MIN_OPEN_MARGIN_USDT = 1.
@@ -326,8 +327,40 @@ def ioc_target_economics(*, side, entry, stop, target, fee, slippage):
     return abs(target - entry), net, loss
 
 
-def validate_economics(gross, net, loss):
-    if loss <= 0 or net / loss < MIN_NET_TARGET_R:
+def setup_is_real(setup):
+    """Zone, a touch, and a closed CHoCH/MSS. Missing any one is not an entry.
+
+    A stored execution packet may omit ``state`` and still be real when the
+    evidence itself is a confirmed zone setup. Watch and awaiting stages are not.
+    """
+    if not isinstance(setup, dict) or setup.get('state') not in (None, 'ready'):
+        return False
+    evidence = setup.get('evidence')
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get('kind') not in ('htf_zone_choch', 'htf_zone_mss'):
+        return False
+    if evidence.get('stage') != 'confirmed':
+        return False
+    if not isinstance(evidence.get('zone'), dict) or not evidence.get('zone'):
+        return False
+    touch = evidence.get('touch_at')
+    if isinstance(touch, bool) or not isinstance(touch, (int, float)) or not isfinite(touch):
+        return False
+    shift = evidence.get('shift')
+    return isinstance(shift, dict) and shift.get('kind') in ('choch', 'mss')
+
+
+def validate_economics(gross, net, loss, *, action=None, setup=None):
+    """Reject a payoff the entry gate does not allow.
+
+    The stated floor stays 1.25. A trade on a real setup may use the 1.10
+    engine slack. Hold, silence, and a setup that is not real stay on 1.25.
+    Below 1.10 still rejects. The stop is not moved to manufacture R.
+    """
+    name = getattr(action, 'value', action)
+    floor = ENGINE_R_SLACK if name == 'trade' and setup_is_real(setup) else MIN_NET_TARGET_R
+    if loss <= 0 or net / loss < floor:
         raise ValueError('runner3_net_target_r_too_low')
     if gross <= 0 or (gross - net) / gross > MAX_COST_SHARE:
         raise ValueError('runner3_cost_share_too_high')
@@ -407,9 +440,10 @@ def supplied_target_identities(setup):
 def entry_gate_instruction(*, fee, slippage):
     """Prompt text for the cost gate validate_economics still enforces.
 
-    A real setup with a supplied opposing target that clears the floor must
-    be ENTER at that target. BEKLE is only missing confirmation or no
-    supplied level that clears the floor. The floor stays 1.25.
+    The stated floor stays 1.25. One line tells the model that a real setup
+    whose best supplied target sits between the 1.10 engine slack and that
+    floor may still ENTER. BEKLE remains for missing confirmation or no
+    supplied level at or above 1.10.
     """
     fee = _cost_number(fee)
     slippage = _cost_number(slippage)
@@ -431,7 +465,7 @@ def entry_gate_instruction(*, fee, slippage):
         f'The continuous equity stop cap is {CONTINUOUS_STOP_RISK_CAP:.0%} of equity. One stop cannot lose more than that fraction of equity.',
         f'When continuous aggressive is off, aggressive model sizing uses the {AGGRESSIVE_STOP_RISK_CAP:.0%} equity stop cap.',
         f'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears {MIN_NET_TARGET_R:.2f}, you must ENTER (action trade) at that supplied target.',
-        f'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears {MIN_NET_TARGET_R:.2f}.',
+        f'A real setup whose best supplied target is between {ENGINE_R_SLACK:.2f} and {MIN_NET_TARGET_R:.2f} may still ENTER. BEKLE (action hold) remains for missing confirmation or no supplied level at or above {ENGINE_R_SLACK:.2f}.',
         f'If you BEKLE because no supplied level clears {MIN_NET_TARGET_R:.2f}, say that. Do not cite account balance or other risk-management limits in its place.',
         'These are not BEKLE reasons: account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',

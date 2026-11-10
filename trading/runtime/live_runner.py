@@ -554,7 +554,9 @@ class LiveRunner:
         if runner_id!='runner3':
             limits['available_margin']=snapshot['balance']['available']/margin_rate*.95
         if runner_id=='runner3':
-            runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
+            runner3_policy.validate_economics(
+                gross_target, expected_net, unit_loss,
+                action=result.action.value, setup=setup)
             balance = snapshot['balance']
             available = balance['available']
             if model_sizing and balance.get('available_open') is not None:
@@ -615,6 +617,7 @@ class LiveRunner:
             contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
             decision_ai=result.metadata.get('decision_ai',{}),account_generation=snapshot['generation'])
         if runner_id == 'runner3':
+            proposal.metadata['model_action'] = result.action.value
             proposal.metadata['htf_setup'] = {key: copy.deepcopy(setup[key]) for key in
                 ('context_timeframe','trigger_timeframe','evidence')}
         return proposal
