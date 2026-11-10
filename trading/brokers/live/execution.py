@@ -214,18 +214,20 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             expected_generation=snapshot['generation'],position_mode=mode,managed_position_ids=managed_positions,managed_order_ids=managed_orders)
         if not readiness.ready:raise LiveExecutionError('private_preflight_rejected',reason_codes=readiness.reasons)
         available=readiness.available
+        policy=proposal.metadata.get('runner3_allocation') or {}
+        model_sizing=(policy.get('aggressive_model_sizing') is True and runner3_policy.aggressive_model_sizing(
+            self.risk.settings, self.risk.preset.profile, proposal.metadata.get('runner_id'), equity))
         if proposal.metadata.get('runner_id')=='runner3':
-            policy=proposal.metadata.get('runner3_allocation') or {}
             if policy.get('risk_boost_applied') and any(
                     row['side'] == (1 if proposal.side.value == 'long' else 2) for row in snapshot['positions']):
                 raise LiveExecutionError('runner3_boost_same_side_exposure')
             expires=policy.get('evidence_expires_at')
             if expires is not None and expires<=time():
                 raise LiveExecutionError('runner3_evidence_expired')
-            reserve=readiness.allowed_capital*runner3_policy.MARGIN_RESERVE_FRACTION
+            reserve=0. if model_sizing else readiness.allowed_capital*runner3_policy.MARGIN_RESERVE_FRACTION
             if readiness.planned_margin+notional*self.fee>available-reserve+1e-8:
-                raise LiveExecutionError('runner3_margin_reserve')
-            if (0<readiness.equity<runner3_policy.SMALL_ACCOUNT_EQUITY_USDT
+                raise LiveExecutionError('insufficient_available_margin' if model_sizing else 'runner3_margin_reserve')
+            if (not model_sizing and 0<readiness.equity<runner3_policy.SMALL_ACCOUNT_EQUITY_USDT
                     and readiness.planned_margin<runner3_policy.MIN_OPEN_MARGIN_USDT):
                 raise LiveExecutionError('runner3_margin_below_minimum')
         if abs(notional-proposal.notional)>max(1e-8,entry*rules.size*rules.step):raise LiveExecutionError('approved_notional_changed')
@@ -258,9 +260,7 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             open_positions=len(snapshot['positions']),open_risk=sum(r.get('planned_loss',r['proposal']['max_loss_if_stopped']) for r in managed),
             daily_loss_pct=state['daily_loss_pct'],weekly_loss_pct=state['weekly_loss_pct'],drawdown_pct=state['drawdown_pct'],
             enforce_position_limit=enforce_position_limit,
-            aggressive_model_sizing=(proposal.metadata.get('runner3_allocation') or {}).get('aggressive_model_sizing') is True
-                and runner3_policy.aggressive_model_sizing(
-                    self.risk.settings, self.risk.preset.profile, proposal.metadata.get('runner_id'), equity))
+            aggressive_model_sizing=model_sizing)
         checked_proposal = proposal
         if context.aggressive_model_sizing:
             checked_proposal = proposal.model_copy(update={'max_loss_if_stopped': planned_loss})

@@ -677,3 +677,26 @@ def test_runner3_aggressive_rechecks_costed_loss_against_fresh_equity(tmp_path):
         executor._preflight(row)
     assert 'MAX_LOSS_EXCEEDS_CAP' in exc.value.reason_codes
     assert not private.submits
+
+
+def test_runner3_aggressive_uses_available_margin_without_local_reserve_or_floor(tmp_path):
+    from trading.config import RiskProfile, Settings
+    from trading.risk.engine import RiskEngine
+
+    executor, private, _, _, _ = ioc_case(tmp_path)
+    executor.risk = RiskEngine(Settings(
+        _env_file=None, risk_profile=RiskProfile.AGGRESSIVE_GROWTH,
+        live_runner3_aggressive_model_sizing_enabled=True))
+    private.leverage_value = 10
+    private.assets[0].update(equity=8., availableBalance=.85)
+    row = approve(executor, proposal(notional=8., leverage=10, max_loss_if_stopped=.3,
+        metadata={'runner_id': 'runner3',
+                  'runner3_allocation': {'aggressive_model_sizing': True}}))
+    executor._preflight(row)
+    assert row['margin'] == pytest.approx(.8)
+
+    private.assets[0]['availableBalance'] = .79
+    with pytest.raises(LiveExecutionError) as exc:
+        executor._preflight(row)
+    assert 'INSUFFICIENT_FREE_MARGIN' in exc.value.reason_codes
+    assert not private.submits

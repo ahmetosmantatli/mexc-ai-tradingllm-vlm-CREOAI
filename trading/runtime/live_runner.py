@@ -541,14 +541,18 @@ class LiveRunner:
             limits['available_margin']=snapshot['balance']['available']/margin_rate*.95
         if runner_id=='runner3':
             runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
+            balance = snapshot['balance']
+            available = balance['available']
+            if model_sizing and balance.get('available_open') is not None:
+                available = min(available, balance['available_open'])
             allocation=runner3_policy.apply_guclu_margin_share(
                 runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
-                    snapshot['balance']['available'],grade,setup['horizon']),
-                equity=snapshot['balance']['equity'], available=snapshot['balance']['available'],
+                    available,grade,setup['horizon'],model_sizing=model_sizing),
+                equity=snapshot['balance']['equity'], available=available,
                 raw_share=runner3_policy.chosen_margin_share(result.metadata), allow_standard=model_sizing)
-            free_margin=snapshot['balance']['available']-allocation['reserve_usdt']
+            free_margin=available-allocation['reserve_usdt']
             if free_margin<=0:
-                raise ValueError('runner3_margin_reserve')
+                raise ValueError('insufficient_available_margin' if model_sizing else 'runner3_margin_reserve')
         _,notional=rules.size_order(min(limits.values()),planned_entry if runner_id=='runner3' else entry,1 if runner_id=='runner3' else proposal.leverage)
         proposal.notional=notional
         if runner_id=='runner3':
@@ -572,7 +576,7 @@ class LiveRunner:
                 equity=snapshot['balance']['equity'],max_leverage=min(self._leverage_cap(control,exchange_cap),exchange_cap),
                 maintenance=max(rules.maintenance,private_risk['maintenance_rate'],private_leverage['maintenance_rate']),
                 initial_rate=private_risk['initial_rate'],fee=fee,liquidation_buffer=self.cfg.liquidation_buffer_pct,
-                preferred_leverage=model_leverage if model_sizing else None)
+                preferred_leverage=model_leverage if model_sizing else None, model_sizing=model_sizing)
             if sized<proposal.notional-1e-8:
                 _,proposal.notional=rules.size_order(sized,entry,leverage)
             proposal.leverage=leverage

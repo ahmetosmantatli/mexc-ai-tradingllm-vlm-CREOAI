@@ -5,7 +5,7 @@ from time import time
 from zoneinfo import ZoneInfo
 
 COHORT = 'runner3-htf-zone-v3'
-MODEL_SIZING_COHORT = 'runner3-htf-zone-v3-aggressive-model-sizing'
+MODEL_SIZING_COHORT = 'runner3-htf-zone-v3-aggressive-market-margin'
 AGGRESSIVE_STOP_RISK_CAP = .10
 MARGIN_RESERVE_FRACTION = .15
 MIN_NET_TARGET_R = 1.25
@@ -169,7 +169,7 @@ def validate_evidence(setup, plan, now=None):
         raise ValueError('runner3_structural_stop_too_tight')
 
 
-def margin_policy(equity, capital, available, grade, horizon):
+def margin_policy(equity, capital, available, grade, horizon, *, model_sizing=False):
     if not all(type(v) in (int, float) and isfinite(v) and v >= 0 for v in (equity, capital, available)):
         raise ValueError('runner3_invalid_margin_context')
     if grade not in ('standard','strong') or horizon not in ('scalp','intraday','swing'):
@@ -183,7 +183,7 @@ def margin_policy(equity, capital, available, grade, horizon):
     else:
         fraction = .20 if grade == 'strong' else .10
         target = capital * fraction
-    reserve = capital * MARGIN_RESERVE_FRACTION
+    reserve = 0. if model_sizing else capital * MARGIN_RESERVE_FRACTION
     return dict(grade=grade, horizon=horizon, equity_usdt=equity, margin_fraction=fraction,
                 target_margin_usdt=target, reserve_usdt=reserve,
                 max_entry_cost_usdt=max(0., min(target, available - reserve)))
@@ -232,16 +232,17 @@ def drift_respects_choch_risk(*, side, fresh_entry, stop, target, choch_extreme,
 
 
 def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_leverage,
-                            maintenance, initial_rate, fee, liquidation_buffer, margin_target=None, preferred_leverage=None):
+                            maintenance, initial_rate, fee, liquidation_buffer, margin_target=None,
+                            preferred_leverage=None, model_sizing=False):
     """Lowest leverage that posts the tightest of the loss budget, margin target, and free margin.
 
     ``notional`` is the CHoCH stop-loss budget. It is a ceiling, not a reason to
     move the stop. ``margin_target`` is the margin cap: Standart's 20% of equity,
     the text model's Güçlü share, or the 35% fallback. The size cannot exceed
     that cap, the loss budget, or free margin. Leverage is only raised far
-    enough to post the loss-sized notional inside that margin cap. It is not
-    10x and it is not the exchange maximum. A share under 1 USDT is rejected
-    while equity is under 100.
+    enough to post the loss-sized notional inside that margin cap unless the
+    model's preferred leverage fits. The legacy small-account policy also
+    enforces a 1 USDT margin minimum.
     """
     values = (notional, entry, stop, free_margin, equity, max_leverage, maintenance, initial_rate, fee, liquidation_buffer)
     if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) for value in values):
@@ -255,7 +256,8 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
         margin_cap = min(free_margin, margin_target)
     if margin_cap <= 0:
         raise ValueError('runner3_margin_reserve')
-    if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and margin_cap < MIN_OPEN_MARGIN_USDT:
+    minimum_margin = MIN_OPEN_MARGIN_USDT if not model_sizing and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT else 0.
+    if margin_cap < minimum_margin:
         raise ValueError('runner3_margin_below_minimum')
     cap = floor(max_leverage)
     if cap < 1 or cap > 100000:
@@ -274,7 +276,7 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
         buffer = (stop - liquidation) / entry if long else (liquidation - stop) / entry
         if buffer + 1e-12 < liquidation_buffer:
             return None
-        if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and margin < MIN_OPEN_MARGIN_USDT:
+        if margin < minimum_margin:
             return None
         return leverage, margin, size
 
@@ -298,7 +300,7 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
         selected = fit(leverage, fitted)
         if selected is not None:
             return selected
-    if 0 < equity < SMALL_ACCOUNT_EQUITY_USDT and min(notional, margin_cap) <= MIN_OPEN_MARGIN_USDT:
+    if min(notional, margin_cap) <= minimum_margin:
         raise ValueError('runner3_margin_below_minimum')
     raise ValueError('runner3_margin_reserve')
 

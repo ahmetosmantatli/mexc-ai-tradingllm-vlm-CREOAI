@@ -254,7 +254,7 @@ class ContextEvaluator:
             for option in options:
                 grade=runner3_policy.evidence_grade(option)
                 allocation=runner3_policy.margin_policy(balance,equity,live_account['available_usdt'],
-                    grade,option['horizon'])
+                    grade,option['horizon'],model_sizing=model_sizing)
                 ceiling=risk_per_trade_pct*(.5 if option['family']=='countertrend_sweep_reclaim' else 1)
                 target_risk=None if model_sizing else runner3_policy.small_account_risk_target(balance,ceiling,grade)
                 option['allocation']=dict(allocation,
@@ -444,10 +444,13 @@ class ContextEvaluator:
                         'A valid share is an equity fraction and a margin target. The executor prefers your leverage '
                         'when it fits verified exchange limits, available margin, and the liquidation buffer. '
                         'Choose risk per trade within the supplied ceiling, including fees and estimated exit slippage. '
+                        'If a setup is READY and you would otherwise trade it, return TRADE with a grounded plan. '
+                        'Do not choose HOLD solely because the account is small, there are open positions, or the desired size '
+                        'may not fit free margin. The executor sizes the order down to actual available margin and exchange minimums. '
                         if model_sizing else runner3_policy.GUCLU_MARGIN_INSTRUCTION +
                         'A Güçlü setup may use more of the existing per-trade loss ceiling. '
-                        'Leverage is the lowest value that fits that share and the CHoCH stop. ') +
-                     'Do not ask for a margin below 1 USDT while equity is under 100. '
+                        'Leverage is the lowest value that fits that share and the CHoCH stop. '
+                        'Do not ask for a margin below 1 USDT while equity is under 100. ') +
                      'Do not narrow or move the CHoCH stop to make the position bigger. '
                      'For a long, the initial stop is just beyond the low of the CHoCH candle that confirmed the entry. '
                      'For a short, it is just beyond that CHoCH candle high. A 4h setup uses the 15m CHoCH. '

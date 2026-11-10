@@ -531,6 +531,12 @@ def test_runner3_aggressive_keeps_explicit_standard_size_and_leverage(tmp_path):
     assert allocation['grade'] == 'standard'
     assert allocation['target_margin_usdt'] == pytest.approx(30.)
     assert allocation['aggressive_model_sizing']
+    assert allocation['reserve_usdt'] == 0.
+    snapshot['balance'].update(available=2., available_open=.85)
+    limited = runner._final_proposal(signal, decision, snapshot, control)
+    assert limited.leverage == 10
+    assert 0. < limited.metadata['runner3_allocation']['initial_margin_usdt'] < .85
+    assert limited.metadata['runner3_allocation']['limiting_factor'] == 'available_margin'
     decision.metadata['sizing_plan']['risk_per_trade_pct'] = .101
     with pytest.raises(ValueError, match='model_risk_exceeds_policy'):
         runner._final_proposal(signal, decision, snapshot, control)
