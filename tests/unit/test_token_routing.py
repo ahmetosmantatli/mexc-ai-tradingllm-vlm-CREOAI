@@ -34,7 +34,7 @@ def _packet():
                                 'last_break': {'direction': 'bullish'}, 'structure_shifts': [{'kind': 'mss'}]}},
             'ETH_USDT': {'4h': {'trend': 'bearish', 'return_6_bars': -0.03, 'relative_return_6_bars': 0.04}},
         }),
-        account=dict(equity=80, text_model_decision=dict(rationale='Bölge tuttu ve teyit mumu kapandı.'),
+        account=dict(equity=80, leverage=5, text_model_decision=dict(rationale='Bölge tuttu ve teyit mumu kapandı.'),
                      capital_allocation=dict(equity_usdt=80, available_usdt=42.5,
                                              open_positions=[{'symbol': 'BNB_USDT', 'side': 'long'}]),
                      setup_selection=dict(options=[dict(
@@ -62,7 +62,7 @@ def test_compact_packet_keeps_the_decision_fields_and_drops_the_padded_history()
         dict(timeframe='4h', open_time=80, field='high', price=14),
         dict(timeframe='4h', open_time=40, field='high', price=18)]]
     assert compact['setups'][0]['opposing_target_levels']==compact['opposing_target_levels'][0]
-    assert compact['equity']==80 and compact['free_margin']==42.5
+    assert compact['equity']==80 and compact['free_margin']==42.5 and compact['leverage']==5
     assert compact['why']=='Bölge tuttu ve teyit mumu kapandı.'
     assert compact['text_decision_why']==compact['why']
     assert compact['benchmarks']['BTC_USDT']['4h']['trend']=='bullish'
@@ -171,7 +171,7 @@ def test_fitting_model_receives_the_full_packet_and_groq_receives_the_compact_on
     assert compact['closed_choch_mss'][0]['kind']=='choch'
     assert compact['why']=='Bölge tuttu ve teyit mumu kapandı.'
     assert 'BTC_USDT' in compact['benchmarks'] and 'ETH_USDT' in compact['benchmarks']
-    assert compact['equity']==80 and compact['free_margin']==42.5
+    assert compact['equity']==80 and compact['free_margin']==42.5 and compact['leverage']==5
     assert compact['open_positions'][0]['symbol']=='BNB_USDT'
     assert compact['confirming_candles'][0]['recent_ohlcv']
     assert 'PADDED-4H' not in groq[0]

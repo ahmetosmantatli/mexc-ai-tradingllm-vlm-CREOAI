@@ -143,9 +143,11 @@ def compact_decision_packet(user):
 
     Returns canonical JSON, or None when the text is not a decision packet.
     Callers must not delete zone, touch, CHoCH/MSS, the supplied opposing
-    target levels, entry, stop, why, BTC/ETH, equity, free margin, open
-    positions, or the confirming candles to force a fit. The entry-gate text
-    keeps the fee, exit slippage, 1.25 floor, and equity stop cap.
+    target levels, entry, stop, why, BTC/ETH, equity, free margin, leverage,
+    open positions, or the confirming candles to force a fit. The entry-gate
+    text keeps the fee, exit slippage, the 1.25 condition, the equity stop
+    cap, and the rule that a trade on a supplied opposing target is not
+    rejected for cost-adjusted R.
     The full packet used for Gemini is never rewritten here.
     """
     if not isinstance(user, str) or not user.startswith('{'):
@@ -206,6 +208,12 @@ def compact_decision_packet(user):
     operating = account.get('operating_context') if isinstance(account.get('operating_context'), dict) else {}
     equity = capital.get('equity_usdt', account.get('equity', operating.get('equity_snapshot_usdt')))
     free_margin = capital.get('available_usdt', operating.get('available_usdt', account.get('available')))
+    leverage = _finite(account.get('leverage'))
+    if leverage is None or leverage < 1:
+        limits = account.get('sizing_limits') if isinstance(account.get('sizing_limits'), dict) else {}
+        leverage = _finite(limits.get('exchange_max_leverage'))
+        if leverage is None or leverage < 1:
+            leverage = _finite(limits.get('policy_max_leverage'))
     positions = data.get('open_positions')
     if positions is None:
         positions = capital.get('open_positions', operating.get('open_positions'))
@@ -218,6 +226,8 @@ def compact_decision_packet(user):
                   text_decision_why=text.get('rationale'), benchmarks=benchmarks, equity=equity,
                   free_margin=free_margin, open_positions=positions if positions is not None else [],
                   confirming_candles=candles, setups=kept)
+    if leverage is not None and leverage >= 1:
+        packet['leverage'] = leverage
     gates = account.get('runner3_entry_gate')
     if isinstance(gates, str) and gates.strip():
         packet['entry_gates'] = gates
