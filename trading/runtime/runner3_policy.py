@@ -424,16 +424,55 @@ def entry_veto(*, side, entry, stop, target, equity, free_margin, fee, slippage,
     return None
 
 
-def priced_reentry(setup, *, price, equity, free_margin, fee, slippage, notional=None, leverage=1):
-    """A printed hold comes back at the current price, the CHoCH stop, and the next target.
+def retrigger_target(setup, *, price_step=0):
+    """Against the higher timeframe, the next block or flow.
 
-    The next target is the first supplied opposing level. Against the higher
-    timeframe that is the next block or flow. The returned veto name is the
-    failed check. A passing plan does not place the order by itself.
+    With the higher timeframe, the farther supplied target. The price is moved
+    one tick toward entry, the same step the setup builder uses.
+    """
+    if not isinstance(setup, dict):
+        return None, None, None
+    raw = setup.get('opposing_target_levels')
+    levels = [level for level in raw if isinstance(level, dict) and _positive_number(level.get('price'))] if isinstance(raw, list) else []
+    long = setup.get('side') != 'short'
+    aligned = with_higher_timeframe(setup)
+    if aligned:
+        pool = levels
+    else:
+        blocks = [level for level in levels if level.get('kind') in ('block', 'flow')]
+        pool = blocks or levels
+    if not pool:
+        price = setup.get('take_profit_price')
+        if not _positive_number(price):
+            return None, None, None
+        return float(price), setup.get('target_reference'), None
+
+    def distance(level):
+        price = float(level['price'])
+        return (price if long else -price, level.get('open_time') or 0)
+
+    chosen = max(pool, key=distance) if aligned else min(pool, key=distance)
+    step = price_step if _cost_rate(price_step) else 0
+    price = _tick_toward_entry(chosen['price'], step, long=long)
+    reference = {key: chosen.get(key) for key in ('timeframe', 'open_time', 'field')}
+    if any(reference[key] is None for key in reference):
+        reference = setup.get('target_reference')
+        card_target = setup.get('take_profit_price')
+        if _positive_number(card_target) and _same_price(float(chosen['price']), float(card_target)):
+            price = float(card_target)
+    return float(price), reference, chosen
+
+
+def priced_reentry(setup, *, price, equity, free_margin, fee, slippage, notional=None, leverage=1, price_step=0):
+    """A printed hold comes back at the current price and the CHoCH stop.
+
+    Against the higher timeframe the target is the next block or flow. With
+    the higher timeframe it is the farther supplied target. The returned name
+    is the failed check. A passing plan does not place the order by itself.
     """
     if not isinstance(setup, dict):
         return None, 'cost_adjusted_r'
-    target = setup.get('take_profit_price')
+    target, reference, level = retrigger_target(setup, price_step=price_step)
     stop = setup.get('stop_loss_price')
     failed = entry_veto(
         side=setup.get('side'), entry=price, stop=stop, target=target,
@@ -441,10 +480,8 @@ def priced_reentry(setup, *, price, equity, free_margin, fee, slippage, notional
         notional=notional, leverage=leverage)
     if failed:
         return None, failed
-    levels = setup.get('opposing_target_levels')
-    level = levels[0] if isinstance(levels, list) and levels and isinstance(levels[0], dict) else None
     return dict(entry=float(price), stop=float(stop), target=float(target), level=level,
-                stop_reference=setup.get('stop_reference'), target_reference=setup.get('target_reference')), None
+                stop_reference=setup.get('stop_reference'), target_reference=reference), None
 
 
 def with_higher_timeframe(setup):

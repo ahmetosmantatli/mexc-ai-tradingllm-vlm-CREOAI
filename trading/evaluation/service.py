@@ -228,6 +228,87 @@ def _ready_hold_trade(decision, candidate, options, chart_context, prior_watch, 
         thesis_invalidated=False))
 
 
+def _ready_retrigger_card(card):
+    """Closed CHoCH at a block or flow, with a stop. Awaiting touch is not this card."""
+    if not runner3_policy.closed_choch_at_block_or_flow(card):
+        return False
+    stop = card.get('stop_loss_price', card.get('stop'))
+    return isinstance(stop, (int, float)) and not isinstance(stop, bool) and stop > 0
+
+
+def _retrigger_card(candidate, options):
+    """The current card for this hold. A ready card on the same side wins."""
+    side = getattr(candidate.side, 'value', None)
+    features = candidate.features if isinstance(candidate.features, dict) else {}
+    rows = [row for row in options or [] if isinstance(row, dict) and row.get('side') == side]
+    ready = [row for row in rows if _ready_retrigger_card(row)]
+    ident = features.get('setup_id')
+    if ready:
+        named = next((row for row in ready if row.get('setup_id') == ident), None)
+        if named is not None:
+            return named
+        timed = [row for row in ready if row.get('trigger_timeframe') == features.get('seed_timeframe')]
+        return (timed or ready)[0]
+    named = next((row for row in rows if row.get('setup_id') == ident), None)
+    if named is not None:
+        return named
+    return rows[0] if rows else None
+
+
+def _rearm_printed_hold(evaluator, candidate, card, chart_context, price_rules):
+    """Keep the hold and store a new numeric trigger. The model is not asked."""
+    from trading.evaluation.hold_triggers import save_hold, snapshot_market, trigger_levels
+    prior = candidate.features.get('prior_hold') if isinstance(candidate.features.get('prior_hold'), dict) else {}
+    rationale = str(prior.get('rationale') or candidate.rationale or 'Kapalı CHoCH yok.')
+    levels = trigger_levels(card if isinstance(card, dict) else None, candidate)
+    if not levels:
+        return EvaluationResult(action=GraphAction.HOLD, hold_reason='hold',
+            metadata={'provider_called': False, 'model_not_asked': True})
+    held = save_hold(
+        evaluator.store, symbol=candidate.symbol, rationale=rationale, levels=levels,
+        side=(card or {}).get('side') if isinstance(card, dict) else candidate.side.value,
+        setup_id=None if not isinstance(card, dict) else card.get('setup_id'),
+        old_market=snapshot_market(chart_context),
+        trigger_timeframe=None if not isinstance(card, dict) else card.get('trigger_timeframe'),
+        price=candidate.entry_price, tick=price_rules.price_step if price_rules is not None else 0)
+    return EvaluationResult(action=GraphAction.HOLD, hold_reason='hold',
+        metadata={'provider_called': False, 'model_not_asked': True, 'price_action_hold': held})
+
+
+def _ready_card_decision(candidate, card, chart_context, *, entry, price_step, now):
+    """A trade from the ready card at the current price, or None when it will not ground."""
+    target, reference, _level = runner3_policy.retrigger_target(card, price_step=price_step)
+    stop = card.get('stop_loss_price')
+    if not isinstance(reference, dict) or any(reference.get(key) is None for key in ('timeframe', 'open_time', 'field')):
+        return None
+    if not runner3_policy._positive_number(target) or not runner3_policy._positive_number(stop):
+        return None
+    try:
+        opened = int(reference['open_time'])
+    except (TypeError, ValueError):
+        return None
+    try:
+        plan = MarketPricePlan.model_validate(dict(
+            entry_type='market', entry_price=entry, stop_loss_price=stop, take_profit_price=target,
+            entry_timeframe=card['trigger_timeframe'], stop_reference=card['stop_reference'],
+            target_reference=dict(timeframe=reference['timeframe'], open_time=opened, field=reference['field']),
+            reason='Hazır kurulumun verilen hedefi. Stop aynı kaldı.'))
+        from trading.evaluation.setup_selection import selected_candidate
+        probe = selected_candidate(candidate, card)
+        apply_market_price_plan(probe, plan, evidence_from_market(chart_context),
+            price_step=price_step, current_price=entry, now=now)
+        runner3_policy.validate_evidence(card, plan, now)
+    except (KeyError, TypeError, ValueError):
+        return None
+    rationale = (
+        f'{candidate.symbol} hazır kurulumdan güncel fiyattan girildi. '
+        'Kapalı CHoCH, blok veya akış ve stop vardı. Model yeniden sorulmadı.')
+    return ModelDecision(
+        action='trade', signal_id=candidate.signal_id, setup_id=card['setup_id'],
+        rationale=rationale[:1200], invalidation='Kapalı CHoCH stopu bozulursa işlem biter.',
+        price_plan=plan)
+
+
 class ContextEvaluator:
     """Self-contained current evidence + bounded application-owned setup memory.
 
@@ -402,6 +483,19 @@ class ContextEvaluator:
             account['prior_hold']=copy.deepcopy(prior_hold)
             changes.update(reason='hold_trigger_printed',
                 summary='Bekleme tetiki basıldı. Eski gerekçe: '+str(prior_hold.get('rationale') or '')[:240])
+        direct_decision = None
+        model_not_asked = False
+        if runner3 and candidate.features.get('hold_review') and price_rules is not None:
+            # A printed number on a ready card is an entry. An incomplete card stays a hold.
+            card = _retrigger_card(candidate, options)
+            if not _ready_retrigger_card(card):
+                return _rearm_printed_hold(self, candidate, card, chart_context, price_rules)
+            direct_decision = _ready_card_decision(
+                candidate, card, chart_context, entry=candidate.entry_price,
+                price_step=price_rules.price_step, now=time.time())
+            if direct_decision is None:
+                return _rearm_printed_hold(self, candidate, card, chart_context, price_rules)
+            model_not_asked = True
         if runner2:
             from trading.analysis.market import trade_flow_context
             chart_context['recent_trade_flow']=trade_flow_context(self.public,symbol)
@@ -508,7 +602,7 @@ class ContextEvaluator:
                 cash_equity, cash_free = runner3_policy.cash_for_veto(equity, live_account)
                 prices, failed = runner3_policy.priced_reentry(
                     option, price=candidate.entry_price, equity=cash_equity, free_margin=cash_free,
-                    fee=fee, slippage=slippage)
+                    fee=fee, slippage=slippage, price_step=price_rules.price_step)
                 if failed:
                     reentry_note['veto']=failed
                 else:
@@ -715,7 +809,15 @@ class ContextEvaluator:
                         attempts=[dict(review_mode=mode, status='error', generation_requests=0)],
                         identity={}, prompt='', raw={})
 
-        if runner3 and paths:
+        if model_not_asked:
+            decision = direct_decision
+            share_decision = None
+            decision_mode = 'rule'
+            winning_identity = {}
+            winning_prompt = prompt
+            attempts = []
+            raw_trace = {}
+        elif runner3 and paths:
             try:
                 text_result = run_review('text', deadline_at=deadline)
             except sqlite3.Error:
@@ -831,6 +933,8 @@ class ContextEvaluator:
             input_fingerprint=trace['input_fingerprint'],context_policy=POLICY_VERSION,
             why_reconsidered=changes,prompt_bytes=trace['prompt_bytes'],strategy_cohort=trace.get('strategy_cohort'),
             pending_vlm=pending)
+        if model_not_asked:
+            metadata['model_not_asked'] = True
         if decision is None:
             metadata['provider_busy']=getattr(self.llm,'last_status','')=='paid_in_flight'
             wait_statuses={'cooldown_skipped','quota_skipped','paid_in_flight','stopped','missing_key','budget_exhausted','budget_or_interval_hold'}
@@ -907,7 +1011,7 @@ class ContextEvaluator:
             cash_equity, cash_free = runner3_policy.cash_for_veto(equity, live_account)
             prices, entry_block = runner3_policy.priced_reentry(
                 selection, price=candidate.entry_price, equity=cash_equity, free_margin=cash_free,
-                fee=fee, slippage=slippage)
+                fee=fee, slippage=slippage, price_step=price_rules.price_step)
             if entry_block is None and prices is not None and decision.price_plan is not None:
                 update=dict(entry_price=prices['entry'], stop_loss_price=prices['stop'],
                             take_profit_price=prices['target'])
@@ -1073,8 +1177,13 @@ class ContextEvaluator:
             return EvaluationResult(action=GraphAction.HOLD,hold_reason=decision.action,metadata=metadata)
         proposal=prepared_proposal
         proposal.metadata.update(setup_family=trace.get('setup_family'),setup_id=decision.setup_id)
-        proposal.metadata.update(price_source='model' if decision.price_plan else 'quant',price_plan=metadata.get('price_plan'))
+        proposal.metadata.update(
+            price_source='ready_card' if model_not_asked else 'model' if decision.price_plan else 'quant',
+            price_plan=metadata.get('price_plan'))
         proposal.rationale=decision.rationale
+        if model_not_asked:
+            logging.getLogger('worker').info(
+                'ENTRY %s model was not asked again reason=%s', symbol, decision.rationale)
         return EvaluationResult(action=GraphAction.TRADE,proposal=proposal,selected_signal=candidate,
             market=MarketAnalystNote(mode='llm'),strategy=StrategyReviewNote(mode='llm'),
             portfolio=PortfolioAnalystNote(mode='llm'),metadata=metadata)

@@ -484,7 +484,7 @@ class LiveRunner:
         private_risk=next(row for row in snapshot['risk_limits'][candidate.symbol] if row['side']==side)
         private_leverage=next(row for row in snapshot['leverage'][candidate.symbol] if row['side']==side)
         exchange_cap=min(rules.max_leverage,private_risk['max_leverage'],private_leverage['max_leverage'])
-        ready_hold = bool(result.metadata.get('ready_setup_after_hold'))
+        ready_hold = bool(result.metadata.get('ready_setup_after_hold') or result.metadata.get('model_not_asked'))
         if self.cfg.live_leverage_mode=='exchange' and result.metadata.get('sizing_plan') is None and not ready_hold:
             raise ValueError('model must explicitly choose live leverage and risk')
         ticker=self.quote(candidate.symbol)

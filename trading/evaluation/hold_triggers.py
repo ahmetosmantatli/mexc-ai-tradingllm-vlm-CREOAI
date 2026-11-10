@@ -1,9 +1,11 @@
-"""Numeric levels that bring a Runner 3 hold back to the model.
+"""Numeric levels that bring a Runner 3 hold back for review.
 
 A hold stores the zone edge, the CHoCH level, and the block or flow price,
 plus the short rationale. When one of those numbers prints, the symbol is
-queued again with the old rationale and the market from that hold. The new
-market is read at the next review. Nothing here places an order.
+queued again with the old rationale and the market from that hold. A ready
+card is entered without another model call. A card that is still awaiting
+touch, or that has no closed CHoCH, stays a hold and stores a new trigger.
+Nothing here places an order.
 """
 import copy
 import logging
@@ -142,7 +144,7 @@ def claim_printed(store, price_of, *, tick_of=None, now=None):
 
 
 def review_signal(row):
-    """The pair goes back to the model with the prior rationale and the old market."""
+    """Queue the symbol again with the prior rationale and the old market."""
     price = float(row['printed_price'])
     long = row.get('side') != 'short'
     prior = dict(rationale=row.get('rationale'), triggers=row.get('triggers'),
