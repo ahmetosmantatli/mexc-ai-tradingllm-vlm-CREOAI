@@ -170,6 +170,37 @@ def finalize_trace(store, trace_id, status, reason, details=None):
         return True
 
 
+def _ground_card_plan(setup, candidate, chart_context, *, entry, fee, slippage, price_step, now, allow_blocked=False):
+    """A price plan from the card's stop and a supplied target. None when it cannot be grounded."""
+    evidence = evidence_from_market(chart_context)
+    levels = list(runner3_policy.clearing_supplied_targets(
+        setup, entry=entry, fee=fee, slippage=slippage, price_step=price_step))
+    if allow_blocked and not levels:
+        for level in setup.get('opposing_target_levels') or []:
+            price = level.get('price') if isinstance(level, dict) else None
+            if isinstance(price, (int, float)) and not isinstance(price, bool) and price > 0:
+                levels.append(dict(level, take_profit_price=price))
+    for level in levels:
+        if any(level.get(key) is None for key in ('timeframe', 'open_time', 'field', 'take_profit_price')):
+            continue
+        try:
+            plan = MarketPricePlan.model_validate(dict(
+                entry_type='market', entry_price=entry,
+                stop_loss_price=setup['stop_loss_price'],
+                take_profit_price=level['take_profit_price'],
+                entry_timeframe=setup['trigger_timeframe'],
+                stop_reference=setup['stop_reference'],
+                target_reference={key: level[key] for key in ('timeframe', 'open_time', 'field')},
+                reason='Hazır kurulumun verilen hedefi. Stop aynı kaldı.'))
+            apply_market_price_plan(candidate, plan, evidence, price_step=price_step,
+                                    current_price=entry, now=now)
+            runner3_policy.validate_evidence(setup, plan, now)
+        except (ValueError, TypeError):
+            continue
+        return plan
+    return None
+
+
 def _ready_hold_trade(decision, candidate, options, chart_context, prior_watch, *, entry, fee, slippage, price_step, now):
     """A valid hold becomes a trade at the farthest supplied level that clears 1.25.
 
@@ -186,28 +217,15 @@ def _ready_hold_trade(decision, candidate, options, chart_context, prior_watch, 
             and (decision.reviewed_watch_revision != prior_watch.get('revision')
                  or len(decision.rationale.strip()) < 12)):
         return None
-    evidence = evidence_from_market(chart_context)
-    for level in runner3_policy.clearing_supplied_targets(
-            setup, entry=entry, fee=fee, slippage=slippage, price_step=price_step):
-        try:
-            plan = MarketPricePlan.model_validate(dict(
-                entry_type='market', entry_price=entry,
-                stop_loss_price=setup['stop_loss_price'],
-                take_profit_price=level['take_profit_price'],
-                entry_timeframe=setup['trigger_timeframe'],
-                stop_reference=setup['stop_reference'],
-                target_reference={key: level[key] for key in ('timeframe', 'open_time', 'field')},
-                reason='Hazır kurulumun verilen hedefi. Stop aynı kaldı.'))
-            apply_market_price_plan(candidate, plan, evidence, price_step=price_step,
-                                    current_price=entry, now=now)
-            runner3_policy.validate_evidence(setup, plan, now)
-        except (ValueError, TypeError):
-            continue
-        return decision.model_copy(update=dict(
-            action='trade', signal_id=candidate.signal_id, setup_id=setup['setup_id'],
-            price_plan=plan, watch_plan=None, limit_price=None, release_symbol=None,
-            thesis_invalidated=False))
-    return None
+    plan = _ground_card_plan(
+        setup, candidate, chart_context, entry=entry, fee=fee, slippage=slippage,
+        price_step=price_step, now=now)
+    if plan is None:
+        return None
+    return decision.model_copy(update=dict(
+        action='trade', signal_id=candidate.signal_id, setup_id=setup['setup_id'],
+        price_plan=plan, watch_plan=None, limit_price=None, release_symbol=None,
+        thesis_invalidated=False))
 
 
 class ContextEvaluator:
@@ -417,9 +435,31 @@ class ContextEvaluator:
         reentry_note={}
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
+            from trading.evaluation.setup_selection import awaiting_touch, closed_structure_card, validate_selection
+            if selection_enabled and isinstance(decision.setup_id, str):
+                named=next((row for row in options if isinstance(row, dict) and row.get('setup_id')==decision.setup_id), None)
+                if named is not None and decision.action=='trade' and awaiting_touch(named):
+                    # Touch has not happened. Keep the parseable answer as a hold.
+                    decision=decision.model_copy(update=dict(
+                        action='hold', price_plan=None, sizing_plan=None, limit_price=None,
+                        watch_plan=None, release_symbol=None, thesis_invalidated=False))
+                elif (named is not None and decision.action=='trade' and decision.price_plan is None
+                        and closed_structure_card(named) and runner3 and price_rules is not None):
+                    # The card already has the closed CHoCH, the block or flow, and the stop.
+                    # A missing plan is filled from that card. It is not a discarded response.
+                    try:
+                        plan=_ground_card_plan(
+                            named, candidate, chart_context, entry=candidate.entry_price, fee=fee, slippage=slippage,
+                            price_step=price_rules.price_step, now=time.time(), allow_blocked=True)
+                    except (KeyError, TypeError, ValueError):
+                        plan=None
+                    if plan is None:
+                        decision=decision.model_copy(update=dict(
+                            action='hold', price_plan=None, sizing_plan=None, limit_price=None))
+                    else:
+                        decision=decision.model_copy(update=dict(price_plan=plan))
             if model_sizing and decision.action == 'trade' and decision.sizing_plan is None:
                 raise ValueError('aggressive Runner 3 requires explicit sizing')
-            from trading.evaluation.setup_selection import validate_selection
             chosen,option=validate_selection(decision,candidate,options,selection_enabled)
             if (option and option['family']=='countertrend_sweep_reclaim' and decision.action=='trade'
                     and (decision.sizing_plan is None or decision.sizing_plan.risk_per_trade_pct>countertrend_cap)):

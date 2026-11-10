@@ -19,8 +19,19 @@ def _hold():
                                           usage=dict(prompt_tokens=100, completion_tokens=20)))
 
 
+def _wave(count=24):
+    rows=[]
+    for index in range(count):
+        phase=index % 6
+        high=10.+phase
+        low=high-1.
+        close=(high+low)/2.
+        rows.append([1_700_000_000+index*900, close, high, low, close, 1.])
+    return rows
+
+
 def _packet():
-    candles=[[index, 1.5, 2.5, 0.5, 1.25, 3] for index in range(12)]
+    candles=_wave()
     padded=[['PADDED-4H', index, 1, 2, 3, 4] for index in range(4000)]
     zone=dict(timeframe='4h', direction='bullish', low=10.5, high=12.25, open_time=100, confirmed_at=200)
     shift=dict(kind='choch', at=300, direction='bullish', level=11)
@@ -53,28 +64,21 @@ def _packet():
 def test_compact_packet_keeps_the_decision_fields_and_drops_the_padded_history():
     raw=_packet()
     compact=json.loads(compact_decision_packet(raw))
+    setup=compact['setups'][0]
     assert compact['context_policy']=='pa-context-v4-compact'
-    assert compact['zone']==[dict(timeframe='4h', direction='bullish', low=10.5, high=12.25, open_time=100, confirmed_at=200)]
-    assert compact['touch']==[280]
-    assert compact['closed_choch_mss']==[dict(kind='choch', at=300, direction='bullish', level=11)]
-    assert compact['entry']==[11]
-    assert compact['stop']==[9.5]
-    assert compact['opposing_target_levels']==[[
-        dict(timeframe='4h', open_time=80, field='high', price=14),
-        dict(timeframe='4h', open_time=40, field='high', price=18)]]
-    assert compact['setups'][0]['opposing_target_levels']==compact['opposing_target_levels'][0]
-    assert compact['equity']==80 and compact['free_margin']==42.5 and compact['leverage']==5
-    assert compact['why']=='Bölge tuttu ve teyit mumu kapandı.'
-    assert compact['text_decision_why']==compact['why']
-    assert compact['benchmarks']['BTC_USDT']['4h']['trend']=='bullish'
-    assert compact['benchmarks']['BTC_USDT']['4h']['return_6_bars']==0.02
-    assert compact['benchmarks']['ETH_USDT']['4h']['relative_return_6_bars']==0.04
-    assert compact['equity']==80
-    assert compact['free_margin']==42.5
-    assert compact['open_positions'][0]['symbol']=='BNB_USDT'
-    assert compact['confirming_candles'][0]['timeframe']=='15m'
-    assert compact['confirming_candles'][0]['recent_ohlcv'][0]==[0, 1.5, 2.5, 0.5, 1.25, 3]
-    assert len(compact['confirming_candles'][0]['recent_ohlcv'])==12
+    assert setup['lane']=='4h/15m' and setup['direction']=='long'
+    assert setup['closed_choch_price']==11
+    assert setup['stop']==9.5
+    assert setup['block_or_flow']['price']==12.25
+    assert setup['higher_timeframe_bias']=='bullish'
+    assert setup['next_target']==14
+    assert setup['farther_with_trend_targets']==[18]
+    assert compact['gates']['cost_adjusted_r']==1.25
+    assert compact['gates']['equity_stop']=='15%'
+    assert compact['gates']['free_margin']==42.5
+    assert compact['swings'] and all(point['kind'] in ('high', 'low') for point in compact['swings'])
+    assert compact['atr']>0
+    assert 'recent_ohlcv' not in compact_decision_packet(raw)
     assert 'PADDED-4H' not in compact_decision_packet(raw)
     assert len(compact_decision_packet(raw))<len(raw)
 
@@ -172,14 +176,12 @@ def test_fitting_model_receives_the_full_packet_and_groq_receives_the_compact_on
     assert len(groq)==1 and len(gemini)==1
     compact=json.loads(groq[0])
     assert compact['context_policy']=='pa-context-v4-compact'
-    assert compact['zone'][0]['low']==10.5
-    assert compact['touch']==[280]
-    assert compact['closed_choch_mss'][0]['kind']=='choch'
-    assert compact['why']=='Bölge tuttu ve teyit mumu kapandı.'
-    assert 'BTC_USDT' in compact['benchmarks'] and 'ETH_USDT' in compact['benchmarks']
-    assert compact['equity']==80 and compact['free_margin']==42.5 and compact['leverage']==5
-    assert compact['open_positions'][0]['symbol']=='BNB_USDT'
-    assert compact['confirming_candles'][0]['recent_ohlcv']
+    assert compact['setups'][0]['closed_choch_price']==11
+    assert compact['setups'][0]['stop']==9.5
+    assert compact['setups'][0]['block_or_flow']['price']==12.25
+    assert compact['setups'][0]['next_target']==14
+    assert compact['swings'] and compact['atr']>0
+    assert 'recent_ohlcv' not in groq[0]
     assert 'PADDED-4H' not in groq[0]
     assert gemini[0]==raw
     assert 'PADDED-4H' in gemini[0]
@@ -203,3 +205,84 @@ def test_skip_trace_names_the_reason_instead_of_a_blank_token_pair(tmp_path):
     text=TelegramController.diagnostics_text(fake, 'ahmet')
     assert 'does-not-fit' in text
     assert '? / ?' not in text
+
+
+def test_compact_review_stays_under_8k_and_keeps_swings_not_the_prior_paragraph(tmp_path):
+    from trading.agents.model_limits import estimate_input_tokens
+    from trading.evaluation.service import ModelDecision
+    from trading.runtime.runner3_policy import entry_gate_instruction
+
+    paragraph='Fiyat blokta durdu. '+('Eski sonuç işlemi reddeder ve gerekçeyi uzatır. '*40)
+    assert len(paragraph)>400
+    zone=dict(timeframe='4h', kind='block', direction='bullish', low=10.5, high=12.25, open_time=100, confirmed_at=200)
+    shift=dict(kind='choch', at=300, direction='bullish', level=11.11)
+    padded=[[1_600_000_000+index*14400, 1, 424242.5, 0.5, 1, 9] for index in range(500)]
+    option=dict(setup_id='setup-1', state='ready', side='long', horizon='swing', macro_trend='bullish',
+                context_timeframe='4h', trigger_timeframe='15m', entry_reference=11.11, stop_loss_price=9.5,
+                take_profit_price=14, opposing_target_levels=[
+                    dict(timeframe='4h', open_time=80, field='high', price=14),
+                    dict(timeframe='4h', open_time=40, field='high', price=18)],
+                evidence=dict(zone=zone, touch_at=280, shift=shift, kind='htf_zone_choch',
+                              alignment='with_higher_timeframe'))
+    raw=json.dumps(dict(
+        context_policy='pa-context-v4',
+        candidate=dict(symbol='LAB_USDT', side='long', entry_price=11.5),
+        market=dict(symbol='LAB_USDT', funding_rate=0.0001, timeframes=[
+            dict(timeframe='4h', recent_ohlcv=padded),
+            dict(timeframe='15m', recent_ohlcv=_wave(30)),
+        ]),
+        account=dict(capital_allocation=dict(available_usdt=42.5), setup_selection=dict(options=[option]),
+                     prior_hold=dict(rationale=paragraph, printed_trigger=11.11,
+                                     old_market=dict(note='REPEATED-HISTORY'*80, timeframes=[dict(recent_ohlcv=padded)]))),
+    ), separators=(',', ':'))
+    assert len(raw.encode())>=35000
+    compact_text=compact_decision_packet(raw)
+    assert estimate_input_tokens('', compact_text)<8000
+    compact=json.loads(compact_text)
+    assert compact['swings'] and compact['atr']>0
+    assert all(set(point)=={'timeframe', 'kind', 'price'} for point in compact['swings'])
+    assert '424242.5' not in compact_text and 'REPEATED-HISTORY' not in compact_text
+    assert 'recent_ohlcv' not in compact_text
+    setup=compact['setups'][0]
+    assert setup['closed_choch_price']==11.11 and setup['stop']==9.5
+    assert setup['block_or_flow']['kind']=='block' and setup['next_target']==14
+    assert setup['farther_with_trend_targets']==[18]
+    assert setup['distance_to_block']==abs(11.5-12.25)
+    assert setup['higher_timeframe_bias']=='bullish'
+    assert compact['funding']==0.0001
+    assert compact['prior_clause']=='Fiyat blokta durdu'
+    assert len(compact['prior_clause'])<=80
+    assert 'Eski sonuç' not in compact_text
+    assert compact['trigger']==11.11
+    assert compact['gates']==dict(cost_adjusted_r=1.25, equity_stop='15%', free_margin=42.5)
+    bare=json.loads(raw)
+    bare['market'].pop('funding_rate')
+    assert 'funding' not in json.loads(compact_decision_packet(json.dumps(bare)))
+    against=json.loads(raw)
+    against['account']['setup_selection']['options'][0]['evidence']['alignment']='against_higher_timeframe'
+    assert 'farther_with_trend_targets' not in json.loads(compact_decision_packet(json.dumps(against)))['setups'][0]
+
+    gate=entry_gate_instruction(fee=0.0006, slippage=0.0005)
+    system='Runner 3 review. '+gate+(' Use the supplied evidence only.'*300)
+    calls=[]
+
+    def transport(request):
+        calls.append(request)
+        body=dict(action='hold', signal_id=None, rationale='Geçerli bekleme kararı.',
+                  invalidation='Kurulum bozulursa bekleme biter.', watch_note='')
+        return httpx.Response(200, json=dict(choices=[dict(message=dict(content=json.dumps(body)))],
+                                              usage=dict(prompt_tokens=100, completion_tokens=20)))
+
+    cfg=settings(gemini_api_key='gemini-key', anthropic_api_key='paid', ai_claude_fallback_enabled=True)
+    provider,_store=pool(tmp_path, cfg, transport)
+    provider.response_validator=ModelDecision.model_validate
+    provider.claude.complete_json=lambda **kwargs: (_ for _ in ()).throw(AssertionError('valid BEKLE must not start fallback'))
+    assert provider.complete_json(system=system, user=raw)['action']=='hold'
+    assert len(calls)==1 and 'groq' in calls[0].url.host
+    sent_system=json.loads(calls[0].content)['messages'][0]['content']
+    sent_user=_text(calls[0])
+    assert estimate_input_tokens(sent_system, sent_user)<8000
+    assert estimate_input_tokens(sent_system, sent_user)+cfg.groq_max_completion_tokens<=8000
+    sent=json.loads(sent_user)
+    assert sent['swings'] and sent['atr'] and sent['prior_clause']=='Fiyat blokta durdu'
+    assert provider.last_trace['attempts'][0].get('status')=='success'

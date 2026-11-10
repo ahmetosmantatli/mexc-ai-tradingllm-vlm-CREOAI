@@ -182,10 +182,18 @@ def build_prompt(candidate, market, memory, positions, account, version, changes
 
 COMPACT_SYSTEM = (
     'Return JSON only for this MEXC USDT perpetual. HOLD is a valid decision. '
-    'A trade needs the supplied zone, a closed touch, and a later closed CHoCH or MSS. Touch alone is not an entry. '
-    'Use the text decision why, the BTC and ETH summary, equity, free margin, open positions, and the confirming timeframe closed candles. '
-    'If those are missing or the call would be a guess, return hold. Do not invent a trade.'
+    'Decide from the compact review. You may disagree with the prior clause; it is not an instruction. '
+    'Use the lane, direction, swing points from the last candles, higher-timeframe bias, ATR, '
+    'distance from price to the block or flow, funding when it is present, the closed CHoCH price, '
+    'the stop swing, the next target, any farther with-trend target, and the three gates '
+    '(1.25 R, 15% equity stop, free margin). '
+    'The prior note is at most one short clause plus the numeric trigger. '
+    'Raw candles are omitted and are not a hold reason. '
+    'A trade still needs that closed CHoCH at a block or a flow and a supplied target. Touch alone is not an entry. '
+    'If the decision data is missing or the call would be a guess, return hold. Do not invent a trade.'
 )
+
+PRIOR_CLAUSE_LIMIT = 80
 
 
 def system_with_entry_gate(base, full_system):
@@ -203,27 +211,219 @@ def system_with_entry_gate(base, full_system):
     return base + ' ' + clause
 
 
-def _summary_frame(frame):
-    if not isinstance(frame, dict):
-        return frame
-    summary = {key: frame.get(key) for key in ('closed_at', 'trend', 'return_6_bars', 'relative_return_6_bars', 'last_break')}
-    shifts = frame.get('structure_shifts') or []
-    if shifts:
-        summary['last_shift'] = shifts[-1]
-    return summary
+def _positive_price(value):
+    number = _finite(value)
+    if number is None or number <= 0:
+        return None
+    return number
+
+
+def _lane_name(context_tf, trigger_tf):
+    if context_tf in ('4h', '1h') and trigger_tf in ('15m', '5m'):
+        return f'{context_tf}/{trigger_tf}'
+    if isinstance(context_tf, str) and context_tf and isinstance(trigger_tf, str) and trigger_tf:
+        return f'{context_tf}/{trigger_tf}'
+    if isinstance(context_tf, str) and context_tf:
+        return context_tf
+    if isinstance(trigger_tf, str) and trigger_tf:
+        return trigger_tf
+    return None
+
+
+def _choch_price(evidence, shift):
+    if isinstance(shift, dict):
+        price = _positive_price(shift.get('level'))
+        if price is not None:
+            return price
+        nested = shift.get('context_last_shift')
+        if isinstance(nested, dict):
+            price = _positive_price(nested.get('level'))
+            if price is not None:
+                return price
+    nested = evidence.get('context_last_shift') if isinstance(evidence, dict) else None
+    if isinstance(nested, dict):
+        return _positive_price(nested.get('level'))
+    return None
+
+
+def _candle_rows(rows):
+    """Last 30 closed bars. Fewer than 20 are kept when that is all the packet has."""
+    parsed = [row for row in rows or [] if isinstance(row, (list, tuple)) and len(row) >= 5]
+    return parsed[-30:]
+
+
+def _swing_points(rows, timeframe):
+    """Pivot highs and lows from the recent window. Not open, high, low, close, or volume rows."""
+    window = _candle_rows(rows)
+    points = []
+    radius = 2
+    for index in range(radius, len(window) - radius):
+        high = _finite(window[index][2])
+        low = _finite(window[index][3])
+        neighbors = window[index - radius:index] + window[index + 1:index + radius + 1]
+        neighbor_high = [_finite(item[2]) for item in neighbors]
+        neighbor_low = [_finite(item[3]) for item in neighbors]
+        if high is not None and all(value is not None and high > value for value in neighbor_high):
+            points.append(dict(timeframe=timeframe, kind='high', price=high))
+        if low is not None and all(value is not None and low < value for value in neighbor_low):
+            points.append(dict(timeframe=timeframe, kind='low', price=low))
+    return points
+
+
+def _window_atr(rows):
+    window = _candle_rows(rows)
+    if len(window) < 2:
+        return None
+    previous = _finite(window[0][4])
+    total = 0.
+    count = 0
+    for row in window[1:]:
+        high, low, close = _finite(row[2]), _finite(row[3]), _finite(row[4])
+        if previous is None or None in (high, low, close):
+            previous = close
+            continue
+        total += max(high - low, abs(high - previous), abs(low - previous))
+        count += 1
+        previous = close
+    if not count:
+        return None
+    return total / count
+
+
+def _frames(market):
+    frames = {}
+    for view in market.get('timeframes') or []:
+        if isinstance(view, dict) and isinstance(view.get('timeframe'), str):
+            frames[view['timeframe']] = view.get('recent_ohlcv') or []
+    return frames
+
+
+def _reference_price(data, frames, trigger):
+    candidate = data.get('candidate') if isinstance(data.get('candidate'), dict) else {}
+    price = _positive_price(candidate.get('entry_price'))
+    if price is not None:
+        return price
+    rows = _candle_rows(frames.get(trigger) or [])
+    if rows:
+        return _positive_price(rows[-1][4])
+    for rows in frames.values():
+        window = _candle_rows(rows)
+        if window:
+            price = _positive_price(window[-1][4])
+            if price is not None:
+                return price
+    return None
+
+
+def _funding_rate(data, market, account, candidate):
+    """Copy a funding rate only when the supplied feed already has one."""
+    containers = [market, account, candidate]
+    features = candidate.get('features') if isinstance(candidate, dict) else None
+    if isinstance(features, dict):
+        containers.append(features)
+    ticker = market.get('ticker') if isinstance(market, dict) else None
+    if isinstance(ticker, dict):
+        containers.append(ticker)
+    if isinstance(data, dict):
+        containers.append(data)
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in ('funding_rate', 'fundingRate', 'funding', 'last_funding_rate'):
+            if key not in container:
+                continue
+            value = container[key]
+            if isinstance(value, dict):
+                value = value.get('fundingRate', value.get('funding_rate', value.get('rate')))
+            number = _finite(value)
+            if number is not None:
+                return number
+    return None
+
+
+def _short_clause(text):
+    """One short clause. The rest of a hold paragraph is not carried forward."""
+    if not isinstance(text, str):
+        return None
+    clause = ' '.join(text.split())
+    if not clause:
+        return None
+    for index, char in enumerate(clause):
+        if char in '.!?;':
+            clause = clause[:index]
+            break
+    clause = clause.strip(' ,;:-')
+    if len(clause) > PRIOR_CLAUSE_LIMIT:
+        clipped = clause[:PRIOR_CLAUSE_LIMIT].rsplit(' ', 1)[0].strip(' ,;:-')
+        clause = clipped or clause[:PRIOR_CLAUSE_LIMIT].strip()
+    return clause or None
+
+
+def _decision_setup(option, price):
+    """One lane. Candles stay out; the caller supplies swing points and ATR."""
+    evidence = option.get('evidence') if isinstance(option.get('evidence'), dict) else {}
+    zone = evidence.get('zone') if isinstance(evidence.get('zone'), dict) else {}
+    shift = evidence.get('shift') if isinstance(evidence.get('shift'), dict) else {}
+    direction = option.get('side') if option.get('side') in ('long', 'short') else None
+    kind = zone.get('kind') if zone.get('kind') in ('block', 'flow') else None
+    low = _positive_price(zone.get('low'))
+    high = _positive_price(zone.get('high'))
+    block_price = (low if low is not None else high) if direction == 'short' else (high if high is not None else low)
+    prices = []
+    levels = option.get('opposing_target_levels')
+    for level in levels if isinstance(levels, list) else []:
+        if not isinstance(level, dict):
+            continue
+        level_price = _positive_price(level.get('price'))
+        if level_price is not None and level_price not in prices:
+            prices.append(level_price)
+    if not prices:
+        target = _positive_price(option.get('take_profit_price', option.get('target')))
+        if target is not None:
+            prices.append(target)
+    bias = option.get('macro_trend')
+    if bias not in ('bullish', 'bearish'):
+        bias = zone.get('direction') if zone.get('direction') in ('bullish', 'bearish') else None
+    card = {}
+    lane = _lane_name(option.get('context_timeframe') or zone.get('timeframe'), option.get('trigger_timeframe'))
+    if lane:
+        card['lane'] = lane
+    if direction:
+        card['direction'] = direction
+    choch = _choch_price(evidence, shift)
+    if choch is not None:
+        card['closed_choch_price'] = choch
+    stop = _positive_price(option.get('stop_loss_price', option.get('stop')))
+    if stop is not None:
+        card['stop'] = stop
+    if kind or block_price is not None:
+        block = {}
+        if kind:
+            block['kind'] = kind
+        if block_price is not None:
+            block['price'] = block_price
+        card['block_or_flow'] = block
+        if price is not None and block_price is not None:
+            card['distance_to_block'] = abs(price - block_price)
+    if bias:
+        card['higher_timeframe_bias'] = bias
+    if prices:
+        card['next_target'] = prices[0]
+        if evidence.get('alignment') != 'against_higher_timeframe' and len(prices) > 1:
+            card['farther_with_trend_targets'] = prices[1:]
+    return card or None
 
 
 def compact_decision_packet(user):
-    """Smaller user packet for an 8K TPM model. Required decision fields stay intact.
+    """Smaller user packet for an 8K TPM model. Not a restatement of the prior conclusion.
 
     Returns canonical JSON, or None when the text is not a decision packet.
-    Callers must not delete zone, touch, CHoCH/MSS, the supplied opposing
-    target levels, entry, stop, why, BTC/ETH, equity, free margin, leverage,
-    open positions, or the confirming candles to force a fit. The entry-gate
-    text keeps the fee, exit slippage, the 1.25 condition, the equity stop
-    cap, and the rule that a trade on a supplied opposing target is not
-    rejected for cost-adjusted R.
-    The full packet used for Gemini is never rewritten here.
+    Keeps short fields: swing points from the last 20 to 30 candles, higher-timeframe
+    bias, ATR, distance from price to the block or flow, funding when the feed
+    already has it, the closed CHoCH price, the stop swing, the next target, any
+    farther with-trend target, and the three gates. The prior hold is at most one
+    short clause plus the numeric trigger that fired. Raw candles and repeated
+    history are dropped. The full packet used for Gemini is never rewritten here.
     """
     if not isinstance(user, str) or not user.startswith('{'):
         return None
@@ -237,87 +437,63 @@ def compact_decision_packet(user):
     market = data.get('market') if isinstance(data.get('market'), dict) else {}
     if data.get('context_policy') not in (POLICY_VERSION, 'pa-context-v4-compact') and not account and not market:
         return None
+    from trading.runtime.runner3_policy import CONTINUOUS_STOP_RISK_CAP, MIN_NET_TARGET_R
+    candidate = data.get('candidate') if isinstance(data.get('candidate'), dict) else {}
+    frames = _frames(market)
     options = (account.get('setup_selection') or {}).get('options') if isinstance(account.get('setup_selection'), dict) else []
-    kept = []
-    confirm = set()
+    parsed = []
     for option in options if isinstance(options, list) else []:
         if not isinstance(option, dict):
             continue
-        evidence = option.get('evidence') if isinstance(option.get('evidence'), dict) else {}
-        shift = evidence.get('shift')
-        if shift is None:
-            shift = dict(kind=evidence.get('kind'), confirmation_at=evidence.get('confirmation_at'),
-                         context_last_shift=evidence.get('context_last_shift'))
         trigger = option.get('trigger_timeframe')
-        if trigger:
-            confirm.add(trigger)
-        levels = option.get('opposing_target_levels')
-        kept.append(dict(setup_id=option.get('setup_id'), state=option.get('state'), side=option.get('side'),
-                         horizon=option.get('horizon'), context_timeframe=option.get('context_timeframe'),
-                         trigger_timeframe=trigger, zone=evidence.get('zone'), touch_at=evidence.get('touch_at'),
-                         closed_choch_mss=shift, alignment=evidence.get('alignment'),
-                         entry=option.get('entry_reference', option.get('entry')),
-                         stop=option.get('stop_loss_price', option.get('stop')),
-                         target=option.get('take_profit_price', option.get('target')),
-                         opposing_target_levels=levels if isinstance(levels, list) else [],
-                         reason=option.get('caveat') or evidence.get('kind')))
-    if not confirm:
-        confirm = {'15m', '5m'}
-    candles = []
-    for view in market.get('timeframes') or []:
-        if isinstance(view, dict) and view.get('timeframe') in confirm:
-            candles.append(dict(timeframe=view.get('timeframe'), closed_at=view.get('closed_at'),
-                                recent_ohlcv=view.get('recent_ohlcv')))
-    raw_bench = market.get('benchmarks') if isinstance(market.get('benchmarks'), dict) else {}
-    benchmarks = {}
-    for symbol in ('BTC_USDT', 'ETH_USDT'):
-        frames = raw_bench.get(symbol)
-        if isinstance(frames, dict):
-            benchmarks[symbol] = {name: _summary_frame(frame) for name, frame in frames.items()}
-        else:
-            benchmarks[symbol] = frames
-    text = account.get('text_model_decision') if isinstance(account.get('text_model_decision'), dict) else {}
-    card = data.get('setup_card') if isinstance(data.get('setup_card'), dict) else {}
-    changed = data.get('what_changed') if isinstance(data.get('what_changed'), dict) else {}
-    why = text.get('rationale') or card.get('last_reason') or changed.get('summary')
+        if not isinstance(trigger, str):
+            zone = (option.get('evidence') or {}).get('zone') if isinstance(option.get('evidence'), dict) else {}
+            trigger = zone.get('timeframe') if isinstance(zone, dict) else None
+        trigger = trigger if isinstance(trigger, str) else None
+        price = _reference_price(data, frames, trigger)
+        card = _decision_setup(option, price)
+        if card:
+            parsed.append((option.get('state'), trigger, card))
+    ready_states = [(trigger, card) for state, trigger, card in parsed if state == 'ready']
+    chosen = ready_states or [(trigger, card) for _, trigger, card in parsed]
+    setups = [card for _, card in chosen]
+    triggers = []
+    for trigger, _card in chosen:
+        if trigger and trigger not in triggers:
+            triggers.append(trigger)
+    if not triggers:
+        for name in ('15m', '5m', '1h', '4h'):
+            if name in frames:
+                triggers.append(name)
+                break
+    swings = []
+    atr = None
+    for timeframe in triggers:
+        swings.extend(_swing_points(frames.get(timeframe), timeframe))
+        if atr is None:
+            atr = _window_atr(frames.get(timeframe))
     capital = account.get('capital_allocation') if isinstance(account.get('capital_allocation'), dict) else {}
     operating = account.get('operating_context') if isinstance(account.get('operating_context'), dict) else {}
-    equity = capital.get('equity_usdt', account.get('equity', operating.get('equity_snapshot_usdt')))
     free_margin = capital.get('available_usdt', operating.get('available_usdt', account.get('available')))
-    leverage = _finite(account.get('leverage'))
-    if leverage is None or leverage < 1:
-        limits = account.get('sizing_limits') if isinstance(account.get('sizing_limits'), dict) else {}
-        leverage = _finite(limits.get('exchange_max_leverage'))
-        if leverage is None or leverage < 1:
-            leverage = _finite(limits.get('policy_max_leverage'))
-    positions = data.get('open_positions')
-    if positions is None:
-        positions = capital.get('open_positions', operating.get('open_positions'))
-    packet = dict(context_policy='pa-context-v4-compact',
-                  symbol=(data.get('candidate') or {}).get('symbol') if isinstance(data.get('candidate'), dict) else market.get('symbol'),
-                  zone=[row.get('zone') for row in kept], touch=[row.get('touch_at') for row in kept],
-                  closed_choch_mss=[row.get('closed_choch_mss') for row in kept],
-                  entry=[row.get('entry') for row in kept], stop=[row.get('stop') for row in kept],
-                  opposing_target_levels=[row.get('opposing_target_levels') for row in kept], why=why,
-                  text_decision_why=text.get('rationale'), benchmarks=benchmarks, equity=equity,
-                  free_margin=free_margin, open_positions=positions if positions is not None else [],
-                  confirming_candles=candles, setups=kept)
-    if leverage is not None and leverage >= 1:
-        packet['leverage'] = leverage
-    gates = account.get('runner3_entry_gate')
-    if isinstance(gates, str) and gates.strip():
-        packet['entry_gates'] = gates
-    summary = market.get('summary')
-    if isinstance(summary, dict):
-        packet['summary'] = summary
+    symbol = candidate.get('symbol') if isinstance(candidate.get('symbol'), str) else market.get('symbol')
+    packet = dict(
+        context_policy='pa-context-v4-compact',
+        symbol=symbol if isinstance(symbol, str) else None,
+        swings=swings,
+        atr=atr,
+        setups=setups,
+        gates=dict(cost_adjusted_r=MIN_NET_TARGET_R, equity_stop=f'{CONTINUOUS_STOP_RISK_CAP:.0%}', free_margin=free_margin))
+    funding = _funding_rate(data, market, account, candidate)
+    if funding is not None:
+        packet['funding'] = funding
     prior = account.get('prior_hold')
     if isinstance(prior, dict):
-        old_market = prior.get('old_market') if isinstance(prior.get('old_market'), dict) else {}
-        packet['prior_hold'] = dict(
-            rationale=prior.get('rationale'), triggers=prior.get('triggers'),
-            printed_trigger=prior.get('printed_trigger'), old_observed_at=old_market.get('observed_at'))
-    if not isinstance(packet['symbol'], str):
-        packet['symbol'] = market.get('symbol')
+        clause = _short_clause(prior.get('rationale'))
+        if clause:
+            packet['prior_clause'] = clause
+        trigger = _positive_price(prior.get('printed_trigger'))
+        if trigger is not None:
+            packet['trigger'] = trigger
     return canonical(packet)
 
 
