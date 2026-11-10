@@ -324,3 +324,106 @@ def test_runner3_watch_uses_supplied_zone_trigger_and_invalidation(tmp_path, mon
     assert result.metadata['watch_plan']['trigger_price']==97.
     assert result.metadata['watch_plan']['invalidation_price']==94.
     assert store.get('analysis_trace')['htf_evidence']['evidence']['stage']=='awaiting_touch'
+
+
+def _fresh_htf_market():
+    from .test_runner3_llm_vlm_limits import rebase_market
+    return rebase_market()
+
+
+def _runner(tmp_path, monkeypatch, market, answer, **account):
+    monkeypatch.setattr('trading.analysis.build_bundle', lambda *args, **kwargs:
+        SimpleNamespace(fingerprint='zone', to_context=lambda **kw: deepcopy(market)))
+    monkeypatch.setattr('trading.analysis.render_bundle', lambda *a, **kw: [])
+    cfg = Settings(_env_file=None, analysis_version='text', live_structure_setups_enabled=True,
+                   live_price_plan_enabled=True)
+    store = RuntimeStore(str(tmp_path / 'state'))
+    evaluator = ContextEvaluator(SimpleNamespace(budget=None, complete_json=answer), store,
+        SimpleNamespace(get_contract_rules=lambda _: SimpleNamespace(max_leverage=20, price_step=.01)), cfg)
+    seed = signal(Side.LONG)
+    seed.entry_price = 101.
+    context = dict(mode='LIVE', currency='USDT', runner_id='runner3', current_equity=11.58, available_usdt=11.58)
+    context.update(account)
+    result = evaluator.evaluate_candidates([seed], equity=11.58, risk_per_trade_pct=.03, target_leverage=20,
+        live_account_context=context, live_positions={})
+    return result, store
+
+
+def test_closed_card_trade_without_price_plan_is_kept(tmp_path, monkeypatch):
+    market = _fresh_htf_market()
+
+    def answer(**request):
+        packet = json.loads(request['user'])
+        option = next(row for row in packet['account']['setup_selection']['options']
+                      if row['state'] == 'ready' and row['family'] == 'pullback')
+        assert option['evidence']['shift']['kind'] in ('choch', 'mss')
+        assert option['evidence']['zone']['kind'] in ('block', 'flow')
+        return dict(action='trade', signal_id=packet['candidate']['signal_id'], setup_id=option['setup_id'],
+                    rationale='Kapalı CHoCH ve blok duruyor.', invalidation='Yapısal dip altı.', watch_note='',
+                    sizing_plan=dict(leverage=5, risk_per_trade_pct=.001), price_plan=None)
+
+    result, store = _runner(tmp_path, monkeypatch, market, answer)
+    assert result.hold_reason != 'invalid_or_unavailable_model'
+    trace = store.get('analysis_trace')
+    assert trace['status'] == 'completed'
+    issues = [issue.get('type') for attempt in trace.get('attempts') or []
+              for issue in attempt.get('validation_issues') or []]
+    assert 'setup_requires_ready_context_price_plan' not in issues
+
+
+def test_closed_card_hold_is_kept(tmp_path, monkeypatch):
+    market = _fresh_htf_market()
+
+    def answer(**request):
+        packet = json.loads(request['user'])
+        option = next(row for row in packet['account']['setup_selection']['options'] if row['state'] == 'ready')
+        return dict(action='hold', signal_id=packet['candidate']['signal_id'], setup_id=option['setup_id'],
+                    rationale='Kapalı kart var, yine de bekle.', invalidation='Kurulum bozulursa bekleme biter.',
+                    watch_note='', price_plan=None)
+
+    result, store = _runner(tmp_path, monkeypatch, market, answer)
+    assert result.hold_reason != 'invalid_or_unavailable_model'
+    assert store.get('analysis_trace')['status'] == 'completed'
+
+
+def test_awaiting_touch_trade_stays_a_hold(tmp_path, monkeypatch):
+    from .test_structure_setups import htf_zone_context
+
+    market = htf_zone_context('4h', '15m')
+    market['symbol'] = 'BTC_USDT'
+    view(market, '15m')['recent_ohlcv'][-3][3] = 98.
+
+    def answer(**request):
+        packet = json.loads(request['user'])
+        option, = packet['account']['setup_selection']['options']
+        assert option['evidence']['stage'] == 'awaiting_touch'
+        return dict(action='trade', signal_id=None, setup_id=option['setup_id'],
+                    rationale='Temas yok, bu bir giriş değil.', invalidation='Bölgenin alt sınırı.',
+                    watch_note='', price_plan=None)
+
+    result, store = _runner(tmp_path, monkeypatch, market, answer)
+    assert result.hold_reason == 'hold'
+    assert result.action.value == 'hold'
+    assert store.get('analysis_trace')['status'] == 'completed'
+
+
+def test_kept_closed_card_still_loses_to_free_margin(tmp_path, monkeypatch):
+    market = _fresh_htf_market()
+
+    def answer(**request):
+        packet = json.loads(request['user'])
+        option = next(row for row in packet['account']['setup_selection']['options']
+                      if row['state'] == 'ready' and row['family'] == 'pullback')
+        return dict(action='trade', signal_id=packet['candidate']['signal_id'], setup_id=option['setup_id'],
+                    rationale='Kapalı CHoCH ve blok duruyor.', invalidation='Yapısal dip altı.', watch_note='',
+                    sizing_plan=dict(leverage=5, risk_per_trade_pct=.001), price_plan=None)
+
+    result, store = _runner(tmp_path, monkeypatch, market, answer, available_usdt=0)
+    assert result.hold_reason == 'free_margin'
+    assert store.get('analysis_trace')['status'] == 'completed'
+
+
+def test_incomplete_setup_without_price_plan_is_still_discarded(tmp_path, monkeypatch):
+    run, source, calls, override, store = prepare(tmp_path, monkeypatch)
+    override.update(price_plan=None)
+    assert run().hold_reason == 'invalid_or_unavailable_model'
