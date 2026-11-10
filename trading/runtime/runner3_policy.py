@@ -407,8 +407,9 @@ def supplied_target_identities(setup):
 def entry_gate_instruction(*, fee, slippage):
     """Prompt text for the cost gate validate_economics still enforces.
 
-    A real setup tries a farther supplied level before BEKLE. The 1.25 floor
-    is unchanged: the engine still rejects cost-adjusted R under that floor.
+    A real setup with a supplied opposing target that clears the floor must
+    be ENTER at that target. BEKLE is only missing confirmation or no
+    supplied level that clears the floor. The floor stays 1.25.
     """
     fee = _cost_number(fee)
     slippage = _cost_number(slippage)
@@ -429,8 +430,12 @@ def entry_gate_instruction(*, fee, slippage):
         f'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < {MIN_NET_TARGET_R:.2f}, and when gross <= 0 or (gross - net) / gross > {MAX_COST_SHARE:.2f}.',
         f'The continuous equity stop cap is {CONTINUOUS_STOP_RISK_CAP:.0%} of equity. One stop cannot lose more than that fraction of equity.',
         f'When continuous aggressive is off, aggressive model sizing uses the {AGGRESSIVE_STOP_RISK_CAP:.0%} equity stop cap.',
-        f'When the setup is real (zone, touch, and a later closed CHoCH/MSS), first choose a farther target that is one of the supplied opposing target levels and whose cost-adjusted R clears {MIN_NET_TARGET_R:.2f}.',
-        f'BEKLE (action hold) only when none of the supplied levels clears {MIN_NET_TARGET_R:.2f}.',
+        f'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears {MIN_NET_TARGET_R:.2f}, you must ENTER (action trade) at that supplied target.',
+        f'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears {MIN_NET_TARGET_R:.2f}.',
+        f'If you BEKLE because no supplied level clears {MIN_NET_TARGET_R:.2f}, say that. Do not cite account balance or other risk-management limits in its place.',
+        'These are not BEKLE reasons: account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
+        'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
+        'The equity stop cap and free margin change size after ENTER. They are not BEKLE reasons, and they do not replace the cost-adjusted R check.',
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
         ENTRY_GATE_END,
