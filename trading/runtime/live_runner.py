@@ -554,7 +554,10 @@ class LiveRunner:
         if runner_id!='runner3':
             limits['available_margin']=snapshot['balance']['available']/margin_rate*.95
         if runner_id=='runner3':
-            runner3_policy.validate_economics(gross_target,expected_net,unit_loss)
+            supplied = runner3_policy.order_names_supplied_target(
+                setup, result.metadata.get('price_plan'),
+                stop=proposal.stop_loss.price, target=proposal.take_profit_price)
+            runner3_policy.validate_economics(gross_target,expected_net,unit_loss,supplied_target=supplied)
             balance = snapshot['balance']
             available = balance['available']
             if model_sizing and balance.get('available_open') is not None:
@@ -617,6 +620,10 @@ class LiveRunner:
         if runner_id == 'runner3':
             proposal.metadata['htf_setup'] = {key: copy.deepcopy(setup[key]) for key in
                 ('context_timeframe','trigger_timeframe','evidence')}
+            proposal.metadata['runner3_target_setup'] = {
+                key: copy.deepcopy(setup.get(key)) for key in
+                ('side', 'state', 'evidence', 'stop_loss_price', 'stop_reference',
+                 'target_reference', 'opposing_target_levels')}
         return proposal
 
     def _record_entry_rejection(self, candidate, trace_id, reason, details=None, *, notify=True):

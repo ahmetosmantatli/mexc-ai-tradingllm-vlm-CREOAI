@@ -243,7 +243,10 @@ class ApprovedLiveExecutor(PositionManagementMixin):
             planned_loss=abs(worst_entry-worst_stop)*quantity+self.fee*quantity*(worst_entry+worst_stop)
         if planned_loss>proposal.max_loss_if_stopped+1e-8:raise LiveExecutionError('fees_slippage_exceed_approved_risk')
         if proposal.metadata.get('runner_id')=='runner3':
-            runner3_policy.validate_economics(gross,net,unit_loss)
+            supplied = runner3_policy.order_names_supplied_target(
+                proposal.metadata.get('runner3_target_setup'), proposal.metadata.get('price_plan'),
+                stop=sl, target=tp)
+            runner3_policy.validate_economics(gross,net,unit_loss,supplied_target=supplied)
         if notional/proposal.leverage+notional*self.fee>available:raise LiveExecutionError('insufficient_available_margin')
         side=1 if proposal.side.value=='long' else 2
         private_maintenance=max(row['maintenance_rate'] for group in ('risk_limits','leverage')

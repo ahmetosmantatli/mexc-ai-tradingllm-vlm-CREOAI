@@ -284,6 +284,8 @@ class ContextEvaluator:
                 note=('Confirmed plans share one balance. Simultaneous local limits are ranked by cost-adjusted R. '
                       'A local limit does not reserve margin. Equity under 100 USDT still needs a valid zone, '
                       'a closed touch, and a later closed CHoCH/MSS. It is not a BEKLE reason when a supplied target clears cost-adjusted R 1.25. Touch alone never places an order. '
+                      'Balance, free margin, and leverage (the multiplier) stay in this packet so you can size. They are not BEKLE reasons. '
+                      'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
                       'The risk engine still caps size and loss. Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
                       'release_symbol closes one different open position only when its thesis is invalidated and free margin cannot fund the new plan. '
                       'The close uses the single writer and the new entry waits until the exchange confirms that close.'))
@@ -470,6 +472,8 @@ class ContextEvaluator:
                      'Swing stays 4h zone then 15m confirmation. Intraday stays 1h zone then 5m confirmation. Touch alone is not an entry. '
                      'Equity under 100 USDT still needs the valid HTF zone, a closed touch, '
                      'and a later closed CHoCH/MSS. It is not a BEKLE reason when a supplied target clears cost-adjusted R 1.25. Touch alone never places an order. The risk engine still caps size and loss. '
+                     'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons. '
+                     'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
                      'Queued confirmed plans share one balance. Simultaneous local limits are ranked by cost-adjusted R, not by preference. '
                      'Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
                      'release_symbol may name one different open position only when thesis_invalidated is true and that thesis is already invalidated, '
@@ -477,8 +481,11 @@ class ContextEvaluator:
                      'The close uses the single order writer and the new entry waits until the exchange confirms that close. '
                      'limit_price is optional. Omit it or null for a market-now entry. A number is stored locally and is not a resting exchange order. '
                      'A real setup (zone, touch, and a closed CHoCH/MSS) with at least one supplied opposing target whose cost-adjusted R clears 1.25 must be ENTER at that target. '
-                     'BEKLE only when confirmation is missing or none of the supplied levels clears 1.25. '
-                     'Account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons. '
+                     'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
+                     'If your action is trade and the target you name is one of the supplied opposing levels, the engine does not reject that choice for cost-adjusted R. '
+                     'A silent answer or BEKLE opens nothing. '
+                     'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons. '
+                     'Account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not BEKLE reasons. '
                      'Do not move the stop to manufacture R. Do not invent a level. Do not invent a trade if you are silent.')
         decision_mode = None
         winning_identity = {}
@@ -516,7 +523,9 @@ class ContextEvaluator:
                                   'You have two minutes to answer. A valid answer in that time is the decision. '
                                   'You may rebuild the plan onto a supplied opposing target, take the market-now setup, or name limit_price. '
                                   'Do not drop or refuse a real setup when a supplied opposing target clears cost-adjusted R 1.25. '
-                                  'Account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not reasons to drop it. '
+                                  'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
+                                  'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not reasons to drop the setup. '
+                                  'Account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, and "watch already exists" are not reasons to drop it. '
                                   'An answer after the order is already sent does not unwind it. It may only update the saved local plan for the next trigger. '
                                   'limit_price is stored locally and is not a resting exchange order. '
                                   'Price reaching it only reopens analysis; confirmation is still required. '

@@ -326,8 +326,16 @@ def ioc_target_economics(*, side, entry, stop, target, fee, slippage):
     return abs(target - entry), net, loss
 
 
-def validate_economics(gross, net, loss):
-    if loss <= 0 or net / loss < MIN_NET_TARGET_R:
+def validate_economics(gross, net, loss, *, supplied_target=False):
+    """Reject a broken payoff.
+
+    ``supplied_target`` is true only for a trade whose target is one of the
+    supplied opposing levels on a setup that still has its zone, touch, and
+    closed CHoCH/MSS, and whose stop was not moved. That choice is not
+    rejected for cost-adjusted R. Loss, gross, and the cost share still
+    reject. The equity stop cap is a separate check.
+    """
+    if loss <= 0 or (not supplied_target and net / loss < MIN_NET_TARGET_R):
         raise ValueError('runner3_net_target_r_too_low')
     if gross <= 0 or (gross - net) / gross > MAX_COST_SHARE:
         raise ValueError('runner3_cost_share_too_high')
@@ -404,12 +412,85 @@ def supplied_target_identities(setup):
     return found
 
 
-def entry_gate_instruction(*, fee, slippage):
-    """Prompt text for the cost gate validate_economics still enforces.
+def _plan_value(plan, name):
+    if isinstance(plan, dict):
+        return plan.get(name)
+    if plan is None:
+        return None
+    return getattr(plan, name, None)
 
-    A real setup with a supplied opposing target that clears the floor must
-    be ENTER at that target. BEKLE is only missing confirmation or no
-    supplied level that clears the floor. The floor stays 1.25.
+
+def _positive_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) and value > 0
+
+
+def closed_entry_structure(setup):
+    """Zone, a touch, and a closed CHoCH/MSS. Missing any one is not this trade."""
+    if not isinstance(setup, dict) or setup.get('state') != 'ready' or setup.get('side') not in ('long', 'short'):
+        return False
+    evidence = setup.get('evidence')
+    if not isinstance(evidence, dict) or evidence.get('stage') != 'confirmed':
+        return False
+    zone = evidence.get('zone')
+    if not isinstance(zone, dict) or not _positive_number(zone.get('low')) or not _positive_number(zone.get('high')):
+        return False
+    if zone['low'] >= zone['high'] or not _positive_number(evidence.get('touch_at')):
+        return False
+    shift = evidence.get('shift')
+    if not isinstance(shift, dict) or shift.get('kind') not in ('choch', 'mss'):
+        return False
+    return evidence.get('kind') == 'htf_zone_' + shift['kind']
+
+
+def _same_price(left, right):
+    return abs(left - right) <= max(1e-8, abs(right) * 1e-9)
+
+
+def _stop_was_not_moved(setup, plan):
+    """The named stop is the supplied stop. A tighter or wider price is a move."""
+    if _target_identity(_plan_value(plan, 'stop_reference')) != _target_identity(setup.get('stop_reference')):
+        return False
+    plan_stop = _plan_value(plan, 'stop_loss_price')
+    setup_stop = setup.get('stop_loss_price')
+    if not _positive_number(plan_stop) or not _positive_number(setup_stop):
+        return False
+    return _same_price(plan_stop, setup_stop)
+
+
+def model_supplied_target(setup, plan, *, action='trade'):
+    """A trade that names one supplied opposing level and does not move the stop.
+
+    Hold, a missing plan, an invented level, a moved stop, or a setup without
+    a zone, a touch, and a closed CHoCH/MSS is not this choice.
+    """
+    if action != 'trade' or plan is None or not closed_entry_structure(setup):
+        return False
+    if not _stop_was_not_moved(setup, plan):
+        return False
+    identity = _target_identity(_plan_value(plan, 'target_reference'))
+    return identity is not None and identity in supplied_target_identities(setup)
+
+
+def order_names_supplied_target(setup, plan, *, stop, target, action='trade'):
+    """The order uses the stop and target the model named on a supplied level."""
+    if not model_supplied_target(setup, plan, action=action):
+        return False
+    plan_stop = _plan_value(plan, 'stop_loss_price')
+    plan_target = _plan_value(plan, 'take_profit_price')
+    if not all(_positive_number(value) for value in (stop, target, plan_stop, plan_target)):
+        return False
+    return _same_price(stop, plan_stop) and _same_price(target, plan_target)
+
+
+def entry_gate_instruction(*, fee, slippage):
+    """Prompt for the cost gate.
+
+    The model knows the 1.25 condition, the balance, and the leverage
+    multiplier. It may choose a farther supplied opposing target when 1.25
+    would otherwise block, and that choice stands. A trade on a supplied
+    opposing level is not rejected for cost-adjusted R. Zone, touch, and a
+    closed CHoCH/MSS stay required. A silent answer or BEKLE opens nothing.
+    The equity stop cap still applies, and the stop is not moved.
     """
     fee = _cost_number(fee)
     slippage = _cost_number(slippage)
@@ -427,15 +508,17 @@ def entry_gate_instruction(*, fee, slippage):
         'net = direction * (target_fill - entry) - fee * (entry + target_fill).',
         'cost_adjusted_R = net / loss.',
         'gross = abs(target - entry).',
-        f'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < {MIN_NET_TARGET_R:.2f}, and when gross <= 0 or (gross - net) / gross > {MAX_COST_SHARE:.2f}.',
+        f'The engine rejects the proposal when loss <= 0, and when gross <= 0 or (gross - net) / gross > {MAX_COST_SHARE:.2f}.',
         f'The continuous equity stop cap is {CONTINUOUS_STOP_RISK_CAP:.0%} of equity. One stop cannot lose more than that fraction of equity.',
         f'When continuous aggressive is off, aggressive model sizing uses the {AGGRESSIVE_STOP_RISK_CAP:.0%} equity stop cap.',
         f'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears {MIN_NET_TARGET_R:.2f}, you must ENTER (action trade) at that supplied target.',
-        f'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears {MIN_NET_TARGET_R:.2f}.',
-        f'If you BEKLE because no supplied level clears {MIN_NET_TARGET_R:.2f}, say that. Do not cite account balance or other risk-management limits in its place.',
-        'These are not BEKLE reasons: account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
+        f'When {MIN_NET_TARGET_R:.2f} would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.',
+        'If your action is trade and the target you name is one of the supplied opposing levels, the engine does not reject that choice for cost-adjusted R.',
+        'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons.',
+        'These are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
-        'The equity stop cap and free margin change size after ENTER. They are not BEKLE reasons, and they do not replace the cost-adjusted R check.',
+        f'The {CONTINUOUS_STOP_RISK_CAP:.0%} equity stop cap still applies. Do not move the stop.',
+        'A silent answer or BEKLE (action hold) opens nothing.',
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
         ENTRY_GATE_END,

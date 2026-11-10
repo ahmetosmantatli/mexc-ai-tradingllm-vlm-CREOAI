@@ -364,15 +364,17 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
         'net = direction * (target_fill - entry) - fee * (entry + target_fill).',
         'cost_adjusted_R = net / loss.',
         'gross = abs(target - entry).',
-        'The engine rejects the proposal when loss <= 0 or cost_adjusted_R < 1.25, and when gross <= 0 or (gross - net) / gross > 0.30.',
+        'The engine rejects the proposal when loss <= 0, and when gross <= 0 or (gross - net) / gross > 0.30.',
         'The continuous equity stop cap is 15% of equity. One stop cannot lose more than that fraction of equity.',
         'When continuous aggressive is off, aggressive model sizing uses the 10% equity stop cap.',
         'When the setup is real (zone, touch, and a closed CHoCH/MSS) and at least one supplied opposing target has cost-adjusted R that clears 1.25, you must ENTER (action trade) at that supplied target.',
-        'BEKLE (action hold) only when confirmation is missing, or when none of the supplied levels clears 1.25.',
-        'If you BEKLE because no supplied level clears 1.25, say that. Do not cite account balance or other risk-management limits in its place.',
-        'These are not BEKLE reasons: account balance, free margin, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
+        'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands.',
+        'If your action is trade and the target you name is one of the supplied opposing levels, the engine does not reject that choice for cost-adjusted R.',
+        'Balance, free margin, and leverage (the multiplier) stay in the packet so you can size. They are not BEKLE reasons.',
+        'These are not BEKLE reasons: account balance, free margin, leverage, open positions, a higher-timeframe trend that disagrees, consolidation or a correction, or "watch already exists".',
         'When the supplied setup already has a closed CHoCH/MSS, an unbroken higher timeframe is not missing confirmation.',
-        'The equity stop cap and free margin change size after ENTER. They are not BEKLE reasons, and they do not replace the cost-adjusted R check.',
+        'The 15% equity stop cap still applies. Do not move the stop.',
+        'A silent answer or BEKLE (action hold) opens nothing.',
         'Do not move the stop to manufacture R. Do not invent a level that was not supplied.',
         'Do not invent a trade when you are silent.',
     ):
@@ -380,7 +382,14 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
     assert 'must be BEKLE (action hold) or a farther target' not in text
     assert 'first choose a farther target' not in text
     assert 'BEKLE (action hold) only when none of the supplied levels clears 1.25.' not in text
-    assert text.index('you must ENTER (action trade)') < text.index('BEKLE (action hold) only when confirmation is missing')
+    assert 'BEKLE (action hold) only when confirmation is missing' not in text
+    assert 'cost_adjusted_R < 1.25' not in text
+    assert 'do not replace the cost-adjusted R check' not in text
+    assert 'If you BEKLE because no supplied level clears 1.25' not in text
+    assert text.index('you must ENTER (action trade)') < text.index('would otherwise block')
+    assert text.index('would otherwise block') < text.index('That choice stands')
+    assert text.index('That choice stands') < text.index('does not reject that choice for cost-adjusted R')
+    assert text.index('Balance, free margin, and leverage (the multiplier) stay in the packet') < text.index('Do not move the stop to manufacture R')
     assert text.index('These are not BEKLE reasons') < text.index('Do not move the stop to manufacture R')
     compact_system = system_with_entry_gate(COMPACT_SYSTEM, 'full policy\n' + text + '\nmore')
     assert 'cost_adjusted_R = net / loss.' in compact_system
@@ -424,3 +433,71 @@ def test_a_farther_supplied_target_is_allowed_and_the_floor_stays():
     validate_economics(1.5, 1.25, 1.)
     with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
         validate_economics(1.5, 1.249, 1.)
+
+
+def test_a_model_chosen_supplied_target_is_not_rejected_for_r():
+    from time import time
+
+    from trading.evaluation.price_plan import CandleReference, MarketPricePlan
+    from trading.runtime.runner3_policy import (
+        CONTINUOUS_STOP_RISK_CAP, MIN_NET_TARGET_R, ioc_target_economics,
+        order_names_supplied_target, validate_economics)
+
+    assert MIN_NET_TARGET_R == 1.25
+    assert CONTINUOUS_STOP_RISK_CAP == .15
+    near = dict(timeframe='4h', open_time=2, field='high', price=110.)
+    far = dict(timeframe='4h', open_time=3, field='high', price=130.)
+    stop = CandleReference(timeframe='15m', open_time=1, field='low')
+    setup = dict(
+        side='long', state='ready', context_timeframe='4h', trigger_timeframe='15m',
+        evidence=dict(
+            kind='htf_zone_mss', stage='confirmed', expires_at=time() + 60,
+            zone=dict(timeframe='4h', direction='bullish', low=95., high=99., open_time=1, confirmed_at=2),
+            touch_at=10., shift=dict(kind='mss', at=11, direction='bullish', level=100.),
+            confirmation_at=12.),
+        stop_loss_price=90., stop_reference=stop.model_dump(),
+        target_reference={key: near[key] for key in ('timeframe', 'open_time', 'field')},
+        opposing_target_levels=[near, far])
+    far_plan = MarketPricePlan(
+        entry_type='market', entry_price=100, stop_loss_price=90, take_profit_price=105,
+        entry_timeframe='15m', stop_reference=stop,
+        target_reference=CandleReference(timeframe='4h', open_time=3, field='high'),
+        reason='Daha uzak verilen seviyede potansiyel var.')
+    gross, net, loss = ioc_target_economics(
+        side='long', entry=100, stop=90, target=105, fee=0.0006, slippage=0.0005)
+    assert loss > 0 and net / loss < MIN_NET_TARGET_R
+    assert (gross - net) / gross <= 0.30
+    assert order_names_supplied_target(setup, far_plan, stop=90, target=105) is True
+    validate_economics(gross, net, loss, supplied_target=True)
+    with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
+        validate_economics(gross, net, loss)
+    with pytest.raises(ValueError, match='runner3_net_target_r_too_low'):
+        validate_economics(1.0, 0.9, 0, supplied_target=True)
+    with pytest.raises(ValueError, match='runner3_cost_share_too_high'):
+        validate_economics(1.0, 0.5, 1.0, supplied_target=True)
+
+    near_plan = far_plan.model_copy(update={
+        'take_profit_price': 110,
+        'target_reference': CandleReference(timeframe='4h', open_time=2, field='high')})
+    assert order_names_supplied_target(setup, near_plan, stop=90, target=110) is True
+    invented = far_plan.model_copy(update={
+        'target_reference': CandleReference(timeframe='4h', open_time=9, field='high')})
+    assert order_names_supplied_target(setup, invented, stop=90, target=105) is False
+    moved_stop = far_plan.model_copy(update={'stop_loss_price': 95})
+    assert order_names_supplied_target(setup, moved_stop, stop=95, target=105) is False
+    wider_stop = far_plan.model_copy(update={'stop_loss_price': 85})
+    assert order_names_supplied_target(setup, wider_stop, stop=85, target=105) is False
+    assert order_names_supplied_target(setup, far_plan, stop=95, target=105) is False
+    assert order_names_supplied_target(setup, far_plan, stop=90, target=130) is False
+    assert order_names_supplied_target(setup, far_plan, stop=90, target=105, action='hold') is False
+    assert order_names_supplied_target(setup, None, stop=90, target=105) is False
+    for broken in (
+            dict(setup, evidence=dict(setup['evidence'], zone=None)),
+            dict(setup, evidence=dict(setup['evidence'], shift=None)),
+            dict(setup, evidence=dict(setup['evidence'], shift=dict(kind='bos', at=11))),
+            dict(setup, evidence=dict(setup['evidence'], stage='awaiting_touch')),
+            dict(setup, state='watch')):
+        assert order_names_supplied_target(broken, far_plan, stop=90, target=105) is False
+    missing_touch = dict(setup, evidence=dict(setup['evidence']))
+    missing_touch['evidence'].pop('touch_at')
+    assert order_names_supplied_target(missing_touch, far_plan, stop=90, target=105) is False
