@@ -15,6 +15,7 @@ def test_live_trading_disabled_by_default() -> None:
     assert settings.live_trading_enabled is False
     assert settings.broker_mode == BrokerMode.PAPER
     assert settings.effective_broker_mode() == BrokerMode.PAPER
+    assert settings.live_runner3_structure_auto_entry_enabled is False
 
 
 def test_aggressive_growth_is_default_profile() -> None:

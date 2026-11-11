@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     # Default off. Even when on, does not unsupervised full-close or chase IOC cancel state 4.
     live_runner3_capital_rotation_enabled: bool = False
     live_runner3_daily_net_target_usdt: float | None = Field(default=None, gt=0)
+    # Opt-in: open early READY confirm_bar/ob_retest without asking the model.
+    # Default off. Risk gates (1.25R, 15% stop, margin, liq buffer) still apply.
+    live_runner3_structure_auto_entry_enabled: bool = False
     # After a valid Runner 3 text decision, skip the second (VLM) provider call by default.
     runner3_vlm_after_valid_text: bool = False
     live_management_min_interval_seconds: float = Field(default=60, ge=15, le=3600)
