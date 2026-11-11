@@ -45,6 +45,49 @@ def compact_market(market):
     return result
 
 
+# Open-position management only needs a short wick window and a small structure tail.
+MANAGEMENT_OHLCV_BARS = 8
+MANAGEMENT_STRUCTURE_ROWS = 3
+_MANAGEMENT_STRUCTURE_KEYS = ('swings', 'breaks', 'sweeps', 'fvgs')
+
+
+def management_market(market):
+    """Compact market packet for live position management.
+
+    Entry prompts may carry long OHLCV and observation lists. Management only
+    needs recent closed bars for wick references plus a short structure tail
+    (trend, last swings, recent breaks). Padded history is dropped.
+    """
+    result = {key: value for key, value in (market or {}).items()
+              if key not in ('fingerprint', 'timeframes')}
+    views = []
+    for view in market.get('timeframes', []) if isinstance(market, dict) else []:
+        if not isinstance(view, dict):
+            continue
+        features = view.get('features') if isinstance(view.get('features'), dict) else {}
+        compact = {key: value for key, value in view.items()
+                   if key not in ('features', 'fingerprint', 'recent_ohlcv')}
+        rows = [row for row in (view.get('recent_ohlcv') or [])
+                if isinstance(row, (list, tuple)) and row]
+        compact['recent_ohlcv'] = [list(row) for row in rows[-MANAGEMENT_OHLCV_BARS:]]
+        compact['history_bars'] = len(compact['recent_ohlcv'])
+        trimmed = {}
+        for key, value in features.items():
+            if key in ('definition_version', 'caveat'):
+                continue
+            if key in _MANAGEMENT_STRUCTURE_KEYS and isinstance(value, list):
+                trimmed[key] = table(value[-MANAGEMENT_STRUCTURE_ROWS:])
+            elif isinstance(value, list):
+                trimmed[key] = table(value[-MANAGEMENT_STRUCTURE_ROWS:])
+            else:
+                trimmed[key] = value
+        compact['features'] = trimmed
+        views.append(compact)
+    if isinstance(market, dict) and 'timeframes' in market:
+        result['timeframes'] = views
+    return result
+
+
 def position_cards(positions):
     return [{key:position[key] for key in POSITION_FIELDS if key in position}
             for symbol,position in sorted(positions.items())]

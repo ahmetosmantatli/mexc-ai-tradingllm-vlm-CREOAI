@@ -8,7 +8,7 @@ import time
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from trading.evaluation.context import compact_market, digest
+from trading.evaluation.context import digest, management_market
 from trading.evaluation.price_plan import CandleReference, evidence_from_market, _reference
 from trading.runtime.usage import archive_trace
 from trading.quant.structure_setups import trade_horizon
@@ -283,7 +283,7 @@ class LivePositionManager:
             market['benchmarks']=benchmark_context(r.public,market)
             market['recent_trade_flow']=trade_flow_context(r.public,symbol)
         prompt=json.dumps(dict(task='manage_existing_position',event=event,position=position_card,
-            account=r._live_context(snapshot,{**control,'runner_id':runner_id}),market=compact_market(market),
+            account=r._live_context(snapshot,{**control,'runner_id':runner_id}),market=management_market(market),
             current_quote=dict(bid=quote.bid1,ask=quote.ask1,fair=quote.raw['fairPrice']),price_step=rules.price_step),
             ensure_ascii=False,separators=(',',':'),allow_nan=False)
         llm=r.management_llm()

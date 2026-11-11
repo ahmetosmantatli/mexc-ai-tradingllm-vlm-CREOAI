@@ -219,7 +219,10 @@ def test_full_unchanged_context_images_and_schema_reach_paid_once(tmp_path):
 def test_one_transient_retry_only_and_stop_during_wait_no_paid(tmp_path):
     cfg=settings(ai_pool_retry_seconds=5,ai_pool_max_retry_attempts=1,anthropic_api_key='paid',ai_claude_fallback_enabled=True)
     calls=[]
-    p,_=pool(tmp_path,cfg,lambda request:(calls.append(request) or httpx.Response(500,json={'error':{'message':'down'}})))
+    def transport(request):
+        calls.append(request)
+        raise httpx.ReadTimeout('temporary',request=request)
+    p,_=pool(tmp_path,cfg,transport)
     allowed=[True]
     p.can_call=lambda:allowed[0]
     p._sleep=lambda seconds:allowed.__setitem__(0,False)
@@ -228,15 +231,49 @@ def test_one_transient_retry_only_and_stop_during_wait_no_paid(tmp_path):
     assert p.last_status=='stopped' and len(calls)==1
 
 
-def test_transient_retries_once_after_local_cooldown(tmp_path):
+def test_transient_network_retries_once_after_local_cooldown(tmp_path):
     calls=[]
     def transport(request):
         calls.append(request)
-        return httpx.Response(500,json={'error':{'message':'down'}}) if len(calls)==1 else response()
+        if len(calls)==1:
+            raise httpx.ReadTimeout('temporary',request=request)
+        return response()
     cfg=settings(ai_pool_retry_seconds=0,ai_pool_max_retry_attempts=1)
     p,_=pool(tmp_path,cfg,transport)
     assert p.complete_json(system='s',user='u')=={'action':'hold'}
     assert len(calls)==2 and len(p.last_trace['attempts'])==2
+
+
+def test_503_cooldown_is_not_cleared_for_same_cycle_retry(tmp_path):
+    calls=[]
+    def transport(request):
+        calls.append(request)
+        return httpx.Response(503,json={'error':{'message':'down'}})
+    cfg=settings(ai_pool_retry_seconds=0,ai_pool_max_retry_attempts=1,anthropic_api_key='',
+                 ai_claude_fallback_enabled=False)
+    p,_store=pool(tmp_path,cfg,transport)
+    assert p.complete_json(system='s',user='u') is None
+    assert len(calls)==1
+    assert p._cooldown(p._slots[0], False)>time.time()
+    assert p.last_trace['attempts'][-1]['error_category']=='provider_server_error'
+
+
+def test_404_dead_model_is_skipped_without_retrying_the_same_id(tmp_path):
+    calls=[]
+    def transport(request):
+        calls.append(request.headers['authorization'])
+        return httpx.Response(404,json={'error':{'message':'The model does not exist',
+                                                  'code':'model_not_found'}})
+    cfg=settings(groq_api_key_2='other-groq-key-2',groq_quota_group_2='second',
+                 ai_pool_max_retry_attempts=1,ai_pool_retry_seconds=0,
+                 anthropic_api_key='',ai_claude_fallback_enabled=False)
+    p,_store=pool(tmp_path,cfg,transport)
+    assert p.complete_json(system='s',user='u') is None
+    # Second key shares the same model id; it must not be hammered after a 404.
+    assert calls==['Bearer private-groq-key-1']
+    assert p._cooldown(p._slots[0], False)>time.time()+3000
+    assert p.last_trace['attempts'][-1]['error_category']=='model_unavailable'
+    assert p.last_fallback_reason=='model_unavailable'
 
 
 def test_stop_and_expired_deadline_make_no_requests(tmp_path):

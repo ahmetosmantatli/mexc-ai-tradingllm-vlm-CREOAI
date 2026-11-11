@@ -192,7 +192,8 @@ def test_opposite_direction_selection_reaches_native_exchange_protection(tmp_pat
                     target_reference=option['target_reference'],reason='Teyitli fitil altı stop ve gözlenen üst likidite.'))
     cfg=Settings(_env_file=None,broker_mode='live',live_trading_enabled=True,live_automatic_enabled=True,
         live_structure_setups_enabled=True,live_price_plan_enabled=True,live_allowed_accounts=('ahmet',),
-        risk_profile='balanced',risk_per_trade_pct=.01,default_target_leverage=5,kill_switch_path=str(tmp_path/'STOP'),analysis_chart_dir=str(tmp_path/'charts'))
+        risk_profile='balanced',risk_per_trade_pct=.01,default_target_leverage=5,kill_switch_path=str(tmp_path/'STOP'),
+        analysis_chart_dir=str(tmp_path/'charts'),runner3_vlm_after_valid_text=True)
     store=RuntimeStore(str(tmp_path/'runtime.sqlite3'));private,public=Client(),QuotePublic()
     if runner_id=='runner3':
         private.assets=[dict(currency='USDT',equity=11.,availableBalance=11.,positionMargin=0.,unrealized=0.)]
@@ -270,7 +271,7 @@ def test_runner3_text_decides_first_and_valid_vision_replaces_it(tmp_path, monke
 
     model = Model()
     settings = Settings(_env_file=None,analysis_version='text',live_structure_setups_enabled=True,
-                        live_price_plan_enabled=True)
+                        live_price_plan_enabled=True,runner3_vlm_after_valid_text=True)
     store = RuntimeStore(str(tmp_path/'state'))
     evaluator = ContextEvaluator(model,store,
         SimpleNamespace(get_contract_rules=lambda symbol:SimpleNamespace(max_leverage=20,price_step=.01)),settings)
