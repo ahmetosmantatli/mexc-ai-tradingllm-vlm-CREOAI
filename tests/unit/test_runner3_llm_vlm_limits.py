@@ -5,6 +5,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from trading.agents.schemas import EvaluationResult, GraphAction
 from trading.config import Settings
 from trading.evaluation.service import ContextEvaluator
@@ -69,10 +71,12 @@ def evaluator(tmp_path, monkeypatch, model, market=None, version='text', prepare
         prepare(seed, market)
 
     def run(**account):
-        context = dict(mode='LIVE', currency='USDT', runner_id='runner3', current_equity=11.58,
-                       available_usdt=11.58)
+        equity = account.pop('equity', 11.58)
+        risk = account.pop('risk_per_trade_pct', .03)
+        context = dict(mode='LIVE', currency='USDT', runner_id='runner3', current_equity=equity,
+                       available_usdt=equity)
         context.update(account)
-        return reviewed.evaluate_candidates([seed], equity=11.58, risk_per_trade_pct=.03, target_leverage=20,
+        return reviewed.evaluate_candidates([seed], equity=equity, risk_per_trade_pct=risk, target_leverage=20,
                                             live_account_context=context, live_positions={})
 
     return run, store
@@ -1248,6 +1252,59 @@ def test_printed_hold_reenters_at_the_current_price(tmp_path, monkeypatch):
     assert outcome.proposal.entry_price != current + 5
     level = chosen['opposing_target_levels'][0]
     assert chosen['target_reference']['open_time'] == level['open_time']
+
+
+def test_omitted_risk_share_becomes_an_order_inside_the_cap_and_a_wide_stop_is_vetoed(tmp_path, monkeypatch):
+    def quiet_vision(model, packet):
+        model.vision_answer = None
+        model.last_trace = {'attempts': [{'generation_requests': 1, 'status': 'invalid_schema'}]}
+
+    def omitted(packet):
+        answer = ready_answer(packet, rationale='Kapanmış yapı duruyor, pay alanı boş.')
+        answer['sizing_plan'] = {'leverage': 5}
+        return answer
+
+    model = DecisionModel(omitted, quiet_vision)
+    run, store = evaluator(tmp_path, monkeypatch, model)
+    result = run(equity=1000)
+    assert 'sizing_plan.risk_per_trade_pct is required' in model.calls[0]['system']
+    assert 'Set it from the account equity and the account target, inside the 15% cap.' in model.calls[0]['system']
+    assert result.action.value == 'trade'
+    assert result.proposal is not None
+    assert result.hold_reason != 'invalid_or_unavailable_model'
+    assert result.metadata.get('veto') not in ('cost_adjusted_r', 'equity_stop', 'free_margin')
+    share = result.proposal.metadata['risk_per_trade_pct']
+    assert share == pytest.approx(.03)
+    assert share <= .15
+    assert result.metadata['sizing_plan']['risk_per_trade_pct'] == pytest.approx(.03)
+    stop_fraction = abs(result.proposal.entry_price - result.proposal.stop_loss.price) / result.proposal.entry_price
+    assert result.proposal.max_loss_if_stopped == pytest.approx(1000 * share)
+    assert result.proposal.notional == pytest.approx(1000 * share / stop_fraction)
+    assert store.get('analysis_trace')['status'] == 'completed'
+
+    def present(packet):
+        return ready_answer(packet, sizing_plan={'leverage': 5, 'risk_per_trade_pct': .004},
+                            rationale='Model kendi payını hesapladı.')
+
+    present_model = DecisionModel(present, quiet_vision)
+    present_run, _present_store = evaluator(tmp_path / 'present', monkeypatch, present_model)
+    kept = present_run(equity=1000)
+    assert kept.action.value == 'trade'
+    assert kept.proposal.metadata['risk_per_trade_pct'] == pytest.approx(.004)
+    assert kept.metadata['sizing_plan']['risk_per_trade_pct'] == pytest.approx(.004)
+
+    def wide(packet):
+        return ready_answer(packet, sizing_plan={'leverage': 5, 'risk_per_trade_pct': .20},
+                            rationale='Model payı stop tavanının üstünde.')
+
+    wide_model = DecisionModel(wide, quiet_vision)
+    wide_run, _wide_store = evaluator(tmp_path / 'wide', monkeypatch, wide_model)
+    vetoed = wide_run(equity=1000, risk_per_trade_pct=.20)
+    assert vetoed.action.value == 'hold'
+    assert vetoed.proposal is None
+    assert vetoed.hold_reason == 'equity_stop'
+    assert vetoed.metadata['veto'] == 'equity_stop'
+    assert vetoed.metadata['sizing_plan']['risk_per_trade_pct'] == pytest.approx(.20)
 
 
 def test_short_margin_reports_a_swap_and_does_not_close(tmp_path, monkeypatch):

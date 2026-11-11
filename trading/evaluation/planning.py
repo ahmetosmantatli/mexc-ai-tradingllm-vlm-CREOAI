@@ -27,8 +27,11 @@ def _usable_margin_share(value):
 
 
 class PlanSizing(BaseModel):
-    """Leverage and risk are required when a model supplies a sizing plan.
+    """Leverage is required when a model supplies a sizing plan.
 
+    risk_per_trade_pct is the model's account fraction. A present value stays.
+    A missing value stays empty here so equity sizing can fill it inside the
+    15% cap. That omission does not discard the rest of the plan.
     margin_share is a Runner 3 margin target as a fraction of equity.
     A missing or unusable value stays empty so the policy can select its default.
     It does not reject the rest of the plan and it cannot move the stop.
@@ -36,7 +39,7 @@ class PlanSizing(BaseModel):
 
     model_config = ConfigDict(extra='forbid', strict=True, allow_inf_nan=False)
     leverage: int = Field(ge=1)
-    risk_per_trade_pct: float = Field(gt=0, le=1, description='Account risk fraction; .01 means 1%.')
+    risk_per_trade_pct: float | None = Field(default=None, gt=0, le=1, description='Account risk fraction; .01 means 1%. The model sets it from equity and the account target.')
     margin_share: float | None = Field(default=None, description='Margin target as a fraction of equity when supported by the active policy.')
 
     @model_validator(mode='before')
@@ -50,6 +53,20 @@ class PlanSizing(BaseModel):
 
 class PlanSizingError(ValueError):
     """Invalid sizing is a HOLD, not permission to substitute larger sizing."""
+
+
+def filled_risk_share(policy_risk: float) -> float:
+    """Equity-sizing fraction used only when the model omits risk_per_trade_pct.
+
+    The share is the policy fraction already used to size from equity, and it
+    is never above the continuous stop cap. A share the model already sent is
+    not passed through here.
+    """
+    from trading.runtime.runner3_policy import CONTINUOUS_STOP_RISK_CAP
+    limit = _number(policy_risk, 'policy_risk')
+    if limit > 1:
+        raise PlanSizingError('invalid_policy_risk')
+    return min(limit, CONTINUOUS_STOP_RISK_CAP)
 
 
 def _number(value: Any, label: str, *, minimum: float = 0) -> float:
@@ -72,9 +89,12 @@ def apply_decision_sizing(
     """Size one selected candidate; raise PlanSizingError instead of clamping.
 
     ``None`` retains deterministic policy sizing with the lower current policy
-    and exchange leverage. An explicit plan exceeding *either* limit is rejected.
-    The exchange maximum is information, not a replacement for user policy.
-    Unknown fields (including symbol, cash amount or prices) are rejected.
+    and exchange leverage. A plan that omits risk_per_trade_pct keeps the
+    model's leverage and fills that share from equity sizing, inside the
+    continuous stop cap. A share the model already set is kept. An explicit
+    plan exceeding *either* limit is rejected. The exchange maximum is
+    information, not a replacement for user policy. Unknown fields (including
+    symbol, cash amount or prices) are rejected.
     """
     current_equity = _number(equity.equity if isinstance(equity, EquityState) else equity, 'equity')
     risk_limit = _number(policy_risk, 'policy_risk')
@@ -90,7 +110,9 @@ def apply_decision_sizing(
             plan = PlanSizing.model_validate(raw)
         except (ValidationError, TypeError, ValueError):
             raise PlanSizingError('invalid_model_sizing') from None
-        if plan.risk_per_trade_pct > risk_limit:
+        if plan.risk_per_trade_pct is None:
+            plan = plan.model_copy(update={'risk_per_trade_pct': filled_risk_share(risk_limit)})
+        elif plan.risk_per_trade_pct > risk_limit:
             raise PlanSizingError('model_risk_exceeds_policy')
         if plan.leverage > leverage_limit or plan.leverage > exchange_limit:
             raise PlanSizingError('model_leverage_exceeds_limit')

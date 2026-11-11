@@ -49,6 +49,17 @@ class ModelDecision(BaseModel):
 VLM_DECISION_TIMEOUT_SECONDS = 120
 
 
+def _has_trade_prices(decision, candidate):
+    """Entry, stop, and target from the decision, or from the candidate it prices."""
+    source = decision.price_plan
+    if source is not None:
+        entry, stop, target = source.entry_price, source.stop_loss_price, source.take_profit_price
+    else:
+        entry, stop, target = candidate.entry_price, candidate.stop_loss_price, candidate.take_profit_price
+    return all(isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+               for value in (entry, stop, target))
+
+
 def _decision_packet(decision):
     if decision is None:
         return dict(action=None, rationale='Metin modeli geçerli bir karar üretemedi.',
@@ -94,8 +105,8 @@ SYSTEM_POLICY = (
     'Use cancel_watch when the canonical active thesis is invalid: signal_id, sizing_plan, price_plan and watch_plan must be null; '
     'reviewed_watch_revision must exactly match the canonical revision and explain why. HOLD preserves an active watch; '
     'writing invalid/cancelled in rationale alone never cancels it. '
-    'Never pretend to supersede an unseen plan. For trade choose sizing_plan with integer leverage and '
-    'risk_per_trade_pct as an account fraction (.01 means 1%), within supplied limits; null retains policy sizing. '
+    'Never pretend to supersede an unseen plan. For trade choose sizing_plan with integer leverage. '
+    f'sizing_plan.risk_per_trade_pct is required. Set it from the account equity and the account target, as a fraction of equity (.01 means 1%), inside the {runner3_policy.CONTINUOUS_STOP_RISK_CAP:.0%} cap. '
     'In LIVE exchange leverage mode an explicit sizing_plan is mandatory: never default to the maximum. '
     'Only when account.price_planning.enabled is true, return a price_plan for the selected setup side and supplied symbol; '
     'without setup selection the original seed side applies. '
@@ -707,8 +718,17 @@ class ContextEvaluator:
             if model_sizing and decision.action == 'trade' and decision.sizing_plan is None:
                 raise ValueError('aggressive Runner 3 requires explicit sizing')
             chosen,option=validate_selection(decision,candidate,options,selection_enabled)
+            if (decision.action=='trade' and decision.sizing_plan is not None
+                    and decision.sizing_plan.risk_per_trade_pct is None and _has_trade_prices(decision, candidate)):
+                # The model did not set the share. Fill it from equity sizing inside
+                # the cap. A share the model already sent is left unchanged.
+                ceiling=countertrend_cap if option and option['family']=='countertrend_sweep_reclaim' else risk_per_trade_pct
+                from trading.evaluation.planning import filled_risk_share
+                decision=decision.model_copy(update={'sizing_plan': decision.sizing_plan.model_copy(
+                    update={'risk_per_trade_pct': filled_risk_share(ceiling)})})
+            share=None if decision.sizing_plan is None else decision.sizing_plan.risk_per_trade_pct
             if (option and option['family']=='countertrend_sweep_reclaim' and decision.action=='trade'
-                    and (decision.sizing_plan is None or decision.sizing_plan.risk_per_trade_pct>countertrend_cap)):
+                    and (decision.sizing_plan is None or (share is not None and share>countertrend_cap))):
                 raise ValueError('countertrend sizing exceeds reduced risk limit')
             if decision.action=='cancel_watch':
                 if (prior_watch.get('status') not in ACTIVE or decision.reviewed_watch_revision!=prior_watch['revision']
@@ -846,7 +866,7 @@ class ContextEvaluator:
                      + ('Choose sizing_plan.margin_share and integer leverage for either evidence grade. '
                         'A valid share is an equity fraction and a margin target. The executor prefers your leverage '
                         'when it fits verified exchange limits, available margin, and the liquidation buffer. '
-                        'Choose risk per trade within the supplied ceiling, including fees and estimated exit slippage. '
+                        f'sizing_plan.risk_per_trade_pct is required. Set it from the account equity and the account target, inside the {runner3_policy.CONTINUOUS_STOP_RISK_CAP:.0%} cap, including fees and estimated exit slippage. '
                         'If a setup is READY and you would otherwise trade it, return TRADE with a grounded plan. '
                         'Do not choose HOLD solely because the account is small, there are open positions, or the desired size '
                         'may not fit free margin. The executor sizes the order down to actual available margin and exchange minimums. '
