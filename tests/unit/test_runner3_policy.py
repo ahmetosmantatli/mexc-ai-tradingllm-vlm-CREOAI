@@ -322,6 +322,53 @@ def test_quantity_rejection_preserves_exchange_constraints_for_audit():
     assert detail['contracts'] == {'quantity': 1., 'minimum': 2., 'maximum': 100., 'step': 1.}
 
 
+def test_sub_minimum_quantity_bumps_when_risk_allows_else_rejects_clearly():
+    """AKE-class: never round to 0; bump to min when stop budget covers it."""
+    from trading.exchange.contracts import ContractQuantityError, ContractRules
+    from trading.runtime.execution_diagnostics import safe_execution_error
+
+    # contractSize=1, step=1, minVol=1: 0.4 contracts floors to 0.
+    rules = ContractRules(1., 1., 1., 100., 20., .005, .01, 50.)
+    with pytest.raises(ContractQuantityError) as error:
+        rules.size_order(4., 10., 5.)
+    assert error.value.quantity == 0.
+    assert str(error.value) == 'contract quantity below exchange minimum'
+    detail = safe_execution_error(error.value)
+    assert detail['code'] == 'CONTRACT_QUANTITY_LIMIT'
+    assert detail['contracts']['quantity'] == 0.
+    assert detail['contracts']['minimum'] == 1.
+
+    # Same plan, but risk notional covers one contract → bump to min.
+    qty, notional = rules.size_order(4., 10., 5., allow_minimum_bump=True, max_notional=10.)
+    assert qty == 1.
+    assert notional == pytest.approx(10.)
+
+    # Risk notional cannot cover the minimum → still reject (no silent 0 fill).
+    with pytest.raises(ContractQuantityError) as blocked:
+        rules.size_order(4., 10., 5., allow_minimum_bump=True, max_notional=9.)
+    assert blocked.value.quantity == 0.
+    assert str(blocked.value) == 'contract quantity below exchange minimum'
+
+
+def test_model_sizing_under_100_prefers_profile_floor_over_timid_low_leverage():
+    from trading.runtime.runner3_policy import leverage_for_choch_loss
+
+    # Preferred 200x fails the liquidation buffer; search-from-1x would pick ~4x.
+    # Model sizing must take the profile floor (10x) instead (AAVE-class 6x path).
+    common = dict(
+        notional=26., entry=100., stop=97.64, free_margin=8.2, margin_target=7.79, equity=8.2,
+        max_leverage=50, maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02,
+        preferred_leverage=200, profile_leverage=10)
+    timid, _, timid_size = leverage_for_choch_loss(model_sizing=False, **common)
+    assert timid == 4
+    assert timid_size == pytest.approx(26.)
+    leverage, margin, size = leverage_for_choch_loss(model_sizing=True, **common)
+    assert leverage == 10
+    assert size == pytest.approx(26.)
+    assert margin == pytest.approx(2.6)
+    assert margin + size * .0006 <= 7.79 + 1e-8
+
+
 def test_small_account_stop_budget_applies_immediately_below_threshold():
     from trading.runtime.runner3_policy import small_account_risk_target
 

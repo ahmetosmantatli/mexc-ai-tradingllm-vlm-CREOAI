@@ -1,6 +1,6 @@
 """Linear USDT contract sizing; fail closed on incomplete exchange rules."""
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 from math import isfinite
 
 
@@ -39,13 +39,36 @@ class ContractRules:
             raise ValueError('base risk tier unavailable')
         return cls(*vals, base_tier_max)
 
-    def size_order(self, notional, price, leverage):
+    def size_order(self, notional, price, leverage, *, allow_minimum_bump=False, max_notional=None):
         if leverage > self.max_leverage:
             raise ValueError('exchange leverage exceeded')
-        qty = Decimal(str(notional)) / Decimal(str(price)) / Decimal(str(self.size))
+        raw = Decimal(str(notional)) / Decimal(str(price)) / Decimal(str(self.size))
         step = Decimal(str(self.step))
-        qty = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-        if not Decimal(str(self.minimum)) <= qty <= Decimal(str(self.maximum)):
+        minimum = Decimal(str(self.minimum))
+        maximum = Decimal(str(self.maximum))
+        qty = (raw / step).to_integral_value(rounding=ROUND_DOWN) * step
+        if qty < minimum:
+            bumped = None
+            if allow_minimum_bump:
+                # Round the exchange minimum up onto the step grid.
+                bumped = (minimum / step).to_integral_value(rounding=ROUND_CEILING) * step
+                bumped_notional = bumped * Decimal(str(self.size)) * Decimal(str(price))
+                ceiling = (Decimal(str(max_notional)) if isinstance(max_notional, (int, float))
+                           and not isinstance(max_notional, bool) and isfinite(max_notional)
+                           else None)
+                if (ceiling is None or bumped_notional > ceiling + Decimal('1e-8')
+                        or bumped > maximum
+                        or (self.base_tier_max and bumped > Decimal(str(self.base_tier_max)))):
+                    bumped = None
+            if bumped is None:
+                # Fail closed with the floored quantity (often 0) and the exchange min —
+                # never pretend a sub-minimum plan is executable.
+                raise ContractQuantityError(
+                    'contract quantity below exchange minimum'
+                    if qty < minimum else 'contract quantity outside exchange limits',
+                    quantity=float(qty), minimum=self.minimum, maximum=self.maximum, step=self.step)
+            qty = bumped
+        elif qty > maximum:
             raise ContractQuantityError('contract quantity outside exchange limits',
                 quantity=float(qty), minimum=self.minimum, maximum=self.maximum, step=self.step)
         if self.base_tier_max and qty > Decimal(str(self.base_tier_max)):

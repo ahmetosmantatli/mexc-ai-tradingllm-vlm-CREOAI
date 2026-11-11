@@ -284,9 +284,11 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
     enough to post that notional unless the model's preferred leverage fits.
     Under 100 USDT that search must not stop at 1x: omitted leverage, or a
     model leverage of 1x, uses the profile's leverage, or 10x when the profile
-    has no number. A model leverage above 1x stays when it fits. The stop
-    cannot lose more than 15% of equity. The legacy small-account policy still
-    rejects a margin budget under 1 USDT.
+    has no number. Continuous / model sizing under 100 USDT prefers that
+    profile floor over a timid search-from-1x when the preferred (e.g. 200x)
+    fails the liquidation buffer. A model leverage above 1x stays when it
+    fits. The stop cannot lose more than 15% of equity. The legacy
+    small-account policy still rejects a margin budget under 1 USDT.
     """
     values = (notional, entry, stop, free_margin, equity, max_leverage, maintenance, initial_rate, fee, liquidation_buffer)
     if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) for value in values):
@@ -360,6 +362,16 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
         selected = fit(leverage, fitted)
         if selected is not None:
             return selected
+
+    # Continuous / model sizing under 100 USDT: prefer the profile leverage floor
+    # (PR30) over a timid search-from-1x that lands on 2–6x when a higher safe
+    # profile leverage can still post the stop-budgeted notional.
+    if small and model_sizing:
+        floor_leverage = _aggressive_leverage_floor(profile_leverage, cap)
+        if floor_leverage >= 2:
+            replaced = search(floor_leverage)
+            if replaced is not None:
+                return replaced
 
     selected = search(1)
     if small and (selected is None or selected[0] < 2):

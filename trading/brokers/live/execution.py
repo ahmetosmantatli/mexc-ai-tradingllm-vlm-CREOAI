@@ -178,7 +178,8 @@ class ApprovedLiveExecutor(PositionManagementMixin):
         if not proposal.entry_price:
             raise LiveExecutionError('approved_entry_price_drift')
         deviation = entry / proposal.entry_price - 1
-        if abs(deviation) > self.max_drift:
+        # Inclusive bound: exact equality with the drift limit still executes.
+        if abs(deviation) > self.max_drift + 1e-12:
             raise LiveExecutionError('approved_entry_price_drift', price_drift=dict(
                 stage='preflight', planned=proposal.entry_price, observed=entry,
                 deviation=deviation, tolerance=self.max_drift))

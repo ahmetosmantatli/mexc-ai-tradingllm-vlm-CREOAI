@@ -25,6 +25,7 @@ CODES={
 
     'live entry price drift':'ENTRY_PRICE_DRIFT',
     'contract quantity outside exchange limits':'CONTRACT_QUANTITY_LIMIT',
+    'contract quantity below exchange minimum':'CONTRACT_QUANTITY_LIMIT',
     'position exceeds supported base risk tier':'CONTRACT_RISK_TIER',
     'exchange leverage exceeded':'EXCHANGE_LEVERAGE_CAP',
     'model target does not cover expected trading costs':'TARGET_COSTS',

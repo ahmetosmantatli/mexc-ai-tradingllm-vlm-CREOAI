@@ -646,3 +646,30 @@ def test_continuous_under_100_deploys_near_full_margin_without_forcing_1x(tmp_pa
     strong = runner._final_proposal(signal, strong_silent, runner._refresh([signal.symbol]), control)
     assert strong.metadata['runner3_allocation']['margin_share_source'] == 'fallback_continuous'
     assert strong.metadata['runner3_allocation']['target_margin_usdt'] == pytest.approx(7.6)
+
+
+def test_continuous_under_100_boosts_timid_stop_budget_to_fifteen_percent(tmp_path):
+    """AAVE-class: model 7.5% stop share must be raised to the 15% continuous ceiling."""
+    from trading.runtime.runner3_policy import CONTINUOUS_STOP_RISK_CAP
+
+    runner, private, _, control = prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled = True
+    runner.cfg.live_runner3_continuous_aggressive_enabled = True
+    control.update(runner_id='runner3', risk_profile='aggressive_growth', max_leverage=10)
+    runner.configure(control)
+    private.equity = private.available = 8.2
+    signal = candidate()
+    decision = _runner3_decision(runner, signal, 'htf_zone_mss')
+    decision.metadata['sizing_plan'].update(leverage=10, risk_per_trade_pct=.075)
+    sized = runner._final_proposal(signal, decision, runner._refresh([signal.symbol]), control)
+    allocation = sized.metadata['runner3_allocation']
+    assert allocation['risk_boost_applied']
+    assert allocation['model_risk_fraction'] == pytest.approx(.075)
+    assert allocation['effective_risk_fraction'] == pytest.approx(CONTINUOUS_STOP_RISK_CAP)
+    assert allocation['risk_ceiling'] == pytest.approx(CONTINUOUS_STOP_RISK_CAP)
+    assert sized.max_loss_if_stopped == pytest.approx(8.2 * CONTINUOUS_STOP_RISK_CAP)
+    assert sized.leverage == 10
+    assert allocation['initial_margin_usdt'] <= allocation['target_margin_usdt'] + 1e-8
+    assert allocation['margin_fraction'] == pytest.approx(.95)
+    # Full 15% stop budget must size larger than the timid 7.5% notional path.
+    assert sized.notional > 8.2 * .075 / .02 + 1e-6

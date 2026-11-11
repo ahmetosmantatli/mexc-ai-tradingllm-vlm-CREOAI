@@ -79,7 +79,8 @@ def apply_market_price_plan(candidate,raw,evidence,*,price_step,current_price,no
         units=Decimal(str(price))/Decimal(str(step))
         if abs(units-units.to_integral_value())>Decimal('0.000001'):
             raise PricePlanError('price_tick_mismatch')
-    if abs(plan.entry_price/current-1)>max_entry_drift:
+    # Inclusive bound: sapma == sınır must not reject (float epsilon).
+    if abs(plan.entry_price / current - 1) > max_entry_drift + 1e-12:
         raise PricePlanError('market_entry_reference_too_far')
     long=candidate.side.value=='long'
     stop,target=plan.stop_loss_price,plan.take_profit_price
