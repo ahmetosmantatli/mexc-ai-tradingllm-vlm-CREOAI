@@ -670,10 +670,62 @@ class LiveRunner:
                                 symbol=candidate.symbol, reason=reason, details=details or {}))
             self.store.put('live:entry_rejection_notices', pending[-100:])
 
+    def _decision_still_live(self, candidate, result, started):
+        """Wall TTL, or price still validates the plan after our gate/queue delay.
+
+        Does not loosen 1.25R, 15% stop, free-margin, halt, or other risk gates.
+        """
+        if not started:
+            return False
+        now = time.time()
+        if now - started <= self.cfg.decision_ttl_seconds:
+            return True
+        plan = result.metadata.get('price_plan')
+        if plan is None:
+            return False
+        try:
+            planned = float(plan.entry_price if hasattr(plan, 'entry_price') else plan['entry_price'])
+            planned_stop = float(plan.stop_loss_price if hasattr(plan, 'stop_loss_price') else plan['stop_loss_price'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if planned <= 0 or planned_stop <= 0 or planned == planned_stop:
+            return False
+        try:
+            ticker = self.quote(candidate.symbol)
+        except (TypeError, ValueError, sqlite3.Error, OSError):
+            return False
+        price = ticker.ask1 if candidate.side.value == 'long' else ticker.bid1
+        if not isinstance(price, (int, float)) or not isfinite(price) or price <= 0:
+            return False
+        drift_cap = abs(planned - planned_stop) / abs(planned)
+        return abs(float(price) / planned - 1) <= drift_cap + 1e-12
+
+    def _refresh_decision_clock(self, result, started):
+        """Extend entry freshness only after a successful price re-check."""
+        if started and time.time() - started > self.cfg.decision_ttl_seconds:
+            result.metadata['decision_started_at'] = time.time()
+        return result.metadata.get('decision_started_at', 0)
+
+    def _clear_accepted_entry(self, symbol):
+        """Drop a saved early-card acceptance so entry failures do not loop forever."""
+        key = 'accepted_entry:' + symbol
+        if self.store.get(key) is not None:
+            self.store.put(key, {})
+
+    def _price_invalidated_acceptance(self, reason, details=None):
+        text = str(reason or '')
+        if 'DECISION_EXPIRED' in text or 'ENTRY_PRICE_DRIFT' in text or 'EVIDENCE_EXPIRED' in text:
+            return True
+        code = '' if not isinstance(details, dict) else str(details.get('code') or '')
+        return code in ('ENTRY_PRICE_DRIFT', 'RUNNER3_EVIDENCE_EXPIRED', 'approved_entry_price_drift')
+
     def _apply(self,candidate,result,control):
         trace_id=result.metadata.get('analysis_trace_id')
         def finish(reason, *, notify=True, intent_id=None):
             details = None if intent_id is None else dict(intent_id=intent_id)
+            if result.action.value == 'trade' and reason != 'LIVE_PROTECTED':
+                if self._price_invalidated_acceptance(reason, details):
+                    self._clear_accepted_entry(candidate.symbol)
             if trace_id and result.action.value == 'trade':
                 if reason == 'LIVE_PROTECTED':
                     finalize_trace(self.store, trace_id, 'opened', reason, details)
@@ -692,10 +744,12 @@ class LiveRunner:
         if self.executor is None:
             return finish('HOLD_LIVE_EXECUTOR_DISABLED')
         if self.store.get('live:halt'):
+            # Keep accepted_entry: when the technical gate clears, re-check price and place.
             return finish('HOLD_LIVE_HALT')
         started=result.metadata.get('decision_started_at',0)
-        if not started or time.time()-started>self.cfg.decision_ttl_seconds:
+        if not self._decision_still_live(candidate, result, started):
             return finish('HOLD_LIVE_DECISION_EXPIRED')
+        started = self._refresh_decision_clock(result, started)
         if not self.candidate_queue().is_current(candidate):
             return finish('HOLD_LIVE_CANDIDATE_STALE')
         coordinator=WatchCoordinator(self.store)
@@ -748,12 +802,16 @@ class LiveRunner:
         def current():
             latest=coordinator.card(candidate.symbol)
             current_control=self._control()
+            clock=result.metadata.get('decision_started_at',0)
+            live=self._decision_still_live(candidate, result, clock)
+            if live:
+                self._refresh_decision_clock(result, clock)
             return bool((original is None or original()) and self._enabled(current_control)
                 and current_control.get('updated_at')==control.get('updated_at')
                 and current_control.get('runner_id','baseline-v1')==control.get('runner_id','baseline-v1')
                 and self.candidate_queue().is_current(candidate)
                 and latest['revision']==card['revision'] and latest.get('last_action')=='trade'
-                and time.time()-started<=self.cfg.decision_ttl_seconds)
+                and live)
         self.executor.can_execute=current
         pending=result.metadata.get('pending_vlm')
         if pending is not None:
@@ -936,6 +994,8 @@ class LiveRunner:
                     reason='HOLD_LIVE_EXECUTION_'+details['code']
                     self.store.put('live_candidate_error:'+candidate.symbol,dict(at=time.time(),**details))
                     if result is not None and result.action.value=='trade':
+                        if self._price_invalidated_acceptance(reason, details):
+                            self._clear_accepted_entry(candidate.symbol)
                         self._record_entry_rejection(candidate,result.metadata.get('analysis_trace_id'),reason,details)
                     outcomes.append(self.status(reason))
             return next((row for row in outcomes if row['reason']=='LIVE_PROTECTED'),outcomes[-1])

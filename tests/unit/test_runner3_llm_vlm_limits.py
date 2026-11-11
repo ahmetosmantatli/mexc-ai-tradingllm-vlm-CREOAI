@@ -165,6 +165,30 @@ def test_vlm_timeout_keeps_the_text_decision_and_labels_it_text(tmp_path, monkey
     assert limits[-1]['decision_mode'] == 'vlm'
 
 
+def test_slow_free_tier_text_answer_is_kept_past_decision_ttl(tmp_path, monkeypatch):
+    """Analysis wait is outside entry TTL; a late valid text trade must not be discarded."""
+    from trading.evaluation import service as evaluation_service
+
+    clock = {'now': time.time()}
+    monkeypatch.setattr(evaluation_service.time, 'time', lambda: clock['now'])
+    monkeypatch.setattr(evaluation_service, 'ANALYSIS_WAIT_SECONDS', 120)
+
+    def text(packet):
+        # Free-tier / queue delay past the 60s decision_ttl, still inside analysis budget.
+        clock['now'] += 90
+        return ready_answer(packet, rationale='Geciken ücretsiz rota cevabı.')
+
+    model = DecisionModel(text, lambda _model, _packet: None)
+    run, store = evaluator(tmp_path, monkeypatch, model, vlm_after_valid_text=False)
+    result = run()
+    assert result.action.value == 'trade', (result.hold_reason, store.get('analysis_trace'))
+    assert result.metadata['rationale'].startswith('Geciken ücretsiz rota')
+    started_at = store.get('analysis_trace')['started_at']
+    assert clock['now'] - started_at > 60
+    assert result.metadata['decision_started_at'] == pytest.approx(clock['now'], abs=1e-6)
+    assert store.get('analysis_trace')['status'] == 'completed'
+
+
 def hold_answer(rationale):
     return dict(action='hold', signal_id=None, rationale=rationale,
                 invalidation='Kurulum bozulursa bekleme biter.', watch_note='')
