@@ -64,7 +64,6 @@ def test_sizing_reapplied_from_fresh_equity():
     {'leverage': 5, 'risk_per_trade_pct': float('nan')},
     {'leverage': 5, 'risk_per_trade_pct': 0},
     {'leverage': 5, 'risk_per_trade_pct': True},
-    {'leverage': 5},
     {'leverage': 5, 'risk_per_trade_pct': .01, 'symbol': 'OTHER_USDT'},
     {'leverage': 5, 'risk_per_trade_pct': .01, 'entry_price': 95},
     {'leverage': 5, 'risk_per_trade_pct': .01, 'amount': 500},
@@ -117,6 +116,21 @@ def test_paper_gate_rejects_liquidation_unsafe_plan_despite_allowed_exchange_lev
     with pytest.raises(ValueError, match='liquidation'):
         ledger.open(proposal, rules(), 99.99, 100., 's1', .03, .01)
     assert not ledger.positions
+
+
+def test_omitted_risk_share_uses_equity_sizing_inside_the_cap_and_a_present_share_stays():
+    omitted = size({'leverage': 5})
+    assert omitted.metadata['risk_per_trade_pct'] == pytest.approx(.03)
+    assert omitted.metadata['risk_per_trade_pct'] <= .15
+    assert omitted.metadata['sizing_plan']['risk_per_trade_pct'] == pytest.approx(.03)
+    assert omitted.notional == pytest.approx(1500.)
+    assert omitted.leverage == 5
+    capped = size({'leverage': 4}, policy_risk=.20)
+    assert capped.metadata['risk_per_trade_pct'] == pytest.approx(.15)
+    assert capped.max_loss_if_stopped == pytest.approx(150.)
+    present = size({'leverage': 4, 'risk_per_trade_pct': .01}, policy_risk=.03)
+    assert present.metadata['risk_per_trade_pct'] == pytest.approx(.01)
+    assert present.notional == pytest.approx(500.)
 
 
 def test_margin_share_does_not_change_size_and_an_unusable_share_stays_empty():

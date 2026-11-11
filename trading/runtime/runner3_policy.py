@@ -839,6 +839,7 @@ def entry_gate_instruction(*, fee, slippage):
         'When the trade is with the higher timeframe, a farther target is allowed. With the higher timeframe means the higher timeframe is long, price reached a block or flow, and the trigger CHoCH turns up, or the short mirror.',
         'A hold is not the default when the CHoCH, the block or flow, and a target exist.',
         'Free margin must cover the order. You choose the balance share.',
+        f'sizing_plan.risk_per_trade_pct is required. Set it from the account equity and the account target, inside the {CONTINUOUS_STOP_RISK_CAP:.0%} cap.',
         'Before you propose an entry, apply this deterministic gate. The engine still runs it after you answer and still rejects a failure.',
         f'Runner 3 minimum cost-adjusted R is {MIN_NET_TARGET_R:.2f}.',
         f'Fee assumption is {fee:.4f} per side. Exit-slippage assumption is {slippage:.4f} ({slippage * 10000:.0f} bps), applied to the stop and the target.',

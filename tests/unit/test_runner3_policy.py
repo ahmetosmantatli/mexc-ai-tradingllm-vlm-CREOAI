@@ -362,6 +362,7 @@ def test_entry_gate_prompt_states_the_engine_formula_and_does_not_lower_it():
         'When the trade is with the higher timeframe, a farther target is allowed. With the higher timeframe means the higher timeframe is long, price reached a block or flow, and the trigger CHoCH turns up, or the short mirror.',
         'A hold is not the default when the CHoCH, the block or flow, and a target exist.',
         'Free margin must cover the order. You choose the balance share.',
+        'sizing_plan.risk_per_trade_pct is required. Set it from the account equity and the account target, inside the 15% cap.',
         'Runner 3 minimum cost-adjusted R is 1.25.',
         'Fee assumption is 0.0006 per side. Exit-slippage assumption is 0.0005 (5 bps), applied to the stop and the target.',
         'direction is 1 for long and -1 for short.',
