@@ -536,7 +536,7 @@ class LiveRunner:
             risk_fraction,self._leverage_cap(control,exchange_cap),exchange_cap)
         if runner_id!='runner3':
             drift_limit = min(planning_candidate.stop_distance_pct / 2, .005)
-            if abs(ticker.last_price / planning_candidate.entry_price - 1) > drift_limit:
+            if abs(ticker.last_price / planning_candidate.entry_price - 1) > drift_limit + 1e-12:
                 raise EntryPriceDrift('live entry price drift', stage='planning', planned=planning_candidate.entry_price,
                                       observed=ticker.last_price, tolerance=drift_limit)
         entry=ticker.ask1 if candidate.side.value=='long' else ticker.bid1
@@ -569,9 +569,15 @@ class LiveRunner:
             ceiling = risk_fraction
             if not model_sizing and setup['family'] == 'countertrend_sweep_reclaim':
                 ceiling *= .5
-            target_risk = runner3_policy.small_account_risk_target(snapshot['balance']['equity'], ceiling, grade)
+            equity = snapshot['balance']['equity']
+            target_risk = runner3_policy.small_account_risk_target(equity, ceiling, grade)
             effective = model_fraction
-            if not model_sizing and target_risk is not None and not any(row['side'] == side for row in snapshot['positions']):
+            # Continuous under $100: use the full allowed stop budget (15%), not a
+            # timid model share like 7.5%. Legacy non-model small-account boost stays.
+            if (continuous and model_sizing
+                    and 0 < equity < runner3_policy.SMALL_ACCOUNT_EQUITY_USDT):
+                effective = max(model_fraction, ceiling)
+            elif not model_sizing and target_risk is not None and not any(row['side'] == side for row in snapshot['positions']):
                 effective = max(model_fraction, target_risk)
             if effective > model_fraction:
                 multiplier = effective / model_fraction
@@ -602,19 +608,31 @@ class LiveRunner:
             free_margin=available-allocation['reserve_usdt']
             if free_margin<=0:
                 raise ValueError('insufficient_available_margin' if model_sizing else 'runner3_margin_reserve')
-        _,notional=rules.size_order(min(limits.values()),planned_entry if runner_id=='runner3' else entry,1 if runner_id=='runner3' else proposal.leverage)
+        size_price = planned_entry if runner_id=='runner3' else entry
+        size_leverage = 1 if runner_id=='runner3' else proposal.leverage
+        # Under runner3, bump a sub-minimum contract to the exchange min when the
+        # stop-budget notional still covers that minimum; otherwise fail closed
+        # with a clear below-minimum quantity (never silently round to 0).
+        bump_ceiling = min(limits.values()) if runner_id == 'runner3' else None
+        _,notional=rules.size_order(min(limits.values()), size_price, size_leverage,
+                                    allow_minimum_bump=runner_id == 'runner3',
+                                    max_notional=bump_ceiling)
         proposal.notional=notional
         if runner_id=='runner3':
             quantity=notional/planned_entry
             plan=result.metadata['price_plan']
             reference=plan.stop_reference if hasattr(plan,'stop_reference') else plan['stop_reference']
             extreme=runner3_policy.confirming_extreme(reference,result.metadata.get('price_evidence') or {})
+            drift_limit = abs(planned_entry - proposal.stop_loss.price) / planned_entry
+            if abs(entry / planned_entry - 1) > drift_limit + 1e-12:
+                raise EntryPriceDrift('live entry price drift', stage='planning', planned=planned_entry,
+                                      observed=entry, tolerance=drift_limit)
             if not runner3_policy.drift_respects_choch_risk(
                     side=candidate.side.value,fresh_entry=entry,stop=proposal.stop_loss.price,
                     target=proposal.take_profit_price,choch_extreme=extreme,quantity=quantity,
                     risk_budget=proposal.max_loss_if_stopped,fee=fee,slippage=slip):
                 raise EntryPriceDrift('live entry price drift',stage='planning',planned=planned_entry,
-                                      observed=entry,tolerance=abs(entry/planned_entry-1))
+                                      observed=entry,tolerance=drift_limit)
             proposal.notional=quantity*entry
             proposal.entry_price=entry
             requested_notional=proposal.notional
@@ -630,7 +648,8 @@ class LiveRunner:
                 ) else None, model_sizing=model_sizing,
                 profile_leverage=self._profile_leverage(control))
             if sized<proposal.notional-1e-8:
-                _,proposal.notional=rules.size_order(sized,entry,leverage)
+                _,proposal.notional=rules.size_order(
+                    sized, entry, leverage, allow_minimum_bump=True, max_notional=sized)
             proposal.leverage=leverage
             if sized<requested_notional-1e-6:
                 limiting_factor=('runner3_margin_policy' if allocation['target_margin_usdt']<=free_margin+1e-8

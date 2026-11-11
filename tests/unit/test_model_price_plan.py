@@ -148,6 +148,20 @@ def test_market_moves_after_analysis_rejects_old_entry_plan():
         apply_market_price_plan(candidate(),plan(),evidence(),price_step=.1,current_price=101,now=NOW)
 
 
+def test_entry_drift_at_exact_limit_is_inclusive():
+    """Sapma == sınır must not reject (AAVE +0.120% vs 0.120%)."""
+    # Default max_entry_drift is 0.5%. Move current so |plan/current - 1| == 0.005.
+    # plan=100, current = 100 / 1.005 → abs(100/current - 1) == 0.005.
+    current = 100. / 1.005
+    apply_market_price_plan(
+        candidate(), plan(), evidence(), price_step=.1, current_price=current, now=NOW,
+        max_entry_drift=.005)
+    with pytest.raises(PricePlanError, match='too_far'):
+        apply_market_price_plan(
+            candidate(), plan(), evidence(), price_step=.1,
+            current_price=100. / 1.0050001, now=NOW, max_entry_drift=.005)
+
+
 def test_model_target_must_cover_estimated_fees_and_slippage(tmp_path):
     runner,private,executor,control=prepare(tmp_path)
     runner.cfg.live_price_plan_enabled=True

@@ -3,8 +3,10 @@
 Risk fractions use .01 for1%. Prices are supplied by a quant candidate or a
 separately grounded/validated price-plan clone. Reapply with fresh equity and
 current policy/exchange limits immediately before execution. Fees, margin,
-contract minima and liquidation remain mandatory gates; a too-small plan is
-rejected rather than increased to the exchange minimum.
+contract minima and liquidation remain mandatory gates. A sub-minimum quantity
+may bump to the exchange minimum only when the caller's risk notional still
+covers that minimum; otherwise it is rejected early with a clear below-minimum
+reason rather than silently rounding to 0.
 """
 from math import isfinite
 from typing import Any
