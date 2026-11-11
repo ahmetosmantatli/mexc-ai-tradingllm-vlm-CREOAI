@@ -110,9 +110,13 @@ def trace_outcome(trace):
     if trace.get('action')=='cancel_watch':return 'Takip planı AI kararıyla iptal edildi; işlem açılmadı'
     if trace.get('status')=='provider_wait':return 'Sağlayıcı kapasitesi bekleniyor; yeni AI isteği gönderilmedi'
     execution=trace.get('execution_status')
+    structure = bool(trace.get('structure_auto_entry'))
+    path = trace.get('entry_path') or 'confirm_bar/ob_retest'
     if execution=='opened':
         return 'Gerçek işlem açıldı; borsa koruması doğrulandı' if trace.get('mode')=='LIVE' else 'Sanal işlem açıldı'
     if execution in ('rejected','not_opened'):
+        if structure and trace.get('model_action')=='trade':
+            return f'Yapı auto-entry planı ({path}) giriş kontrolünde açılmadı'
         if trace.get('model_action')=='trade':return 'AI işlem önerdi; doğrulama/yürütme aşamasında açılmadı'
         if trace.get('status')=='invalid_or_unavailable_model':
             return 'İşlem açılmadı — analiz başarısız'
@@ -124,6 +128,8 @@ def trace_outcome(trace):
     if trace.get('status')=='invalid_or_unavailable_model':
         return 'İşlem açılmadı — analiz başarısız'
     if trace.get('action')=='trade':
+        if structure:
+            return f'Yapı auto-entry planı kuruldu ({path}); giriş kontrolü bekleniyor'
         return 'AI işlem önerdi; risk kontrolü bekleniyor'
     if trace.get('action')=='watch':
         return 'İşlem açılmadı — aday izlemeye alındı'

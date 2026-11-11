@@ -405,6 +405,7 @@ class LiveFleet:
         if runner is not None:
             self._publish_review_notices(ident, runner)
             self._publish_entry_rejections(ident, runner)
+            self._publish_structure_outcomes(ident, runner)
         executor=getattr(runner,'executor',None)
         if executor is not None and callable(getattr(executor,'intents',None)):
             halt=snapshot.get('live_halt') or {}
@@ -482,7 +483,11 @@ class LiveFleet:
                 if notice['phase'] == 'start':
                     strategies = {'trend':'trend taraması', 'momentum':'ivme taraması',
                                   'mean_reversion':'ortalamaya dönüş taraması', 'structure_setup':'yapı taraması'}
-                    if notice.get('review_reason') == 'watch_structure_changed':
+                    if notice.get('structure_auto_entry'):
+                        path = notice.get('entry_path') or 'confirm_bar/ob_retest'
+                        text = (f'Yapı auto-entry adayı ({path}); model sorulmadan plan kuruluyor. '
+                                'Emir henüz yok.')
+                    elif notice.get('review_reason') == 'watch_structure_changed':
                         text = 'Takip planındaki piyasa yapısı değişti; AI incelemesi hazırlanıyor.'
                     elif notice['triggered']:
                         text = 'Takip tetiklendi; AI incelemesi hazırlanıyor.'
@@ -498,6 +503,10 @@ class LiveFleet:
                     text = 'Bu inceleme için uygun AI rotası bekleniyor.'
                 elif notice['status'] == 'completed' and notice.get('ready_setup_after_hold'):
                     text = 'Giriş, hazır kurulumdan alındı. Model BEKLE seçmişti.'
+                elif (notice['status'] == 'completed' and notice.get('structure_auto_entry')
+                      and notice.get('action') == 'trade'):
+                    from trading.runtime.structure_entry_messages import structure_plan_telegram_line
+                    text = structure_plan_telegram_line(notice.get('entry_path'))
                 elif notice['status'] == 'completed':
                     text = decisions.get(notice['action'], 'AI incelemesi tamamlandı.')
                 else:
@@ -553,6 +562,26 @@ class LiveFleet:
             if notices:
                 runner.store.put(key, [])
 
+    def _publish_structure_outcomes(self, ident, runner):
+        from trading.runtime.structure_entry_messages import STRUCTURE_OUTCOME_KEY
+        with runner.store.lock:
+            notices = runner.store.get(STRUCTURE_OUTCOME_KEY, [])
+            for notice in notices:
+                if notice.get('binding_id') != getattr(runner, 'binding_id', None):
+                    continue
+                text = notice.get('text') or ''
+                if not text:
+                    continue
+                symbol = notice.get('symbol') or '?'
+                outcome = notice.get('outcome') or 'REJECT'
+                reason = notice.get('reason') or ''
+                bucket = int(float(notice.get('at') or 0) // 300)
+                event_id = (f"live-structure-entry:{notice.get('binding_id')}:{symbol}:"
+                            f"{outcome}:{reason}:{bucket}")
+                self.controller.enqueue(ident, f'CANLI | {symbol} | {text}', event_id=event_id)
+            if notices:
+                runner.store.put(STRUCTURE_OUTCOME_KEY, [])
+
     def _publish_intent(self, ident, row):
         labels={'protected':'İşlem açıldı; borsada SL/TP koruması doğrulandı.',
             'closed':'İşlem kapandı; MEXC kapanışı doğrulandı.',
@@ -583,6 +612,11 @@ class LiveFleet:
                 if type(value) is int:text+=f'{label}: {value}\n'
             if not rejection:text+='Kesin ret nedeni eski kayıtta saklanmamış.\n'
         if state in ('protected','entry_filled_unprotected'):
+            if metadata.get('structure_auto_entry'):
+                path = metadata.get('entry_path') or 'confirm_bar/ob_retest'
+                text += f'Yapı auto-entry kaynağı: {path}\n'
+                if row.get('exchange_order_id'):
+                    text += f"Emir id: {row['exchange_order_id']}\n"
             stop=proposal.get('stop_loss') or {}
             text+=(f"Yön: {proposal.get('side','?')} | Kaldıraç: {proposal.get('leverage','?')}x\n"
                 f"Gerçekleşen giriş: {row.get('entry_fill_price','doğrulanmadı')} | SL: {stop.get('price','?')} | TP: {proposal.get('take_profit_price','?')}\n")
