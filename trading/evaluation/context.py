@@ -153,7 +153,7 @@ def runner3_model_view(account, market):
         return row.get('state') == 'ready' and evidence.get('kind') == 'htf_zone_internal'
 
     early = [row for row in options if _early(row)]
-    # The 1h weak-low card is the early entry. A 4h/15m CHoCH is not what this path waits for.
+    # Early READY cards (1h/5m or 4h/15m weak swing) skip the zone touch wait.
     ready = early or [row for row in options if closed_choch_at_block_or_flow(row)]
     shown = ready if ready else options
     if selection is not None:
@@ -247,7 +247,7 @@ COMPACT_SYSTEM = (
     'The prior note is at most one short clause plus the numeric trigger. '
     'Raw candles are omitted and are not a hold reason. '
     'A block or flow trade still needs that closed CHoCH and a supplied target. '
-    'The 1h weak swing with its 5m trigger does not need a 15m close. Touch alone is not an entry. '
+    'The 1h weak swing with its 5m trigger does not need a 15m close. The 4h weak swing with its 15m trigger does not need a higher CHoCH. Touch alone is not an entry. '
     'If the decision data is missing or the call would be a guess, return hold. Do not invent a trade.'
 )
 
