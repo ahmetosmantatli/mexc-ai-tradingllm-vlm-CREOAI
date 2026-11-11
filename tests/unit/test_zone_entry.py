@@ -52,8 +52,25 @@ def _bullish_block(view_row, *, low, high):
         direction='bullish', open_time=bar[0], low=low, high=high, status='untested'))
 
 
+def _ltf_confirm_after_choch(lower, *, long=True, level=100.):
+    """Move CHoCH off the last bar and add one same-direction continuation close."""
+    choch = lower['recent_ohlcv'][-2]
+    latest = lower['recent_ohlcv'][-1]
+    if long:
+        choch[1:5] = [99., 102., 98., 101.]
+        latest[1:5] = [101., 103., 100., 102.]
+        direction = 'bullish'
+    else:
+        choch[1:5] = [100., 101., 96., 97.]
+        latest[1:5] = [97., 98., 95., 96.]
+        direction = 'bearish'
+    lower['features']['structure_shifts'] = [
+        dict(at=choch[0], direction=direction, level=level, kind='choch')]
+    return choch, latest
+
+
 def weak_long_market(*, target_high=120., target_low=112., farther=None, block=True):
-    """1h weak low, bullish candle there, 5m CHoCH. No sweep and no 15m CHoCH."""
+    """1h weak low, bullish candle there, 5m CHoCH + confirm bar. No sweep and no 15m CHoCH."""
     ctx = htf_zone_context('1h', '5m')
     higher = view(ctx, '1h')
     swing = next(row for row in higher['features']['swings'] if row['kind'] == 'low')
@@ -82,6 +99,7 @@ def weak_long_market(*, target_high=120., target_low=112., farther=None, block=T
     for row in lower['features']['swings']:
         if row.get('kind') == 'low':
             row['price'] = 92.
+    _ltf_confirm_after_choch(lower, long=True, level=100.)
     return ctx
 
 
@@ -100,6 +118,7 @@ def test_weak_low_uses_the_5m_trigger_and_does_not_wait_for_a_sweep_or_15m():
     assert card['state'] == 'ready'
     assert card['side'] == 'long'
     assert card['evidence']['weak_field'] == 'low'
+    assert card['evidence']['entry_path'] == 'confirm_bar'
     assert card['evidence']['shift']['kind'] in ('choch', 'mss')
     assert view(market, '15m')['features']['structure_shifts'] == []
     assert view(market, '4h')['features']['structure_shifts'] == []
@@ -115,6 +134,7 @@ def test_weak_low_uses_the_5m_trigger_and_does_not_wait_for_a_sweep_or_15m():
     assert card['swing_highs'] and card['swing_lows']
     read = card['algorithm_read'].lower()
     assert 'not swept' in read
+    assert 'entry_path confirm_bar' in read
     assert 'weak low is valid' not in read
     assert 'bos is confirmed' not in read
     assert 'confirmed' not in read
@@ -141,7 +161,7 @@ def test_an_older_5m_choch_is_still_the_trigger_without_a_15m_close():
 
 
 def weak_short_market(*, reaction=108.):
-    """1h weak high at 110, bearish candle there, 5m bearish CHoCH after a 5m high at ``reaction``."""
+    """1h weak high at 110, bearish candle there, 5m bearish CHoCH + confirm bar after a 5m high at ``reaction``."""
     market = weak_long_market()
     higher = view(market, '1h')
     swing = next(row for row in higher['features']['swings'] if row['kind'] == 'high')
@@ -151,9 +171,7 @@ def weak_short_market(*, reaction=108.):
     pivot[2] = swing['price']
     pivot[3] = min(pivot[3], pivot[4])
     lower = view(market, '5m')
-    latest = lower['recent_ohlcv'][-1]
-    latest[1:5] = [100., 101., 96., 97.]
-    lower['features']['structure_shifts'] = [dict(at=latest[0], direction='bearish', level=99., kind='choch')]
+    _ltf_confirm_after_choch(lower, long=False, level=99.)
     high_swing = lower['features']['last_swing_high']
     origin = next(row for row in lower['recent_ohlcv'] if row[0] == high_swing['pivot_at'])
     origin[2] = reaction

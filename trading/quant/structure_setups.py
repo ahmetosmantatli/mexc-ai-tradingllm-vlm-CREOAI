@@ -492,6 +492,125 @@ def _reaction_stop(lower, trigger_tf, shift, long):
     return _reference(lower, trigger_tf, pick[0], field)
 
 
+def _continuation_bar(rows, choch_at, long):
+    """First closed LTF candle after the CHoCH close that continues in trade direction.
+
+    A naked CHoCH wick through a strong high/low is not enough. Long needs a
+    later bullish body (close > open); short needs a later bearish body.
+    """
+    for row in rows:
+        if row[0] <= choch_at:
+            continue
+        if long and row[4] > row[1]:
+            return row
+        if not long and row[4] < row[1]:
+            return row
+    return None
+
+
+def _nearby_ltf_ob(view, *, long, choch_at, current_price):
+    """Nearest valid LTF demand (bullish) or supply (bearish) OB for a pullback entry.
+
+    Only blocks formed at or before the CHoCH count. Nearby means the box mid
+    is within two LTF ATRs of price, or price still sits on the trade side of
+    the distal edge within that band (blue-box style retest, not a chase).
+    """
+    want = 'bullish' if long else 'bearish'
+    atr = _atr(view['rows'])
+    band = atr if atr > 0 else 0
+    found = []
+    for block in view['features'].get('order_block_candidates') or []:
+        if not isinstance(block, dict) or block.get('status') == 'invalidated':
+            continue
+        if block.get('direction') != want:
+            continue
+        low, high = block.get('low'), block.get('high')
+        at = block.get('open_time')
+        if not _positive(low) or not _positive(high) or low >= high or not _positive(at) or at > choch_at:
+            continue
+        mid = (low + high) / 2
+        if band > 0:
+            if abs(current_price - mid) > 2 * band:
+                if long and current_price < low - band:
+                    continue
+                if not long and current_price > high + band:
+                    continue
+                if abs(current_price - mid) > 2 * band:
+                    continue
+        found.append(block)
+    found.sort(key=lambda block: (abs(current_price - (block['low'] + block['high']) / 2),
+                                  -block.get('open_time', 0)))
+    return found[0] if found else None
+
+
+def _ob_touch_after(rows, ob, choch_at):
+    """A closed LTF bar after the CHoCH that trades back into the OB box."""
+    for row in rows:
+        if row[0] <= choch_at:
+            continue
+        if row[3] <= ob['high'] and row[2] >= ob['low']:
+            return row
+    return None
+
+
+def _ob_retest_active(ob, *, long, current_price, atr, touch_row, latest):
+    """Pullback still in play: price at the box, or the latest bar is the touch."""
+    if touch_row is None:
+        return False
+    if latest is not None and touch_row[0] == latest[0]:
+        return True
+    pad = .1 * atr if atr > 0 else 0
+    return ob['low'] - pad <= current_price <= ob['high'] + pad
+
+
+def _ob_retest_stop(lower, trigger_tf, ob, long):
+    """Stop beyond the OB distal, or the last LTF swing low/high if more protective."""
+    field = 'low' if long else 'high'
+    distal = ob['low'] if long else ob['high']
+    swings = _swings({trigger_tf: lower}, field)
+    stop_price = distal
+    stop_at = ob.get('open_time')
+    if swings:
+        swing = min(swings, key=lambda ref: ref['price']) if long else max(swings, key=lambda ref: ref['price'])
+        if long and swing['price'] <= distal:
+            stop_price, stop_at = swing['price'], swing['open_time']
+        if not long and swing['price'] >= distal:
+            stop_price, stop_at = swing['price'], swing['open_time']
+    ref = _reference(lower, trigger_tf, stop_at, field)
+    if ref is not None and ref['price'] == stop_price:
+        return ref
+    wick = _wick_reference(lower, trigger_tf, stop_price, field)
+    if wick is not None:
+        return wick
+    if ref is not None:
+        return dict(ref, price=stop_price)
+    return dict(timeframe=trigger_tf, open_time=stop_at, field=field, price=stop_price)
+
+
+def _early_entry_path(early, trigger_tf, shift, long, current_price):
+    """After LTF CHoCH: confirm_bar first, else OB retest. Naked CHoCH is neither.
+
+    Returns (path, stop_ref, touch_meta). path is 'confirm_bar', 'ob_retest', or None.
+    """
+    confirm = _continuation_bar(early['rows'], shift['at'], long)
+    if confirm is not None:
+        stop_ref = _reaction_stop(early, trigger_tf, shift, long)
+        return 'confirm_bar', stop_ref, dict(confirm_bar_open_time=confirm[0])
+    ob = _nearby_ltf_ob(early, long=long, choch_at=shift['at'], current_price=current_price)
+    if ob is None:
+        return None, _reaction_stop(early, trigger_tf, shift, long), {}
+    touch = _ob_touch_after(early['rows'], ob, shift['at'])
+    atr = _atr(early['rows'])
+    latest = early['rows'][-1] if early['rows'] else None
+    meta = dict(ob=dict(direction=ob.get('direction'), open_time=ob.get('open_time'),
+                        low=ob.get('low'), high=ob.get('high'), status=ob.get('status')),
+                touch_open_time=touch[0] if touch is not None else None)
+    if not _ob_retest_active(ob, long=long, current_price=current_price, atr=atr,
+                             touch_row=touch, latest=latest):
+        return None, _ob_retest_stop(early, trigger_tf, ob, long), meta
+    return 'ob_retest', _ob_retest_stop(early, trigger_tf, ob, long), meta
+
+
 def _fallback_targets(higher, structure_tf, *, long, entry):
     """With no opposing structure block, the next unfilled flow, then the nearest untaken swing."""
     flows = [ref for ref in _opposing_locations(higher, structure_tf, long=long, entry=entry)
@@ -591,11 +710,14 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
     entry does not wait for a sweep. The 1h path triggers on 5m and does not
     wait for a 15m or 4h CHoCH; the 4h path triggers on 15m and does not wait
     for a higher CHoCH. Proximity uses half a structure ATR, entry stays within
-    one structure ATR, nearest weak level first, stop beyond the trigger-TF
-    extreme up to the CHoCH candle, and the target is the next opposing
-    structure block else unfilled flow else untaken swing. On the 1h path a
-    farther 4h block can be the better target. The 4h path does not also fire
-    a 5m trigger in this release.
+    one structure ATR, nearest weak level first. After the LTF CHoCH, READY
+    needs a same-direction continuation bar (confirm_bar) or a pullback touch
+    into a nearby LTF demand/supply OB (ob_retest); a naked CHoCH stays WATCH.
+    confirm_bar keeps the reaction stop; ob_retest stops beyond the OB distal
+    or the last LTF swing. The target is the next opposing structure block
+    else unfilled flow else untaken swing. On the 1h path a farther 4h block
+    can be the better target. The 4h path does not also fire a 5m trigger in
+    this release.
     """
     cards = []
     for structure_tf, trigger_tf, horizon in EARLY_WEAK_PATHS:
@@ -647,9 +769,11 @@ def _early_weak_path(views, structure_tf, trigger_tf, horizon, *, current_price,
             reaction = _reaction_candle(higher, swing, long)
             if reaction is None:
                 continue
-            stop_ref = _reaction_stop(early, trigger_tf, shift, long)
+            path, stop_ref, path_meta = _early_entry_path(
+                early, trigger_tf, shift, long, current_price)
             if stop_ref is None:
                 continue
+            ready = path is not None
             entry = current_price
             aligned = higher_trend == direction and higher_trend in ('bullish', 'bearish')
             ordered = (_target_blocks(higher, structure_tf, book, long=long, entry=entry, aligned=aligned)
@@ -663,15 +787,23 @@ def _early_weak_path(views, structure_tf, trigger_tf, horizon, *, current_price,
             if not (0 < stop < entry < target if long else 0 < target < entry < stop):
                 continue
             target_kind = target_ref.get('kind', 'block')
+            path_note = (f", entry_path {path}" if path else
+                         f", awaiting confirm bar or {trigger_tf} OB retest")
             read = (
                 f"{structure_tf} {field} {swing['price']:g} not swept, "
                 f"{trigger_tf} reached {reach:g}, "
                 f"{'bullish' if long else 'bearish'} candle, "
-                f"{trigger_tf} through {shift['level']:g}, "
+                f"{trigger_tf} through {shift['level']:g}"
+                f"{path_note}, "
                 f"next {structure_tf} {target_kind} {target_ref['price']:g}"
             )
+            ob_meta = path_meta.get('ob')
+            trigger_price = None
+            if not ready and isinstance(ob_meta, dict):
+                trigger_price = ob_meta['high'] if long else ob_meta['low']
             evidence = dict(
-                kind='htf_zone_internal', stage='confirmed',
+                kind='htf_zone_internal',
+                stage='confirmed' if ready else 'awaiting_entry',
                 zone=dict(kind='swing', timeframe=structure_tf, direction=direction,
                           low=swing['price'] if long else target_ref['price'],
                           high=target_ref['price'] if long else swing['price'],
@@ -684,12 +816,22 @@ def _early_weak_path(views, structure_tf, trigger_tf, horizon, *, current_price,
                 candidate_block=dict({key: target_ref[key] for key in ('timeframe', 'open_time', 'field', 'price')},
                                      kind=target_kind),
                 shift=shift, touch_at=reaction[0] + SECONDS[structure_tf],
-                confirmation_at=lower['closed_at'], expires_at=lower['closed_at'] + seconds,
+                confirmation_at=lower['closed_at'] if ready else None,
+                expires_at=lower['closed_at'] + seconds,
                 alignment='with_higher_timeframe' if aligned else 'against_higher_timeframe')
+            if path:
+                evidence['entry_path'] = path
+            if path_meta.get('confirm_bar_open_time') is not None:
+                evidence['confirm_bar_open_time'] = path_meta['confirm_bar_open_time']
+            if isinstance(ob_meta, dict):
+                evidence['ltf_ob'] = ob_meta
+            if path_meta.get('touch_open_time') is not None:
+                evidence['ob_touch_open_time'] = path_meta['touch_open_time']
             family = 'pullback' if aligned else 'countertrend_sweep_reclaim'
             material = dict(version=HTF_ZONE_VERSION, symbol=symbol, family=family,
                             side='long' if long else 'short', horizon=horizon, evidence=evidence,
-                            trigger=None, state='ready', stop=stop, target=target, algorithm_read=read)
+                            trigger=trigger_price, state='ready' if ready else 'watch',
+                            stop=stop, target=target, algorithm_read=read)
             ident = sha256(json.dumps(material, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:24]
             reference = lambda ref: {key: ref[key] for key in ('timeframe', 'open_time', 'field')}
             levels = [{key: ref[key] for key in ('timeframe', 'open_time', 'field', 'price')} for ref in ordered]
@@ -699,9 +841,13 @@ def _early_weak_path(views, structure_tf, trigger_tf, horizon, *, current_price,
                 setup_id=ident, **material, macro_trend=higher['features'].get('trend', 'unknown'),
                 opposing_target_levels=levels, context_timeframe=structure_tf, trigger_timeframe=trigger_tf,
                 source_closed_at=lower['closed_at'], requires_full_context=False,
-                entry_reference=entry, stop_loss_price=stop, take_profit_price=target,
+                entry_reference=entry if ready else trigger_price,
+                stop_loss_price=stop, take_profit_price=target,
                 reward_risk=abs(target - entry) / abs(entry - stop),
-                trigger_condition=None, invalidation_condition='below' if long else 'above',
+                trigger_condition=(None if ready else
+                                   ('closed_candle_overlap_ob' if trigger_price is not None
+                                    else 'closed_continuation_or_ob_retest')),
+                invalidation_condition='below' if long else 'above',
                 invalidation_price=swing['price'],
                 stop_reference=reference(stop_ref), target_reference=reference(target_ref),
                 swing_highs=[point for point in points if point['kind'] == 'high'],
@@ -852,11 +998,15 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0, zone_r
     triggers on 15m and does not wait for a higher CHoCH. A weak swing is
     liquidity that has not been taken, the trigger reaction must reach near it
     (≤0.5 structure ATR), and price must not have run more than one structure
-    ATR away from it. The stop is beyond the trigger extreme before the CHoCH,
-    and the target is the next structure block, else the next unfilled flow,
+    ATR away from it. After the LTF CHoCH, READY needs a same-direction
+    continuation bar or an LTF demand/supply OB retest (``entry_path``); a
+    naked CHoCH stays WATCH. confirm_bar stops beyond the trigger extreme
+    before the CHoCH; ob_retest stops beyond the OB distal or last LTF swing.
+    The target is the next structure block, else the next unfilled flow,
     else the nearest untaken swing. On the 1h path a 4h block is only the
     better target. The 4h early path does not also fire a 5m trigger here.
-    A filled flow is neither a zone nor a target.
+    A filled flow is neither a zone nor a target. ``ZONE_CARDS_READY`` stays
+    off unless the caller forces ``zone_ready``.
     BTC/ETH context stays independent of the symbol's executable evidence.
     """
     if (not _positive(current_price) or isinstance(price_step, bool)
