@@ -446,6 +446,15 @@ python -m trading.control.usage_report --output-dir /app/data/reports
 python -m trading.control.edge_report --root /app/data --output-dir /app/data/reports --fetch-public
 ```
 
+The same `usage_report` export also writes Runner 3 READY→fill measurement files
+(`ready-fill-summary.txt`, `ready-fill.json`) from the durable `ready_fill_events`
+table in each live runtime SQLite. Rows cover every READY structure card (early
+weak-swing and zone): entry/stop/target, net R at gate, AI decision / veto,
+order sent, fill vs reject, and later target-hit / stop-hit / open with realized R
+when known. Telegram only surfaces a one-line aggregate count on activity status;
+it does not spam each card. This journal is measurement evidence, not a live PnL
+claim.
+
 Historical unrecorded decisions or the old STONK exception reason cannot be
 reconstructed. This release does not establish their cause or live profitability.
 

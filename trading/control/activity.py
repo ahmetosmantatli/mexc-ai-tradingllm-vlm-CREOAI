@@ -75,6 +75,12 @@ def activity_summary(snapshot, now=None):
         text+=f"Son tamamlanan analiz: {latest.get('symbol','?')} · {trace_outcome(latest)}\n"
         if latest.get('execution_reason'):
             text+='Son yürütme kontrolü: '+human_reason(latest['execution_reason'])+'\n'
+    ready=snapshot.get('ready_fill_summary')
+    if isinstance(ready, dict) and ready.get('cards'):
+        from trading.runtime.ready_fill import summary_line
+        line=summary_line(ready)
+        if line:
+            text+=line+'\n'
     for job in delayed:
         label={'analysis':'AI analizi','scan':'piyasa taraması','monitor':'borsa uzlaştırması','management':'pozisyon yönetimi'}.get(job.get('kind'),'arka plan görevi')
         text+=f"Geciken görev: {label}, {job.get('age_seconds',0):.0f} sn.\n"
