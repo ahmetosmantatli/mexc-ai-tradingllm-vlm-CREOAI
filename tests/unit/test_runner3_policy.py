@@ -23,6 +23,63 @@ def test_small_equity_silent_fallback_is_35_percent_and_standard_stays_20_percen
     assert margin_policy(11,11,11,'strong','swing')['margin_fraction']==.35
 
 
+def test_continuous_small_account_defaults_near_full_free_margin():
+    from trading.runtime.runner3_policy import (
+        CONTINUOUS_SMALL_ACCOUNT_MARGIN_FRACTION, CONTINUOUS_STOP_RISK_CAP,
+        apply_guclu_margin_share, capital_rotation_plan, leverage_for_choch_loss, swap_candidate)
+
+    for grade in ('standard', 'strong'):
+        allocation = margin_policy(8, 8, 8, grade, 'intraday', model_sizing=True, continuous=True)
+        assert allocation['margin_fraction'] == CONTINUOUS_SMALL_ACCOUNT_MARGIN_FRACTION
+        assert allocation['target_margin_usdt'] == pytest.approx(8 * .95)
+        assert allocation['reserve_usdt'] == 0
+        assert allocation['max_entry_cost_usdt'] == pytest.approx(7.6)
+    # Without continuous, model sizing still keeps the timid 20%/35% defaults.
+    assert margin_policy(8, 8, 8, 'standard', 'intraday', model_sizing=True)['margin_fraction'] == .20
+    assert margin_policy(8, 8, 8, 'strong', 'intraday', model_sizing=True)['margin_fraction'] == .35
+    # At/above 100 USDT continuous does not invent the small-account near-full share.
+    assert margin_policy(100, 100, 100, 'strong', 'intraday', model_sizing=True, continuous=True)['margin_fraction'] == .2
+
+    silent = apply_guclu_margin_share(
+        margin_policy(8, 8, 8, 'strong', 'swing', model_sizing=True, continuous=True),
+        equity=8, available=8, raw_share=None, allow_standard=True, continuous=True)
+    assert silent['margin_share_source'] == 'fallback_continuous'
+    assert silent['margin_fraction'] == pytest.approx(.95)
+    assert silent['target_margin_usdt'] == pytest.approx(7.6)
+    model = apply_guclu_margin_share(
+        margin_policy(8, 8, 8, 'standard', 'intraday', model_sizing=True, continuous=True),
+        equity=8, available=8, raw_share=.5, allow_standard=True, continuous=True)
+    assert model['margin_share_source'] == 'model'
+    assert model['target_margin_usdt'] == pytest.approx(4.)
+
+    # ~$8 continuous: near-full margin target, stop loss still <= 15%, leverage never forced to 1x.
+    leverage, margin, size = leverage_for_choch_loss(
+        notional=60., entry=100., stop=98., free_margin=8., margin_target=7.6, equity=8.,
+        max_leverage=20, maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02,
+        model_sizing=True, profile_leverage=10)
+    assert leverage >= 2
+    assert leverage != 1
+    assert margin + size * .0006 <= 7.6 + 1e-8
+    assert size * .02 <= 8. * CONTINUOUS_STOP_RISK_CAP + 1e-9
+
+    fee, slip = .0006, .0005
+    report = swap_candidate(
+        [dict(symbol='BTC_USDT', setup_id='b', side='long', entry_reference=100,
+              stop_loss_price=90, take_profit_price=150)],
+        [dict(symbol='ETH_USDT', side='long', entry=100, stop=90, target=101)],
+        free_margin=1, required_margin=7.6, fee=fee, slippage=slip)
+    assert report['close'] is False
+    off = capital_rotation_plan(report, enabled=False, equity=8)
+    assert off['execute'] is False
+    assert off['auto_close'] is False
+    assert off['trim_symbols'] == ['ETH_USDT']
+    assert off['margin_gap_usdt'] == pytest.approx(6.6)
+    on = capital_rotation_plan(report, enabled=True, equity=8)
+    assert on['execute'] is True
+    assert on['auto_close'] is False
+    assert capital_rotation_plan(None, enabled=True) is None
+
+
 def test_runner3_economics_rejects_small_payoff_and_expensive_entry():
     validate_economics(2.,1.8,1.)
     with pytest.raises(ValueError,match='runner3_net_target_r_too_low'):

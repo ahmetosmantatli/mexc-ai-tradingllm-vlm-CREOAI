@@ -16,6 +16,9 @@ SMALL_ACCOUNT_EQUITY_USDT = 100.
 SMALL_ACCOUNT_LEVERAGE_FLOOR = 10
 MIN_OPEN_MARGIN_USDT = 1.
 GUCLU_MARGIN_FALLBACK = .35
+# Continuous aggressive under 100 USDT: near-full free margin, not the timid 20%/35% defaults.
+# Final size is still clipped by the 15% equity stop, 1.25R, free margin, and liquidation buffer.
+CONTINUOUS_SMALL_ACCOUNT_MARGIN_FRACTION = .95
 GUCLU_MARGIN_INSTRUCTION = (
     'Under 100 USDT Standart margin stays 20% of equity. Güçlü is not a fixed percent. '
     'When a setup carries guclu_margin_choice, that label, its evidence, free margin, equity, open positions, the CHoCH loss ceiling, and the account goal are for you, the text model. '
@@ -24,6 +27,7 @@ GUCLU_MARGIN_INSTRUCTION = (
     'You cannot widen or tighten the CHoCH stop to make the position bigger. '
     'Final size is the tightest of your share, the CHoCH loss ceiling, and free margin. '
     'If margin_share is missing or invalid the engine uses 35% of equity and does not invent a larger share. '
+    'Continuous aggressive under 100 USDT is different: silence uses 95% of equity (still clipped by free margin and the 15% stop), not 20% or 35%. '
     'At or above 100 USDT the engine keeps its profile margin target. '
     'You do not place the order. One writer does. '
 )
@@ -108,13 +112,15 @@ def guclu_margin_request(setup, *, equity, free_margin, open_positions, loss_cei
         account_goal='grow the cash', time_horizon=setup_time_horizon(setup))
 
 
-def resolve_guclu_margin_share(value):
-    """Usable fraction of equity, or exactly 35%. Never a larger invented share."""
+def resolve_guclu_margin_share(value, *, continuous_small=False):
+    """Usable fraction of equity, or the silent fallback. Never invents above the fallback."""
+    fallback = CONTINUOUS_SMALL_ACCOUNT_MARGIN_FRACTION if continuous_small else GUCLU_MARGIN_FALLBACK
+    source = 'fallback_continuous' if continuous_small else 'fallback_35'
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return GUCLU_MARGIN_FALLBACK, 'fallback_35'
+        return fallback, source
     value = float(value)
     if not isfinite(value) or not 0 < value <= 1:
-        return GUCLU_MARGIN_FALLBACK, 'fallback_35'
+        return fallback, source
     return value, 'model'
 
 
@@ -134,11 +140,13 @@ def chosen_margin_share(metadata):
     return getattr(plan, 'margin_share', None)
 
 
-def apply_guclu_margin_share(allocation, *, equity, available, raw_share, allow_standard=False):
+def apply_guclu_margin_share(allocation, *, equity, available, raw_share, allow_standard=False,
+                             continuous=False):
     """Use the text model's Güçlü share under 100 USDT.
 
     Standart defaults to 20%; the opt-in model policy can honor its explicit share.
-    Silence or an unusable share falls back to 35% of equity.
+    Silence or an unusable share falls back to 35% of equity, or 95% when continuous
+    aggressive sizing is on under 100 USDT.
     """
     strong = allocation.get('grade') == 'strong'
     if not (strong or allow_standard):
@@ -147,7 +155,8 @@ def apply_guclu_margin_share(allocation, *, equity, available, raw_share, allow_
         return allocation
     if not allow_standard and equity >= SMALL_ACCOUNT_EQUITY_USDT:
         return allocation
-    fraction, source = resolve_guclu_margin_share(raw_share)
+    continuous_small = bool(continuous and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT)
+    fraction, source = resolve_guclu_margin_share(raw_share, continuous_small=continuous_small)
     if not strong and source != 'model':
         return allocation
     target = equity * fraction
@@ -182,13 +191,18 @@ def validate_evidence(setup, plan, now=None):
         raise ValueError('runner3_structural_stop_too_tight')
 
 
-def margin_policy(equity, capital, available, grade, horizon, *, model_sizing=False):
+def margin_policy(equity, capital, available, grade, horizon, *, model_sizing=False, continuous=False):
     if not all(type(v) in (int, float) and isfinite(v) and v >= 0 for v in (equity, capital, available)):
         raise ValueError('runner3_invalid_margin_context')
     if grade not in ('standard','strong') or horizon not in ('scalp','intraday','swing'):
         raise ValueError('runner3_invalid_margin_context')
     small_account = 0 < equity < SMALL_ACCOUNT_EQUITY_USDT
-    if small_account:
+    if continuous and model_sizing and small_account:
+        # Near-full free margin under 100 USDT in continuous aggressive mode.
+        # The 15% equity stop, free margin, and liquidation buffer still clip size.
+        fraction = CONTINUOUS_SMALL_ACCOUNT_MARGIN_FRACTION
+        target = equity * fraction
+    elif small_account:
         # Standart is 20% of equity. 35% is only the silent Güçlü fallback.
         # The text model's share replaces it before an order is sized.
         fraction = GUCLU_MARGIN_FALLBACK if grade == 'strong' else .20
@@ -644,6 +658,48 @@ def swap_candidate(waiting, positions, *, free_margin, required_margin, fee, sli
                              expected_r=best_r, with_higher_timeframe=with_higher_timeframe(best),
                              target=best.get('take_profit_price')),
                 open_positions=weaker)
+
+
+def capital_rotation_plan(swap_report, *, enabled=False, equity=None):
+    """Staged trim plan when a better setup needs margin locked in weaker opens.
+
+    Always report-only unless ``enabled``. Even when enabled this does not close or
+    reduce anything by itself: it only names weaker symbols and the margin gap.
+    Full auto-rotation still needs management-path reduce confirmation, fill
+    verification, and no IOC cancel-state chasing. Thesis-invalidated
+    ``release_symbol`` stays the only live full-close rotation path today.
+    """
+    if not isinstance(swap_report, dict):
+        return None
+    weaker = [dict(row) for row in swap_report.get('open_positions') or [] if isinstance(row, dict)]
+    if not weaker:
+        return None
+    try:
+        free = float(swap_report.get('free_margin'))
+        required = float(swap_report.get('required_margin'))
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(free) or not isfinite(required) or required <= free + 1e-9:
+        return None
+    waiting = swap_report.get('waiting') if isinstance(swap_report.get('waiting'), dict) else {}
+    gap = required - free
+    small = (isinstance(equity, (int, float)) and not isinstance(equity, bool)
+             and isfinite(equity) and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT)
+    return dict(
+        mode='trim_weaker_opens',
+        execute=bool(enabled),
+        auto_close=False,
+        reason='better_setup_needs_margin',
+        margin_gap_usdt=gap,
+        free_margin_usdt=free,
+        required_margin_usdt=required,
+        small_account=small,
+        waiting=dict(symbol=waiting.get('symbol'), setup_id=waiting.get('setup_id'),
+                     expected_r=waiting.get('expected_r')),
+        trim_symbols=[row.get('symbol') for row in weaker if row.get('symbol')],
+        open_positions=weaker,
+        note=('Flag off: plan only, no reduce/close. Flag on: still not unsupervised full close; '
+              'wire management reduce next. Do not chase IOC cancel state 4.'))
 
 
 ENTRY_GATE_BEGIN = 'Runner 3 entry gate, checked before you propose and again by the engine:'

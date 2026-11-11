@@ -529,7 +529,7 @@ class ContextEvaluator:
             for option in options:
                 grade=runner3_policy.evidence_grade(option)
                 allocation=runner3_policy.margin_policy(balance,equity,live_account['available_usdt'],
-                    grade,option['horizon'],model_sizing=model_sizing)
+                    grade,option['horizon'],model_sizing=model_sizing,continuous=continuous)
                 ceiling=countertrend_cap if option['family']=='countertrend_sweep_reclaim' else risk_per_trade_pct
                 target_risk=None if model_sizing else runner3_policy.small_account_risk_target(balance,ceiling,grade)
                 option['allocation']=dict(allocation,
@@ -558,7 +558,9 @@ class ContextEvaluator:
                       'When 1.25 would otherwise block, you may choose a farther supplied opposing target you judge has more potential. That choice stands. '
                       'The risk engine still caps size and loss. Open positions include unrealized pnl, thesis, mark, stop, and remaining room. '
                       'release_symbol closes one different open position only when its thesis is invalidated and free margin cannot fund the new plan. '
-                      'The close uses the single writer and the new entry waits until the exchange confirms that close.'))
+                      'The close uses the single writer and the new entry waits until the exchange confirms that close. '
+                      'Continuous aggressive under 100 USDT defaults near-full free margin (95% of equity), still clipped by the 15% stop, 1.25R, and free margin. '
+                      'capital_rotation is a staged trim plan only; it does not unsupervised full-close weaker opens.'))
         account['setup_selection']=dict(enabled=selection_enabled,options=options,
             countertrend_max_risk_fraction=countertrend_cap,
             note='Select setup_id and provide a fresh grounded price_plan for TRADE. No hypothesis means no forced trade.')
@@ -577,6 +579,12 @@ class ContextEvaluator:
                 fee=fee, slippage=slippage)
             if report:
                 account['swap_candidate']=report
+                rotation=runner3_policy.capital_rotation_plan(
+                    report, enabled=bool(getattr(self.cfg, 'live_runner3_capital_rotation_enabled', False)),
+                    equity=live_account.get('current_equity'))
+                if rotation:
+                    account['capital_rotation']=rotation
+                    self.store.put('capital_rotation:'+symbol, rotation)
                 self.store.put('swap_candidate:'+symbol, report)
                 logging.getLogger('worker').info(
                     'SWAP %s expected_r=%s open=%s', report['waiting'].get('symbol'),

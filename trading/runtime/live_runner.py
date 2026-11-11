@@ -345,9 +345,15 @@ class LiveRunner:
             except (KeyError, TypeError):
                 grade='standard'
         horizon=setup.get('horizon') if setup.get('horizon') in ('scalp', 'intraday', 'swing') else 'intraday'
+        equity=snapshot['balance']['equity']
+        runner_id=control.get('runner_id')
+        model_sizing=runner3_policy.aggressive_model_sizing(
+            self.cfg, self.risk.preset.profile, runner_id, equity)
+        continuous=runner3_policy.continuous_aggressive(self.cfg, self.risk.preset.profile, runner_id)
         try:
-            allocation=runner3_policy.margin_policy(snapshot['balance']['equity'], self._capital(snapshot, control),
-                snapshot['balance']['available'], grade, horizon)
+            allocation=runner3_policy.margin_policy(
+                equity, self._capital(snapshot, control), snapshot['balance']['available'],
+                grade, horizon, model_sizing=model_sizing, continuous=continuous)
         except ValueError:
             return False
         return allocation['max_entry_cost_usdt']<=0
@@ -589,9 +595,10 @@ class LiveRunner:
                 available = min(available, balance['available_open'])
             allocation=runner3_policy.apply_guclu_margin_share(
                 runner3_policy.margin_policy(snapshot['balance']['equity'],self._capital(snapshot,control),
-                    available,grade,setup['horizon'],model_sizing=model_sizing),
+                    available,grade,setup['horizon'],model_sizing=model_sizing,continuous=continuous),
                 equity=snapshot['balance']['equity'], available=available,
-                raw_share=runner3_policy.chosen_margin_share(result.metadata), allow_standard=model_sizing)
+                raw_share=runner3_policy.chosen_margin_share(result.metadata), allow_standard=model_sizing,
+                continuous=continuous)
             free_margin=available-allocation['reserve_usdt']
             if free_margin<=0:
                 raise ValueError('insufficient_available_margin' if model_sizing else 'runner3_margin_reserve')

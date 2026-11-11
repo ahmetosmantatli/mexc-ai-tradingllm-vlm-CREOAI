@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     live_runner3_enabled: bool = False
     live_runner3_aggressive_model_sizing_enabled: bool = False
     live_runner3_continuous_aggressive_enabled: bool = False
+    # Staged capital rotation: plans trim of weaker opens when a better setup needs margin.
+    # Default off. Even when on, does not unsupervised full-close or chase IOC cancel state 4.
+    live_runner3_capital_rotation_enabled: bool = False
     live_runner3_daily_net_target_usdt: float | None = Field(default=None, gt=0)
     # After a valid Runner 3 text decision, skip the second (VLM) provider call by default.
     runner3_vlm_after_valid_text: bool = False
