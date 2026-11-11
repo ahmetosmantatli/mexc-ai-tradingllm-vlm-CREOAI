@@ -327,9 +327,9 @@ def _matches_acceptance(saved, card):
     if not isinstance(saved, dict) or not _early_card(card):
         return False
     evidence = card['evidence']
+    # The stop buffer moves with ATR. Agreement is the weak level and the side.
     return (saved.get('side') == card.get('side')
-            and _near(saved.get('weak_level'), evidence.get('weak_level'))
-            and _near(saved.get('stop'), card.get('stop_loss_price')))
+            and _near(saved.get('weak_level'), evidence.get('weak_level')))
 
 
 def _acceptance_snapshot(card):
@@ -615,6 +615,9 @@ class ContextEvaluator:
                 and not candidate.features.get('hold_review')):
             saved = self.store.get('accepted_entry:' + symbol)
             match = next((row for row in options if _matches_acceptance(saved, row)), None)
+            if match is not None and symbol in (live_positions or {}):
+                return EvaluationResult(action=GraphAction.HOLD, hold_reason='open_position',
+                    metadata={'provider_called': False, 'model_not_asked': True})
             if match is not None:
                 cash_equity, cash_free = runner3_policy.cash_for_veto(equity, live_account)
                 direct_decision, failed = _internal_entry_decision(
@@ -686,9 +689,10 @@ class ContextEvaluator:
                         action='hold', price_plan=None, sizing_plan=None, limit_price=None,
                         watch_plan=None, release_symbol=None, thesis_invalidated=False))
                 elif (named is not None and decision.action=='trade' and decision.price_plan is None
-                        and closed_structure_card(named) and runner3 and price_rules is not None):
-                    # The card already has the closed CHoCH, the block or flow, and the stop.
-                    # A missing plan is filled from that card. It is not a discarded response.
+                        and (closed_structure_card(named) or _early_card(named))
+                        and runner3 and price_rules is not None):
+                    # The card already has the stop and a supplied target. A missing
+                    # plan is filled from that card. It is not a discarded response.
                     try:
                         plan=_ground_card_plan(
                             named, candidate, chart_context, entry=candidate.entry_price, fee=fee, slippage=slippage,
@@ -827,6 +831,7 @@ class ContextEvaluator:
                      'Early path: a 1h weak low, a bullish candle there, and a 5m trigger. A short is the weak high. Stop under that 5m swing. The target is the next 1h block. A 4h block is only the better target, not a reason to wait for a 15m CHoCH. '
                      'A weak low is liquidity that has not been taken. Do not wait for that sweep. '
                      'The packet lists swings, highs, lows, the weak-low level, the trigger candle, and the candidate block. The read clause is how the algorithm read them. You may reject that read. '
+                     'That 1h card stays ready after the 5m CHoCH. It does not become an awaiting-confirmation watch and it does not wait for a 15m close. '
                      'The stop is the CHoCH swing: a short uses the CHoCH high and a long uses the CHoCH low. '
                      'When the trade is against the higher timeframe, target only the next opposing block or flow on the trigger timeframe. Do not hold that trade toward a far higher-timeframe target. '
                      'When the trade is with the higher timeframe, a farther target is allowed. '

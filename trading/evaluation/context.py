@@ -201,7 +201,8 @@ COMPACT_SYSTEM = (
     '(1.25 R, 15% equity stop, free margin). '
     'The prior note is at most one short clause plus the numeric trigger. '
     'Raw candles are omitted and are not a hold reason. '
-    'A trade still needs that closed CHoCH at a block or a flow and a supplied target. Touch alone is not an entry. '
+    'A block or flow trade still needs that closed CHoCH and a supplied target. '
+    'The 1h weak swing with its 5m trigger does not need a 15m close. Touch alone is not an entry. '
     'If the decision data is missing or the call would be a guess, return hold. Do not invent a trade.'
 )
 

@@ -113,6 +113,25 @@ def test_weak_low_uses_the_5m_trigger_and_does_not_wait_for_a_sweep_or_15m():
     assert 'valid' not in read
 
 
+def test_an_older_5m_choch_is_still_the_trigger_without_a_15m_close():
+    market = weak_long_market()
+    lower = view(market, '5m')
+    shift = lower['features']['structure_shifts'][0]
+    older = lower['recent_ohlcv'][-5]
+    older[1:5] = [99., 102., 98., 101.]
+    shift['at'] = older[0]
+    for row in lower['recent_ohlcv'][-4:]:
+        row[4] = max(row[4], 101.)
+        row[2] = max(row[2], row[4])
+    card, = _internal(market)
+    assert card['state'] == 'ready'
+    assert card['trigger_timeframe'] == '5m'
+    assert card['evidence']['shift']['at'] == older[0]
+    assert view(market, '15m')['features']['structure_shifts'] == []
+    lower['recent_ohlcv'][-1][4] = 99.
+    assert _internal(market) == []
+
+
 def test_weak_high_is_the_short_with_the_5m_trigger():
     market = weak_long_market()
     higher = view(market, '1h')
@@ -241,6 +260,9 @@ def test_the_first_look_asks_the_model_and_the_next_look_does_not(tmp_path, monk
     def asked(packet):
         raise AssertionError('model was asked again')
 
+    agreed = store.get('accepted_entry:BTC_USDT')
+    agreed['stop'] = agreed['stop'] + 5
+    store.put('accepted_entry:BTC_USDT', agreed)
     monkeypatch.setattr('trading.analysis.build_bundle', lambda *args, **kwargs: SimpleNamespace(
         fingerprint='lane-2', to_context=lambda **kw: deepcopy(market)))
     second_model = DecisionModel(asked, vision)

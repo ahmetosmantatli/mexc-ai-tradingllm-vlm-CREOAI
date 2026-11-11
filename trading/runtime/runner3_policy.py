@@ -831,6 +831,7 @@ def entry_gate_instruction(*, fee, slippage):
         'Early path: a 1h weak low, a bullish candle there, and a 5m trigger. A short is the weak high. Stop under that 5m swing. Target the next 1h block. A 4h block is only the better target, not a reason to wait for a 15m CHoCH.',
         'A weak low is liquidity that has not been taken. Do not wait for that sweep. The untaken level can be revisited.',
         'The packet lists swings, highs, lows, the weak-low level, the trigger candle, and the candidate block. The read clause is how the algorithm read them. You may reject that read.',
+        'That 1h card stays ready after the 5m CHoCH. It does not become an awaiting-confirmation watch and it does not wait for a 15m close.',
         'Entry is a closed CHoCH on the trigger timeframe at a block or a flow. The trigger candle must close through that CHoCH level, against the structure it breaks.',
         'The stop is the CHoCH swing. A short uses the CHoCH high. A long uses the CHoCH low. Do not move it.',
         'When the trade is against the higher timeframe, target only the next opposing block or flow on the trigger timeframe. Do not hold that trade toward a far higher-timeframe target.',

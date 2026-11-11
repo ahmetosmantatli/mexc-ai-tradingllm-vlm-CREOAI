@@ -346,11 +346,21 @@ def _liquidity_taken(view, swing, field):
 
 
 def _reaction_candle(view, swing, long):
-    """A candle that traded the weak swing and closed back with it. A sweep is not required."""
+    """A bullish candle at the weak low, or the short mirror. A sweep is not required.
+
+    The swing candle traded the level. A later candle counts when it trades
+    back into that candle and closes with the level.
+    """
     price = swing['price']
+    origin = next((row for row in view['rows'] if row[0] == swing['open_time']), None)
+    if origin is None:
+        return None
     found = None
     for row in view['rows']:
-        if row[0] < swing['open_time'] or not (row[3] <= price <= row[2]):
+        if row[0] < swing['open_time']:
+            continue
+        overlaps = row[3] <= origin[2] and row[2] >= origin[3]
+        if not overlaps and not (row[3] <= price <= row[2]):
             continue
         if long and row[4] > row[1] and row[4] >= price:
             found = row
@@ -360,22 +370,28 @@ def _reaction_candle(view, swing, long):
 
 
 def _trigger_shift(lower, direction):
-    """The latest trigger-timeframe CHoCH or MSS that closed through its level."""
+    """Latest 5m CHoCH or MSS that closed through its level.
+
+    It does not have to be one of the last three bars, and it is not a 15m
+    close. A later close back through that level removes it.
+    """
     long = direction == 'bullish'
-    recent = {row[0] for row in lower['rows'][-3:]}
+    rows = {row[0]: row for row in lower['rows']}
     for event in reversed(lower['features'].get('structure_shifts') or []):
         if not isinstance(event, dict):
             continue
         if event.get('direction') != direction or event.get('kind') not in ('choch', 'mss'):
             continue
-        if event.get('at') not in recent or not _positive(event.get('level')):
+        row = rows.get(event.get('at'))
+        level = event.get('level')
+        if row is None or not _positive(level):
             continue
-        row = next((item for item in lower['rows'] if item[0] == event['at']), None)
-        if row is None:
+        if long and not row[4] > level:
             continue
-        if long and not row[4] > event['level']:
+        if not long and not row[4] < level:
             continue
-        if not long and not row[4] < event['level']:
+        if any((item[4] < level if long else item[4] > level)
+               for item in lower['rows'] if item[0] > row[0]):
             continue
         return event, row
     return None, None
