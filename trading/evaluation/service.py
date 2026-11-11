@@ -47,6 +47,9 @@ class ModelDecision(BaseModel):
 
 
 VLM_DECISION_TIMEOUT_SECONDS = 120
+# Runner 3 analysis may wait on free-tier routing / provider queue. That wait is
+# outside the post-decision entry clock (decision_started_at / decision_ttl).
+ANALYSIS_WAIT_SECONDS = 180
 
 
 def _has_trade_prices(decision, candidate):
@@ -733,7 +736,10 @@ class ContextEvaluator:
         if live_account is not None and self.on_live_review is not None:
             self.on_live_review(trace)
         self.store.put('stage','model_evaluation')
-        deadline=started+self.cfg.decision_ttl_seconds
+        # Entry freshness uses decision_ttl after a winner is chosen. Analysis may
+        # wait longer on free-tier / queue delay without discarding a valid answer.
+        analysis_budget = max(self.cfg.decision_ttl_seconds, ANALYSIS_WAIT_SECONDS) if runner3 else self.cfg.decision_ttl_seconds
+        deadline = started + analysis_budget
         reentry_note={}
         def validate(payload):
             decision=ModelDecision.model_validate(payload)
@@ -1033,7 +1039,9 @@ class ContextEvaluator:
             except Exception:
                 text_result = failed_review('text')
             provider_called = bool(text_result['called'])
-            text_decision = text_result['decision'] if time.time() - started <= self.cfg.decision_ttl_seconds else None
+            # Keep a valid text answer even when analysis waited past decision_ttl.
+            # decision_clock below starts the entry freshness window.
+            text_decision = text_result['decision']
             share_decision = text_decision
             text_attempts = text_result['attempts']
             decision = text_decision

@@ -150,6 +150,50 @@ def test_changed_entry_inputs_never_reach_executor(tmp_path,change):
     assert not executor.calls
 
 
+def test_aged_decision_survives_when_price_still_matches_plan(tmp_path):
+    """Gate/queue delay past decision_ttl must not hard-expire a still-valid plan."""
+    runner,_,executor,control=prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled=True
+    control['runner_id']='runner3'
+    signal=candidate();runner.candidate_queue().refresh([signal])
+    decision=_runner3_decision(runner,signal,'htf_zone_mss')
+    decision.metadata['decision_started_at']=time()-500
+    assert runner._apply(signal,decision,control)['reason']=='LIVE_PROTECTED'
+    assert [call[0] for call in executor.calls]==['authorize','execute']
+    assert decision.metadata['decision_started_at']>time()-5
+
+
+def test_aged_decision_still_expires_when_price_left_the_plan(tmp_path):
+    runner,_,executor,control=prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled=True
+    control['runner_id']='runner3'
+    signal=candidate();runner.candidate_queue().refresh([signal])
+    decision=_runner3_decision(runner,signal,'htf_zone_mss')
+    decision.metadata['decision_started_at']=time()-500
+    decision.metadata['model_not_asked']=True
+    runner.store.put('accepted_entry:'+signal.symbol,dict(side='long',kind='htf_zone_internal',weak_level=99.))
+    runner.public.get_ticker=lambda symbol:TickerSnapshot(symbol,104,103.99,104.,1e6,
+        raw={'timestamp':time()*1000,'fairPrice':104})
+    assert runner._apply(signal,decision,control)['reason']=='HOLD_LIVE_DECISION_EXPIRED'
+    assert not executor.calls
+    assert runner.store.get('accepted_entry:'+signal.symbol)=={}
+
+
+def test_halt_keeps_accepted_entry_for_retry_after_gate(tmp_path):
+    runner,_,executor,control=prepare(tmp_path)
+    runner.cfg.live_price_plan_enabled=True
+    control['runner_id']='runner3'
+    signal=candidate();runner.candidate_queue().refresh([signal])
+    decision=_runner3_decision(runner,signal,'htf_zone_mss')
+    decision.metadata['model_not_asked']=True
+    accepted=dict(side='long',kind='htf_zone_internal',weak_level=99.)
+    runner.store.put('accepted_entry:'+signal.symbol,accepted)
+    runner.store.put('live:halt',{'reason':'unknown write'})
+    assert runner._apply(signal,decision,control)['reason']=='HOLD_LIVE_HALT'
+    assert runner.store.get('accepted_entry:'+signal.symbol)==accepted
+    assert not executor.calls
+
+
 def test_final_gate_catches_watch_change_during_executor_preflight(tmp_path):
     runner,_,executor,control=prepare(tmp_path)
     signal=candidate();runner.candidate_queue().refresh([signal])
