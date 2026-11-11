@@ -228,6 +228,11 @@ HTF_ZONE_VERSION = 'htf-zone-setup-v1'
 WEAK_PROXIMITY_ATR = .5
 # Entry (current price) must still be within this many 1h ATRs of the weak level.
 WEAK_ENTRY_MAX_ATR = 1.
+# Early weak-swing proximity and stop stay on this short LTF window even when
+# the market packet carries a longer touch-memory series for zone cards.
+EARLY_REACTION_BARS = 12
+# LTF bars kept for zone touch / confirmation memory (5m ≈ 4h, 15m ≈ 12h).
+LTF_TOUCH_BARS = 48
 # A confirmed zone CHoCH/MSS card stays a watch unless this is on. In the
 # 10-day replay those cards lost about 0.9R per trade that cleared 1.25R net.
 ZONE_CARDS_READY = False
@@ -565,22 +570,24 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
     if '1h' not in views or '5m' not in views:
         return []
     higher, lower = views['1h'], views['5m']
+    # Zone cards may see ~48 LTF bars; early proximity/stop stay on the last 12.
+    early = dict(lower, rows=lower['rows'][-EARLY_REACTION_BARS:])
     book = views.get('4h')
     higher_trend = (book or higher)['features'].get('trend', 'unknown')
     seconds = SECONDS['5m']
     if not (observed < lower['closed_at'] + seconds):
         return []
-    points = _swing_points({'4h': book, '1h': higher, '5m': lower} if book else {'1h': higher, '5m': lower})
+    points = _swing_points({'4h': book, '1h': higher, '5m': early} if book else {'1h': higher, '5m': early})
     hourly_atr = _atr(higher['rows'])
     if not hourly_atr > 0:
         return []
     band = WEAK_PROXIMITY_ATR * hourly_atr
     cards = []
     for long, field, direction in ((True, 'low', 'bullish'), (False, 'high', 'bearish')):
-        shift, trigger = _trigger_shift(lower, direction)
+        shift, trigger = _trigger_shift(early, direction)
         if shift is None:
             continue
-        reach = min(row[3] for row in lower['rows']) if long else max(row[2] for row in lower['rows'])
+        reach = min(row[3] for row in early['rows']) if long else max(row[2] for row in early['rows'])
         nearby = [swing for swing in _swings({'1h': higher}, field) if abs(reach - swing['price']) <= band]
         nearby.sort(key=lambda swing: (abs(current_price - swing['price']), -swing['open_time']))
         for swing in nearby:
@@ -593,7 +600,7 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
             reaction = _reaction_candle(higher, swing, long)
             if reaction is None:
                 continue
-            stop_ref = _reaction_stop(lower, '5m', shift, long)
+            stop_ref = _reaction_stop(early, '5m', shift, long)
             if stop_ref is None:
                 continue
             entry = current_price
@@ -603,7 +610,7 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
             if not ordered:
                 continue
             target_ref = ordered[0]
-            stop = _tick(stop_ref['price'] + (-1 if long else 1) * _atr(lower['rows']) * .1,
+            stop = _tick(stop_ref['price'] + (-1 if long else 1) * _atr(early['rows']) * .1,
                          price_step, up=not long)
             target = _tick(target_ref['price'], price_step, up=not long)
             if not (0 < stop < entry < target if long else 0 < target < entry < stop):
@@ -665,7 +672,11 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     outside_zone = current_price <= distal if long else current_price >= distal
     if outside_zone:
         return None
-    subsequent = [row for row in lower['rows'] if row[0] >= zone['confirmed_at']]
+    # Touch memory uses the longer LTF series (up to LTF_TOUCH_BARS). Confirmation
+    # and stop ATR stay on the recent tail so older pads do not reshape the stop.
+    memory = dict(lower, rows=lower['rows'][-LTF_TOUCH_BARS:])
+    recent = dict(lower, rows=lower['rows'][-EARLY_REACTION_BARS:])
+    subsequent = [row for row in memory['rows'] if row[0] >= zone['confirmed_at']]
     if any((row[4] < distal if long else row[4] > distal) for row in subsequent):
         return None
     touches = [row for row in subsequent if row[3] <= zone['high'] and row[2] >= zone['low']]
@@ -688,7 +699,7 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     elif touches:
         touch = touches[-1]
         field = 'high' if long else 'low'
-        swings = _swings({trigger_tf: lower}, field)
+        swings = _swings({trigger_tf: recent}, field)
         levels = [ref['price'] for ref in swings
                   if (ref['price'] > max(current_price, latest[4]) if long
                       else ref['price'] < min(current_price, latest[4]))]
@@ -707,7 +718,7 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
                 else _reference(higher, zone['timeframe'], zone['open_time'], field))
     if stop_ref is None:
         return None
-    stop = _tick(stop_ref['price'] + (-1 if long else 1) * _atr(lower['rows']) * .1,
+    stop = _tick(stop_ref['price'] + (-1 if long else 1) * _atr(recent['rows']) * .1,
                  price_step, up=not long)
     macro = higher['features'].get('trend', 'unknown')
     # With the higher timeframe, farther structural levels stay available.
@@ -736,7 +747,10 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     last_shift = next(iter(reversed(features.get('structure_shifts', []))), None)
     evidence = dict(kind=('htf_zone_' + shift['kind']) if ready else 'htf_zone_watch',
                     stage='confirmed' if ready else 'awaiting_confirmation' if touch else 'awaiting_touch',
-                    zone=zone, touch_at=touch[0] + seconds if touch else None,
+                    zone=zone,
+                    # Touch metadata stays on the card so LLM packets need not carry the full LTF pad.
+                    touch_open_time=touch[0] if touch else None,
+                    touch_at=touch[0] + seconds if touch else None,
                     confirmation_at=lower['closed_at'] if ready else None,
                     context_last_break=last_break, context_last_shift=last_shift)
     if ready:
@@ -781,6 +795,11 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0, zone_r
     on, a confirmed zone card stays a watch with ``watch_only`` evidence.
     A touch or a future level can produce a watch. The LTF trigger must close
     after the touch candle, so same-candle intrabar ordering is never inferred.
+    Zone touch memory reads up to ``LTF_TOUCH_BARS`` closed LTF candles so a
+    touch older than the previous 12-bar window stays ``awaiting_confirmation``;
+    the card stores ``touch_open_time`` / ``touch_at`` rather than shipping the
+    whole pad into the model packet. Early weak-swing cards still score
+    proximity and reaction stops on the last ``EARLY_REACTION_BARS`` only.
     An early 1h card does not wait for a 15m or 4h CHoCH. A weak swing is
     liquidity that has not been taken, the 5m reaction must reach near it, and
     price must not have run more than one 1h ATR away from it. The 5m CHoCH is the trigger, the stop is beyond the 5m extreme before it,

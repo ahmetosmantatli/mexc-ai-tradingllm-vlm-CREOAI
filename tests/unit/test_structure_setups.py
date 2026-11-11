@@ -1,4 +1,5 @@
 from copy import deepcopy
+import json
 import pytest
 
 from trading.quant.structure_setups import build_structure_setups
@@ -558,3 +559,76 @@ def test_htf_zone_rejects_open_confirmation_and_distal_close_invalidation():
     row = view(ctx, '15m')['recent_ohlcv'][-2]
     row[3:5] = [92., 93.]
     assert build_htf_zone_setups(ctx, current_price=101.) == []
+
+
+def _pad_ltf(ctx, trigger_tf, *, bars=48):
+    """Extend the trigger series so an older touch can sit beyond the last 12 bars."""
+    from trading.quant.structure_setups import LTF_TOUCH_BARS, SECONDS
+
+    lower = view(ctx, trigger_tf)
+    rows = lower['recent_ohlcv']
+    seconds = SECONDS[trigger_tf]
+    first = rows[0][0]
+    pad = [[first - seconds * (bars - len(rows) - i), 99., 100., 98., 99., 1.]
+           for i in range(bars - len(rows))]
+    lower['recent_ohlcv'] = pad + rows
+    assert len(lower['recent_ohlcv']) == bars == LTF_TOUCH_BARS
+    return lower
+
+
+@pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
+def test_zone_touch_older_than_12_bars_stays_awaiting_confirmation(context_tf, trigger_tf):
+    from trading.quant.structure_setups import SECONDS, build_htf_zone_setups
+
+    ctx = htf_zone_context(context_tf, trigger_tf)
+    lower = _pad_ltf(ctx, trigger_tf, bars=48)
+    # Clear the near-end touch from the fixture, then place one 20 bars back.
+    for row in lower['recent_ohlcv'][-12:]:
+        row[1:5] = [99., 100., 98., 99.]
+    touch = lower['recent_ohlcv'][-20]
+    touch[1:5] = [97., 98., 96., 97.]
+    lower['features']['structure_shifts'] = []
+    waiting, = build_htf_zone_setups(ctx, current_price=99., price_step=.01)
+    assert waiting['evidence']['stage'] == 'awaiting_confirmation'
+    assert waiting['evidence']['touch_open_time'] == touch[0]
+    assert waiting['evidence']['touch_at'] == touch[0] + SECONDS[trigger_tf]
+
+    # The previous 12-bar window alone would have forgotten the touch.
+    short = deepcopy(ctx)
+    short_lower = view(short, trigger_tf)
+    short_lower['recent_ohlcv'] = short_lower['recent_ohlcv'][-12:]
+    forgotten, = build_htf_zone_setups(short, current_price=99., price_step=.01)
+    assert forgotten['evidence']['stage'] == 'awaiting_touch'
+    assert forgotten['evidence']['touch_at'] is None
+
+
+def test_longer_ltf_touch_memory_does_not_inflate_model_candle_packet():
+    from trading.evaluation.context import compact_decision_packet, runner3_model_view
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context('4h', '15m')
+    lower = _pad_ltf(ctx, '15m', bars=48)
+    for row in lower['recent_ohlcv'][-12:]:
+        row[1:5] = [99., 100., 98., 99.]
+    touch = lower['recent_ohlcv'][-20]
+    touch[1:5] = [97., 98., 96., 97.]
+    lower['features']['structure_shifts'] = []
+    option, = build_htf_zone_setups(ctx, current_price=99., price_step=.01)
+    assert option['evidence']['stage'] == 'awaiting_confirmation'
+    assert len(view(ctx, '15m')['recent_ohlcv']) == 48
+
+    account = dict(setup_selection=dict(options=[option]))
+    trimmed_account, trimmed_market = runner3_model_view(account, ctx)
+    assert trimmed_market['summary']['candle_count'] <= 8 * len(trimmed_market['timeframes'])
+    assert all(len(frame.get('recent_ohlcv') or []) <= 8 for frame in trimmed_market['timeframes'])
+    # The named touch open stays referenced; the 36 older pad bars do not.
+    fifteen = next(frame for frame in trimmed_market['timeframes'] if frame['timeframe'] == '15m')
+    assert option['evidence']['touch_open_time'] in {row[0] for row in fifteen['recent_ohlcv']}
+    assert len(fifteen['recent_ohlcv']) < 48
+
+    packet = compact_decision_packet(json.dumps(dict(
+        context_policy='pa-context-v4', candidate=dict(symbol='TEST_USDT', entry_price=99.),
+        market=trimmed_market, account=trimmed_account)))
+    compact = json.loads(packet)
+    assert 'recent_ohlcv' not in json.dumps(compact)
+    assert len(json.dumps(compact)) < 8_000
