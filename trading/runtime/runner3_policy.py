@@ -167,7 +167,8 @@ def validate_evidence(setup, plan, now=None):
     if evidence.get('expires_at', float('inf')) <= now:
         raise ValueError('runner3_evidence_expired')
     if setup.get('context_timeframe'):
-        if setup.get('state') != 'ready' or evidence.get('kind') not in ('htf_zone_choch', 'htf_zone_mss'):
+        if setup.get('state') != 'ready' or evidence.get('kind') not in (
+                'htf_zone_choch', 'htf_zone_mss', 'htf_zone_internal'):
             raise ValueError('runner3_requires_verified_setup')
         if plan.entry_timeframe != setup['trigger_timeframe']:
             raise ValueError('runner3_trigger_timeframe_mismatch')
@@ -461,6 +462,48 @@ def retrigger_target(setup, *, price_step=0):
         if _positive_number(card_target) and _same_price(float(chosen['price']), float(card_target)):
             price = float(card_target)
     return float(price), reference, chosen
+
+
+def choose_zone_target(setup, *, entry, stop, fee, slippage, price_step=0):
+    """Nearest structure block. A farther block only when it is the better one.
+
+    Against the higher timeframe the next block is the only target. With it,
+    the nearest block is used when it clears 1.25. Otherwise the next
+    higher-timeframe block that clears is the better target.
+    """
+    if not isinstance(setup, dict):
+        return None
+    raw = setup.get('opposing_target_levels')
+    levels = [level for level in raw if isinstance(level, dict) and _positive_number(level.get('price'))] if isinstance(raw, list) else []
+    long = setup.get('side') != 'short'
+    levels.sort(key=lambda level: (float(level['price']) if long else -float(level['price']), level.get('open_time') or 0))
+    if not levels:
+        return None
+    step = price_step if _cost_rate(price_step) else 0
+
+    def priced(level):
+        target = _tick_toward_entry(level['price'], step, long=long)
+        ratio = cost_adjusted_r(
+            side=setup.get('side'), entry=entry, stop=stop, target=target, fee=fee, slippage=slippage)
+        return float(target), ratio, level
+
+    if not with_higher_timeframe(setup):
+        return priced(levels[0])
+    target, ratio, level = priced(levels[0])
+    if isinstance(ratio, float) and ratio >= MIN_NET_TARGET_R:
+        return target, ratio, level
+    structure = setup.get('context_timeframe')
+    rank = {'5m': 0, '15m': 1, '1h': 2, '4h': 3}
+    floor = rank.get(structure, 99)
+    for farther in levels[1:]:
+        if farther.get('kind') not in ('block', None):
+            continue
+        if rank.get(farther.get('timeframe'), -1) < floor:
+            continue
+        price, farther_ratio, chosen = priced(farther)
+        if isinstance(farther_ratio, float) and farther_ratio >= MIN_NET_TARGET_R:
+            return price, farther_ratio, chosen
+    return target, ratio, level
 
 
 def priced_reentry(setup, *, price, equity, free_margin, fee, slippage, notional=None, leverage=1, price_step=0):
@@ -785,6 +828,9 @@ def entry_gate_instruction(*, fee, slippage):
         ENTRY_GATE_BEGIN,
         'Price-action playbook, before you answer:',
         'High structure is 4h with a 15m trigger. Low structure is 1h with a 5m trigger. Both directions use the same rule.',
+        'Early path: a 1h weak low, a bullish candle there, and a 5m trigger. A short is the weak high. Stop under that 5m swing. Target the next 1h block. A 4h block is only the better target, not a reason to wait for a 15m CHoCH.',
+        'A weak low is liquidity that has not been taken. Do not wait for that sweep. The untaken level can be revisited.',
+        'The packet lists swings, highs, lows, the weak-low level, the trigger candle, and the candidate block. The read clause is how the algorithm read them. You may reject that read.',
         'Entry is a closed CHoCH on the trigger timeframe at a block or a flow. The trigger candle must close through that CHoCH level, against the structure it breaks.',
         'The stop is the CHoCH swing. A short uses the CHoCH high. A long uses the CHoCH low. Do not move it.',
         'When the trade is against the higher timeframe, target only the next opposing block or flow on the trigger timeframe. Do not hold that trade toward a far higher-timeframe target.',

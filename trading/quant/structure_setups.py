@@ -328,6 +328,193 @@ def _opposing_locations(view, tf, *, long, entry):
     return found
 
 
+def _liquidity_taken(view, swing, field):
+    """A sweep or a later close through the swing takes its liquidity."""
+    price = swing['price']
+    want = 'low_sweep' if field == 'low' else 'high_sweep'
+    for event in view['features'].get('sweeps') or []:
+        if isinstance(event, dict) and event.get('direction') == want and event.get('level') == price:
+            return True
+    for row in view['rows']:
+        if row[0] <= swing['open_time']:
+            continue
+        if field == 'low' and row[4] < price:
+            return True
+        if field == 'high' and row[4] > price:
+            return True
+    return False
+
+
+def _reaction_candle(view, swing, long):
+    """A candle that traded the weak swing and closed back with it. A sweep is not required."""
+    price = swing['price']
+    found = None
+    for row in view['rows']:
+        if row[0] < swing['open_time'] or not (row[3] <= price <= row[2]):
+            continue
+        if long and row[4] > row[1] and row[4] >= price:
+            found = row
+        if not long and row[4] < row[1] and row[4] <= price:
+            found = row
+    return found
+
+
+def _trigger_shift(lower, direction):
+    """The latest trigger-timeframe CHoCH or MSS that closed through its level."""
+    long = direction == 'bullish'
+    recent = {row[0] for row in lower['rows'][-3:]}
+    for event in reversed(lower['features'].get('structure_shifts') or []):
+        if not isinstance(event, dict):
+            continue
+        if event.get('direction') != direction or event.get('kind') not in ('choch', 'mss'):
+            continue
+        if event.get('at') not in recent or not _positive(event.get('level')):
+            continue
+        row = next((item for item in lower['rows'] if item[0] == event['at']), None)
+        if row is None:
+            continue
+        if long and not row[4] > event['level']:
+            continue
+        if not long and not row[4] < event['level']:
+            continue
+        return event, row
+    return None, None
+
+
+def _stop_swing(lower, trigger_tf, shift, long):
+    field = 'low' if long else 'high'
+    prior = [ref for ref in _swings({trigger_tf: lower}, field) if ref['open_time'] <= shift['at']]
+    if prior:
+        return max(prior, key=lambda ref: ref['open_time'])
+    return _reference(lower, trigger_tf, shift['at'], field)
+
+
+def _swing_points(views):
+    points = []
+    for tf, view in views.items():
+        if not isinstance(view, dict):
+            continue
+        for field in ('high', 'low'):
+            for ref in _swings({tf: view}, field):
+                points.append(dict(timeframe=tf, kind=field, price=ref['price'], open_time=ref['open_time']))
+    return points
+
+
+def _target_blocks(structure, structure_tf, book, *, long, entry, aligned):
+    """Next opposing block on the structure timeframe.
+
+    With the higher timeframe, a farther 4h block stays available as the better
+    target. Against it, only the next structure block is returned.
+    """
+    blocks = [ref for ref in _opposing_locations(structure, structure_tf, long=long, entry=entry)
+              if ref.get('kind') == 'block']
+    blocks.sort(key=lambda ref: (ref['price'] if long else -ref['price'], ref['open_time']))
+    if not blocks:
+        return []
+    if not aligned or book is None or structure_tf != '1h':
+        return blocks[:1]
+    nearest = blocks[0]['price']
+    for ref in _opposing_locations(book, '4h', long=long, entry=entry):
+        if ref.get('kind') != 'block':
+            continue
+        if long and not ref['price'] > nearest:
+            continue
+        if not long and not ref['price'] < nearest:
+            continue
+        ident = (ref['timeframe'], ref['open_time'], ref['field'], ref['price'])
+        if ident in {(row['timeframe'], row['open_time'], row['field'], row['price']) for row in blocks}:
+            continue
+        blocks.append(ref)
+    blocks.sort(key=lambda ref: (ref['price'] if long else -ref['price'], ref['open_time']))
+    return blocks
+
+
+def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
+    """1h weak swing, trigger on 5m. 4h is a better target, not a 15m wait.
+
+    A weak low or high is a swing whose liquidity has not been taken. The
+    entry does not wait for a sweep, and it does not wait for a 15m or 4h CHoCH.
+    """
+    if '1h' not in views or '5m' not in views:
+        return []
+    higher, lower = views['1h'], views['5m']
+    book = views.get('4h')
+    higher_trend = (book or higher)['features'].get('trend', 'unknown')
+    seconds = SECONDS['5m']
+    if not (observed < lower['closed_at'] + seconds):
+        return []
+    points = _swing_points({'4h': book, '1h': higher, '5m': lower} if book else {'1h': higher, '5m': lower})
+    cards = []
+    for long, field, direction in ((True, 'low', 'bullish'), (False, 'high', 'bearish')):
+        shift, trigger = _trigger_shift(lower, direction)
+        if shift is None:
+            continue
+        for swing in _swings({'1h': higher}, field):
+            if _liquidity_taken(higher, swing, field):
+                continue
+            if swing['open_time'] > shift['at']:
+                continue
+            reaction = _reaction_candle(higher, swing, long)
+            if reaction is None:
+                continue
+            stop_ref = _stop_swing(lower, '5m', shift, long)
+            if stop_ref is None:
+                continue
+            entry = current_price
+            aligned = higher_trend == direction and higher_trend in ('bullish', 'bearish')
+            ordered = _target_blocks(higher, '1h', book, long=long, entry=entry, aligned=aligned)
+            if not ordered:
+                continue
+            target_ref = ordered[0]
+            stop = _tick(stop_ref['price'] + (-1 if long else 1) * _atr(lower['rows']) * .1,
+                         price_step, up=not long)
+            target = _tick(target_ref['price'], price_step, up=not long)
+            if not (0 < stop < entry < target if long else 0 < target < entry < stop):
+                continue
+            read = (
+                f"1h {field} {swing['price']:g} not swept, "
+                f"{'bullish' if long else 'bearish'} candle, "
+                f"5m through {shift['level']:g}, next 1h block {target_ref['price']:g}"
+            )
+            evidence = dict(
+                kind='htf_zone_internal', stage='confirmed',
+                zone=dict(kind='swing', timeframe='1h', direction=direction,
+                          low=swing['price'] if long else target_ref['price'],
+                          high=target_ref['price'] if long else swing['price'],
+                          open_time=swing['open_time']),
+                weak_level=swing['price'], weak_field=field,
+                trigger_candle=dict(timeframe='5m', open_time=trigger[0], open=trigger[1],
+                                    high=trigger[2], low=trigger[3], close=trigger[4]),
+                candidate_block={key: target_ref[key] for key in ('timeframe', 'open_time', 'field', 'price')},
+                shift=shift, touch_at=reaction[0] + SECONDS['1h'],
+                confirmation_at=lower['closed_at'], expires_at=lower['closed_at'] + seconds,
+                alignment='with_higher_timeframe' if aligned else 'against_higher_timeframe')
+            family = 'pullback' if aligned else 'countertrend_sweep_reclaim'
+            material = dict(version=HTF_ZONE_VERSION, symbol=symbol, family=family,
+                            side='long' if long else 'short', horizon='intraday', evidence=evidence,
+                            trigger=None, state='ready', stop=stop, target=target, algorithm_read=read)
+            ident = sha256(json.dumps(material, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:24]
+            reference = lambda ref: {key: ref[key] for key in ('timeframe', 'open_time', 'field')}
+            levels = [{key: ref[key] for key in ('timeframe', 'open_time', 'field', 'price')} for ref in ordered]
+            for level, ref in zip(levels, ordered):
+                level['kind'] = ref.get('kind', 'block')
+            cards.append(dict(
+                setup_id=ident, **material, macro_trend=higher['features'].get('trend', 'unknown'),
+                opposing_target_levels=levels, context_timeframe='1h', trigger_timeframe='5m',
+                source_closed_at=lower['closed_at'], requires_full_context=False,
+                entry_reference=entry, stop_loss_price=stop, take_profit_price=target,
+                reward_risk=abs(target - entry) / abs(entry - stop),
+                trigger_condition=None, invalidation_condition='below' if long else 'above',
+                invalidation_price=swing['price'],
+                stop_reference=reference(stop_ref), target_reference=reference(target_ref),
+                swing_highs=[point for point in points if point['kind'] == 'high'],
+                swing_lows=[point for point in points if point['kind'] == 'low'],
+                management_posture='reduced_risk_countertrend' if family == 'countertrend_sweep_reclaim' else 'normal_policy',
+                caveat='1h weak swing and 5m trigger. The read is not a fact the model must obey.'))
+            break
+    return cards
+
+
 def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step, observed, symbol):
     direction = zone['direction']
     long = direction == 'bullish'
@@ -442,6 +629,10 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0):
     flow on the trigger timeframe.
     A touch or a future level can produce a watch. The LTF trigger must close
     after the touch candle, so same-candle intrabar ordering is never inferred.
+    An early 1h card does not wait for a 15m or 4h CHoCH. A weak swing is
+    liquidity that has not been taken. The 5m CHoCH is the trigger, the stop
+    is under that 5m swing, and the target is the next 1h block. A 4h block
+    is only the better target.
     BTC/ETH context stays independent of the symbol's executable evidence.
     """
     if (not _positive(current_price) or isinstance(price_step, bool)
@@ -467,4 +658,7 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0):
                                   market_context['observed_at'], market_context.get('symbol'))
             if option is not None:
                 options.append(option)
+    options.extend(_early_weak_cards(
+        views, current_price=current_price, price_step=price_step,
+        observed=market_context['observed_at'], symbol=market_context.get('symbol')))
     return options
