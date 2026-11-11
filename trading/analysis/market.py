@@ -226,7 +226,10 @@ class TimeframeView:
 
     def to_context(self, *, ict=False, htf_history=False):
         features={**self.features, **ict_features(self.candles,self.features)} if ict else self.features
-        context_bars = 48 if htf_history and self.label in ('4h', '1h') else 12
+        # Runner 3 keeps 48 bars on every TF so LTF touch memory spans ~4h of 5m
+        # / ~12h of 15m. Compact/LLM paths still reference only the few candles
+        # a card names (touch_open_time stays on the setup evidence).
+        context_bars = 48 if htf_history else 12
         return dict(timeframe=self.label, closed_at=self.closed_at, history_bars=len(self.candles),
                     fingerprint=self.fingerprint, features=features,
                     recent_ohlcv=[c.row() for c in self.candles[-context_bars:]])

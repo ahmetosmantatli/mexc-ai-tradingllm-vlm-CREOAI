@@ -112,7 +112,7 @@ def test_runner3_hourly_bundle_uses_closed_min60_and_degrades_by_lane(tmp_path):
     context = bundle.to_context(ict=True, htf_history=True)
     frames = {view['timeframe']: view for view in context['timeframes']}
     assert {frame: len(view['recent_ohlcv']) for frame, view in frames.items()} == {
-        '4h': 48, '1h': 48, '15m': 12, '5m': 12,
+        '4h': 48, '1h': 48, '15m': 48, '5m': 48,
     }
     assert frames['1h']['closed_at'] == 1_800_000_000
     assert frames['1h']['recent_ohlcv'][-1][0] == 1_799_996_400

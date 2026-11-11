@@ -173,7 +173,8 @@ def runner3_model_view(account, market):
         zone = evidence.get('zone') if isinstance(evidence.get('zone'), dict) else {}
         mark(row.get('trigger_timeframe'), shift.get('at'))
         mark(zone.get('timeframe'), zone.get('open_time'))
-        mark(row.get('trigger_timeframe'), evidence.get('touch_at'))
+        # Prefer the open-time stamp stored on the card; touch_at is the close clock.
+        mark(row.get('trigger_timeframe'), evidence.get('touch_open_time') or evidence.get('touch_at'))
         for ref in (row.get('stop_reference'), row.get('target_reference')):
             if isinstance(ref, dict):
                 mark(ref.get('timeframe'), ref.get('open_time'))
