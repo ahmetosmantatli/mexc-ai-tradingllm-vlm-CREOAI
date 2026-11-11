@@ -354,6 +354,25 @@ def _early_card(card):
     return card.get('state') == 'ready' and evidence.get('kind') == 'htf_zone_internal'
 
 
+def _confirm_path_ready_card(options, *, side=None):
+    """Early READY with confirm_bar or ob_retest — post-CHoCH entry paths only."""
+    rows = []
+    for row in options or []:
+        if not _early_card(row):
+            continue
+        evidence = row.get('evidence') if isinstance(row.get('evidence'), dict) else {}
+        path = evidence.get('entry_path') or row.get('entry_path')
+        if path in ('confirm_bar', 'ob_retest'):
+            rows.append(row)
+    if not rows:
+        return None
+    if side is None:
+        return rows[0]
+    side_name = getattr(side, 'value', side)
+    matched = [row for row in rows if row.get('side') == side_name]
+    return matched[0] if matched else None
+
+
 def _near(left, right):
     if not runner3_policy._positive_number(left) or not runner3_policy._positive_number(right):
         return left is None and right is None
@@ -626,6 +645,7 @@ class ContextEvaluator:
                 summary='Bekleme tetiki basıldı. Eski gerekçe: '+str(prior_hold.get('rationale') or '')[:240])
         direct_decision = None
         model_not_asked = False
+        structure_auto_entry = False
         if runner3 and candidate.features.get('hold_review') and price_rules is not None:
             # A printed number enters only when it matches a plan the model already accepted.
             card = _retrigger_card(candidate, options)
@@ -691,6 +711,46 @@ class ContextEvaluator:
                         metadata={'provider_called': False, 'model_not_asked': True, 'veto': failed})
                 if direct_decision is not None:
                     model_not_asked = True
+        if (runner3 and not model_not_asked and price_rules is not None
+                and getattr(self.cfg, 'live_runner3_structure_auto_entry_enabled', True)
+                and not candidate.features.get('hold_review')):
+            # Cold early READY with confirm_bar/ob_retest: open without the model.
+            # Uses the same choose_zone_target + entry_veto path as accepted_entry
+            # (early cards are not closed_entry_structure / _ground_card_plan).
+            # 1.25R / 15% stop / free margin stay. Flag default on.
+            card = _confirm_path_ready_card(options, side=candidate.side)
+            if card is not None:
+                cash_equity, cash_free = runner3_policy.cash_for_veto(equity, live_account)
+                direct_decision, failed = _internal_entry_decision(
+                    candidate, card, chart_context, entry=candidate.entry_price,
+                    stop=card.get('stop_loss_price'), fee=fee, slippage=slippage,
+                    price_step=price_rules.price_step, equity=cash_equity, free_margin=cash_free,
+                    now=time.time())
+                if failed:
+                    logging.getLogger('worker').info('VETO %s check=%s', symbol, failed)
+                    _consume_structure(coordinator, candidate, prior_watch)
+                    _note_ready_fill(
+                        self.store, symbol=symbol, options=options, entry=candidate.entry_price,
+                        fee=fee, slippage=slippage,
+                        trace=dict(id=uuid4().hex, status='completed', action='hold',
+                                   model_action='hold', completed_at=time.time(),
+                                   setup_id=card.get('setup_id'),
+                                   structure_auto_entry=True),
+                        selected_setup_id=card.get('setup_id'), veto_reason=failed,
+                        model_not_asked=True, runner_id=live_account.get('runner_id', 'runner3'))
+                    return EvaluationResult(action=GraphAction.HOLD, hold_reason=failed,
+                        metadata={'provider_called': False, 'model_not_asked': True,
+                                  'structure_auto_entry': True, 'veto': failed})
+                if direct_decision is not None:
+                    path = (card.get('evidence') or {}).get('entry_path') or card.get('entry_path')
+                    rationale = (
+                        f'{symbol} {path} hazır kurulumdan girildi. Model sorulmadı. '
+                        'Stop karttan; hedef 1.25 geçen yapı seviyesi.')
+                    direct_decision = direct_decision.model_copy(update=dict(
+                        rationale=rationale[:1200],
+                        invalidation='Kapalı CHoCH stopu bozulursa işlem biter.'))
+                    model_not_asked = True
+                    structure_auto_entry = True
         if (runner3 and not model_not_asked and price_rules is not None
                 and _structure_review(candidate, prior_watch) and _awaiting_only(options)):
             from trading.evaluation.hold_triggers import save_hold, snapshot_market
@@ -1155,6 +1215,9 @@ class ContextEvaluator:
             pending_vlm=pending)
         if model_not_asked:
             metadata['model_not_asked'] = True
+        if structure_auto_entry:
+            metadata['structure_auto_entry'] = True
+            trace['structure_auto_entry'] = True
         if decision is None:
             metadata['provider_busy']=getattr(self.llm,'last_status','')=='paid_in_flight'
             wait_statuses={'cooldown_skipped','quota_skipped','paid_in_flight','stopped','missing_key','budget_exhausted','budget_or_interval_hold'}

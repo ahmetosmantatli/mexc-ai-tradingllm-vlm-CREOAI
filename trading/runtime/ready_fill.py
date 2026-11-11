@@ -109,6 +109,8 @@ def map_ai_decision(trace, *, veto_reason=None, selected=False, model_not_asked=
     if action in ('trade', 'local_limit', 'watch', 'cancel_watch'):
         if not selected and action == 'trade':
             return 'trade', 'other_setup_selected'
+        if model_not_asked and (trace or {}).get('structure_auto_entry'):
+            return 'trade', 'structure_auto_entry'
         return action if action != 'local_limit' else 'trade', (
             'local_limit' if action == 'local_limit' else None)
     if status == 'provider_wait':
