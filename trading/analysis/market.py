@@ -118,9 +118,60 @@ def structure_features(candles, *, swing_radius=2):
                 caveat='FVGs are historical formations, not asserted unfilled zones; patterns are not calibrated trade probabilities.')
 
 
+def _pivots(candles, radius=2):
+    """Confirmed strict pivots as (confirmed_index, kind, price, pivot_index)."""
+    found=[]
+    for i in range(2*radius,len(candles)):
+        p=i-radius
+        neighbors=[candles[j] for j in range(p-radius,i+1) if j!=p]
+        if all(candles[p].high>c.high for c in neighbors):
+            found.append((i,'high',candles[p].high,p))
+        if all(candles[p].low<c.low for c in neighbors):
+            found.append((i,'low',candles[p].low,p))
+    return found
+
+
+def _alternating(pivots):
+    """Swing structure: consecutive same-side pivots collapse to the more extreme one."""
+    kept=[]
+    for _confirmed,kind,price,index in sorted(pivots,key=lambda row:(row[3],row[0])):
+        if kept and kept[-1][0]==kind:
+            if (price>kept[-1][1]) if kind=='high' else (price<kept[-1][1]):
+                kept[-1]=(kind,price,index)
+            continue
+        kept.append((kind,price,index))
+    return kept
+
+
+def _swing_level(pivots, index, bullish):
+    """Swing-structure level a close at ``index`` must clear for a swing CHoCH.
+
+    Bullish: the last two swing lows made a lower low, and the level is the
+    swing high before that lower low. Bearish mirrors it. None when the swing
+    structure does not oppose the break, so the break is internal.
+    """
+    swings=_alternating([row for row in pivots if row[0]<index])
+    same='low' if bullish else 'high'
+    sides=[n for n,row in enumerate(swings) if row[0]==same]
+    if len(sides)<2:
+        return None
+    last,prior=swings[sides[-1]],swings[sides[-2]]
+    if not ((last[1]<prior[1]) if bullish else (last[1]>prior[1])):
+        return None
+    between=[row for row in swings[sides[-2]+1:sides[-1]] if row[0]!=same]
+    return between[-1][1] if between else None
+
+
 def ict_features(candles, features):
-    """Operational ICT labels from closed candles, without trade-flow inference."""
+    """Operational ICT labels from closed candles, without trade-flow inference.
+
+    Every CHoCH/MSS carries ``structure``. It is ``swing`` when the closing
+    candle clears the opposing swing-structure level (alternating pivots,
+    LL then a close above the lower high, or the mirror), and ``internal``
+    otherwise.
+    """
     by_time={c.timestamp:i for i,c in enumerate(candles)}
+    pivots=_pivots(candles,features.get('swing_radius',2))
     previous=None
     shifts=[]
     blocks=[]
@@ -138,7 +189,11 @@ def ict_features(candles, features):
             recent={bar.timestamp for bar in candles[max(0,index-3):index]}
             swept=any(sweep['at'] in recent and sweep['direction']==('low_sweep' if bullish else 'high_sweep')
                       for sweep in features['sweeps'])
-            shifts.append(dict(br,kind='mss' if swept and displacement else 'choch'))
+            level=_swing_level(pivots,index,bullish)
+            swing=level is not None and (candle.close>level if bullish else candle.close<level)
+            shifts.append(dict(br,kind='mss' if swept and displacement else 'choch',
+                               structure='swing' if swing else 'internal',
+                               **({'swing_level':level} if level is not None else {})))
         if not displacement:
             continue
         block=next((bar for bar in reversed(candles[max(0,index-3):index])

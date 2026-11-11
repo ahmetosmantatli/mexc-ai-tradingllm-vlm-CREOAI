@@ -12,6 +12,12 @@ from .test_watch_service import signal
 from .test_structure_setups import NOW, context, htf_zone_context, view
 
 
+@pytest.fixture(autouse=True)
+def _zone_cards_ready(monkeypatch):
+    """These tests exercise the zone CHoCH/MSS entry path, which is off by default."""
+    monkeypatch.setattr('trading.quant.structure_setups.ZONE_CARDS_READY', True)
+
+
 def prepare(tmp_path,monkeypatch,*,counter=False):
     market=context();market['symbol']='BTC_USDT'
     micro=view(market,'5m')

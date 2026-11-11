@@ -226,6 +226,9 @@ HTF_ZONE_PATHS = (('4h', '15m', 'swing'), ('1h', '5m', 'intraday'))
 HTF_ZONE_VERSION = 'htf-zone-setup-v1'
 # The 5m reaction must reach within this many 1h ATRs of the weak level.
 WEAK_PROXIMITY_ATR = .5
+# A confirmed zone CHoCH/MSS card stays a watch unless this is on. In the
+# 10-day replay those cards lost about 0.9R per trade that cleared 1.25R net.
+ZONE_CARDS_READY = False
 
 
 def _confirmed_zone(block, higher, context_tf):
@@ -438,6 +441,44 @@ def _fallback_targets(higher, *, long, entry):
     return swings[:1]
 
 
+def _structural_targets(view, tf, *, long, entry):
+    """Untaken opposing swing-structure levels beyond entry, nearest first.
+
+    Swings alternate: consecutive same-side pivots keep only the extreme.
+    Two or more untaken raw pivots within a tenth of an ATR form an equal
+    high/low pool; the pool level is its outer wick.
+    """
+    field = 'high' if long else 'low'
+    other = 'low' if long else 'high'
+    raw = sorted([dict(ref, side=field) for ref in _swings({tf: view}, field)]
+                 + [dict(ref, side=other) for ref in _swings({tf: view}, other)],
+                 key=lambda ref: ref['open_time'])
+    swings = []
+    for ref in raw:
+        if swings and swings[-1]['side'] == ref['side']:
+            outer = ref['price'] > swings[-1]['price'] if ref['side'] == 'high' else ref['price'] < swings[-1]['price']
+            if outer:
+                swings[-1] = ref
+            continue
+        swings.append(ref)
+    beyond = lambda ref: ref['price'] > entry if long else ref['price'] < entry
+    untaken = [ref for ref in raw if ref['side'] == field and beyond(ref) and not _liquidity_taken(view, ref, field)]
+    found = {}
+    for ref in swings:
+        if ref['side'] == field and ref in untaken:
+            found[ref['price']] = dict({key: ref[key] for key in ('timeframe', 'open_time', 'field', 'price')}, kind='swing')
+    tolerance = .1 * _atr(view['rows'])
+    for ref in untaken:
+        cluster = [row for row in untaken if abs(row['price'] - ref['price']) <= tolerance]
+        if len(cluster) < 2:
+            continue
+        outer = max(cluster, key=lambda row: row['price']) if long else min(cluster, key=lambda row: row['price'])
+        for row in cluster:
+            found.pop(row['price'], None)
+        found[outer['price']] = dict({key: outer[key] for key in ('timeframe', 'open_time', 'field', 'price')}, kind='pool')
+    return sorted(found.values(), key=lambda ref: (abs(ref['price'] - entry), ref['open_time']))
+
+
 def _swing_points(views):
     points = []
     for tf, view in views.items():
@@ -581,7 +622,7 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
     return cards
 
 
-def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step, observed, symbol):
+def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step, observed, symbol, zone_ready):
     direction = zone['direction']
     long = direction == 'bullish'
     edge = zone['high'] if long else zone['low']
@@ -598,6 +639,7 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     shift = next((event for event in reversed(lower['features'].get('structure_shifts', []))
                   if event.get('at') == latest[0] and event.get('direction') == direction
                   and event.get('kind') in ('choch', 'mss') and _positive(event.get('level'))
+                  and event.get('structure', 'swing') == 'swing'
                   and (latest[4] > event['level'] if long else latest[4] < event['level'])), None)
     prior_touches = [row for row in touches if row[0] < latest[0]]
     ready = shift is not None and bool(prior_touches) and observed < lower['closed_at'] + seconds
@@ -633,21 +675,23 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     stop = _tick(stop_ref['price'] + (-1 if long else 1) * _atr(lower['rows']) * .1,
                  price_step, up=not long)
     macro = higher['features'].get('trend', 'unknown')
-    # With the higher timeframe, farther swings stay available. Against it, the
-    # only target is the next opposing block or flow on the trigger timeframe.
+    # With the higher timeframe, farther structural levels stay available.
+    # Against it, the only target is the nearer of the first structural level
+    # and the next opposing block or flow on the trigger timeframe.
     aligned = macro == direction and macro in ('bullish', 'bearish')
+    structural = _structural_targets(higher, zone['timeframe'], long=long, entry=entry)
     if aligned:
-        targets = _swings({zone['timeframe']: higher}, 'high' if long else 'low')
-        possible = [ref for ref in targets if (ref['price'] > entry if long else ref['price'] < entry)]
-        if not possible:
-            return None
-        ordered = sorted(possible, key=lambda ref: (ref['price'] if long else -ref['price'], ref['open_time']))
-        target_ref = min(possible, key=lambda ref: abs(ref['price'] - entry))
-    else:
-        ordered = _opposing_locations(lower, trigger_tf, long=long, entry=entry)[:1]
+        ordered = structural
         if not ordered:
-            return None
-        target_ref = ordered[0]
+            targets = _swings({zone['timeframe']: higher}, 'high' if long else 'low')
+            possible = [ref for ref in targets if (ref['price'] > entry if long else ref['price'] < entry)]
+            ordered = sorted(possible, key=lambda ref: (ref['price'] if long else -ref['price'], ref['open_time']))
+    else:
+        ordered = sorted(structural[:1] + _opposing_locations(lower, trigger_tf, long=long, entry=entry)[:1],
+                         key=lambda ref: abs(ref['price'] - entry))[:1]
+    if not ordered:
+        return None
+    target_ref = ordered[0]
     target = _tick(target_ref['price'], price_step, up=not long)
     if not (0 < stop < entry < target if long else 0 < target < entry < stop):
         return None
@@ -663,14 +707,17 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
     if ready:
         evidence.update(shift=shift, expires_at=lower['closed_at'] + seconds)
     evidence['alignment'] = 'with_higher_timeframe' if aligned else 'against_higher_timeframe'
+    if ready and not zone_ready:
+        evidence['watch_only'] = True
     family = 'countertrend_sweep_reclaim' if macro in ('bullish', 'bearish') and macro != direction else 'pullback'
-    state = 'ready' if ready else 'watch'
+    state = 'ready' if ready and zone_ready else 'watch'
     material = dict(version=HTF_ZONE_VERSION, symbol=symbol, family=family,
                     side='long' if long else 'short', horizon=horizon, evidence=evidence,
                     trigger=trigger, state=state, stop=stop, target=target)
     ident = sha256(json.dumps(material, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:24]
     reference = lambda ref: {key: ref[key] for key in ('timeframe', 'open_time', 'field')}
-    opposing_target_levels = [{key: ref[key] for key in ('timeframe', 'open_time', 'field', 'price')} for ref in ordered]
+    opposing_target_levels = [dict({key: ref[key] for key in ('timeframe', 'open_time', 'field', 'price')},
+                                   **({'kind': ref['kind']} if ref.get('kind') else {})) for ref in ordered]
     return dict(setup_id=ident, **material, macro_trend=macro, opposing_target_levels=opposing_target_levels,
                 context_timeframe=zone['timeframe'], trigger_timeframe=trigger_tf,
                 source_closed_at=lower['closed_at'], requires_full_context=False,
@@ -683,16 +730,19 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
                 caveat='Closed HTF zone and LTF evidence; not a success probability or execution approval.')
 
 
-def build_htf_zone_setups(market_context, *, current_price, price_step=0):
+def build_htf_zone_setups(market_context, *, current_price, price_step=0, zone_ready=None):
     """Use a confirmed HTF block or flow, a later closed LTF touch, then a closed CHoCH/MSS.
 
     Swing is 4h structure with a 15m trigger. Intraday is 1h structure with a
     5m trigger. Both directions use that same path. A ready long stops just
     beyond the CHoCH low. A ready short stops just beyond the CHoCH high.
-    The trigger candle must close through the CHoCH level. When the trade
-    agrees with the higher timeframe, farther higher-timeframe swings stay
-    supplied. When it does not, the only target is the next opposing block or
-    flow on the trigger timeframe.
+    The trigger candle must close through the CHoCH level, and that CHoCH must
+    be a swing (not internal) break. Targets are untaken alternating swings or
+    equal-high/low pools. When the trade agrees with the higher timeframe,
+    farther levels stay supplied. When it does not, the only target is the
+    nearer of the first such level and the next opposing block or flow on the
+    trigger timeframe. Unless ``zone_ready`` (default ``ZONE_CARDS_READY``) is
+    on, a confirmed zone card stays a watch with ``watch_only`` evidence.
     A touch or a future level can produce a watch. The LTF trigger must close
     after the touch candle, so same-candle intrabar ordering is never inferred.
     An early 1h card does not wait for a 15m or 4h CHoCH. A weak swing is
@@ -706,6 +756,8 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0):
     if (not _positive(current_price) or isinstance(price_step, bool)
             or not isinstance(price_step, (int, float)) or not isfinite(price_step) or price_step < 0):
         return []
+    if zone_ready is None:
+        zone_ready = ZONE_CARDS_READY
     views = _views(market_context)
     options = []
     for context_tf, trigger_tf, horizon in HTF_ZONE_PATHS:
@@ -723,7 +775,7 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0):
                 zones.append(zone)
         for zone in zones:
             option = _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_step,
-                                  market_context['observed_at'], market_context.get('symbol'))
+                                  market_context['observed_at'], market_context.get('symbol'), zone_ready)
             if option is not None:
                 options.append(option)
     options.extend(_early_weak_cards(
