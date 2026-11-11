@@ -7,6 +7,7 @@ transcript or a promise that old detail remains in a model's hidden memory.
 """
 import hashlib
 import json
+from math import isfinite
 
 POLICY_VERSION = 'pa-context-v4'
 POSITION_FIELDS = ('symbol','side','entry','stop','target','quantity','leverage','risk',
@@ -423,12 +424,15 @@ def _decision_setup(option, price):
     weak = _positive_price(evidence.get('weak_level'))
     if weak is not None:
         card['weak_level'] = weak
+    distance = evidence.get('weak_distance_atr')
+    if isinstance(distance, (int, float)) and not isinstance(distance, bool) and isfinite(distance) and distance >= 0:
+        card['weak_distance_atr'] = distance
     trigger = evidence.get('trigger_candle')
     if isinstance(trigger, dict):
         card['trigger_candle'] = {key: trigger.get(key) for key in ('timeframe', 'open_time', 'open', 'high', 'low', 'close')}
     block = evidence.get('candidate_block')
     if isinstance(block, dict):
-        card['candidate_block'] = {key: block.get(key) for key in ('timeframe', 'open_time', 'field', 'price') if key in block}
+        card['candidate_block'] = {key: block.get(key) for key in ('timeframe', 'open_time', 'field', 'price', 'kind') if key in block}
     if isinstance(option.get('algorithm_read'), str):
         card['read'] = option['algorithm_read']
     if option.get('swing_highs'):
