@@ -76,6 +76,23 @@ def test_stop_during_primary_prevents_new_paid_fallback(tmp_path,monkeypatch):
     assert router.last_status=='stopped'
 
 
+def test_groq_validation_warning_contains_exception_type_and_short_message(tmp_path, caplog):
+    import logging
+    reason = 'local decision validation failed ' + ('detail ' * 40)
+    assert len(reason) > 200
+    router = setup(tmp_path, lambda request: response({'action': 'hold'}), ai_claude_fallback_enabled=False)
+    router.response_validator = lambda payload: (_ for _ in ()).throw(ValueError(reason))
+    caplog.set_level(logging.WARNING)
+    assert router.complete_json(system='SECRET_PROMPT', user='SECRET_PACKET') is None
+    warnings = [record.getMessage() for record in caplog.records if record.getMessage().startswith('AI doğrulama:')]
+    assert warnings == ['AI doğrulama: ValueError: ' + reason[:200]]
+    assert 'SECRET_PROMPT' not in warnings[0]
+    assert 'SECRET_PACKET' not in warnings[0]
+    assert 'fake-groq' not in warnings[0]
+    assert 'fake-claude' not in warnings[0]
+    assert reason not in str(router.last_trace)
+
+
 def test_invalid_decision_falls_back_but_opt_out_never_spends(tmp_path,monkeypatch):
     router=setup(tmp_path,lambda request:response({'action':'invented'}),ai_claude_fallback_enabled=False)
     monkeypatch.setattr(router.claude,'complete_json',lambda **kw:pytest.fail('fallback disabled'))

@@ -287,8 +287,8 @@ def test_runner3_text_decides_first_and_valid_vision_replaces_it(tmp_path, monke
     assert [attempt['review_mode'] for attempt in trace['attempts']]==['text','vlm']
 
 
-@pytest.mark.parametrize('invalid_trigger',[False, True])
-def test_runner3_watch_uses_supplied_zone_trigger_and_invalidation(tmp_path, monkeypatch, invalid_trigger):
+@pytest.mark.parametrize('mismatched_prices',[False, True])
+def test_runner3_watch_uses_supplied_zone_trigger_and_invalidation(tmp_path, monkeypatch, mismatched_prices):
     from .test_structure_setups import htf_zone_context
 
     market = htf_zone_context('4h', '15m')
@@ -305,10 +305,10 @@ def test_runner3_watch_uses_supplied_zone_trigger_and_invalidation(tmp_path, mon
         assert option['evidence']['stage']=='awaiting_touch'
         payload=dict(action='watch',signal_id=None,setup_id=option['setup_id'],
                      rationale='Bölgeye dönüş ve teyit gerekiyor.',invalidation='Bölgenin alt sınırı.',watch_note='')
-        if invalid_trigger:
+        if mismatched_prices:
             from time import time
             payload['watch_plan']=dict(trigger_condition='price_below',trigger_price=98.,
-                invalidation_condition='below',invalidation_price=94.,expires_at=time()+3600)
+                invalidation_condition='below',invalidation_price=93.,expires_at=time()+3600)
         return payload
     evaluator=ContextEvaluator(SimpleNamespace(budget=None,complete_json=answer),store,
         SimpleNamespace(get_contract_rules=lambda _:SimpleNamespace(max_leverage=20,price_step=.01)),cfg)
@@ -317,13 +317,24 @@ def test_runner3_watch_uses_supplied_zone_trigger_and_invalidation(tmp_path, mon
     result=evaluator.evaluate_candidates([seed],equity=11.58,risk_per_trade_pct=.03,target_leverage=20,
         live_account_context=dict(mode='LIVE',currency='USDT',runner_id='runner3',current_equity=11.58,available_usdt=11.58),
         live_positions={})
-    if invalid_trigger:
-        assert result.hold_reason=='invalid_or_unavailable_model'
-        return
+    from time import time
+    from trading.evaluation.watch import WatchCoordinator
     assert result.hold_reason=='watch'
-    assert result.metadata['watch_plan']['trigger_price']==97.
-    assert result.metadata['watch_plan']['invalidation_price']==94.
-    assert store.get('analysis_trace')['htf_evidence']['evidence']['stage']=='awaiting_touch'
+    assert result.action.value=='hold'
+    assert result.proposal is None
+    plan=result.metadata['watch_plan']
+    assert plan['trigger_condition']=='price_below'
+    assert plan['trigger_price']==97.
+    assert plan['invalidation_price']==94.
+    assert plan['expires_at']>time()+20*3600
+    trace=store.get('analysis_trace')
+    assert trace['action']=='watch'
+    assert trace['execution_status']=='not_opened'
+    assert trace['htf_evidence']['evidence']['stage']=='awaiting_touch'
+    card=WatchCoordinator(store).card('BTC_USDT')
+    assert card['status']=='watching'
+    assert card['plan']['trigger_price']==97.
+    assert card['plan']['invalidation_price']==94.
 
 
 def _fresh_htf_market():

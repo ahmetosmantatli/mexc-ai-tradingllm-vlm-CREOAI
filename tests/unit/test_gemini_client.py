@@ -106,6 +106,23 @@ def test_http_error_does_not_store_provider_message(tmp_path):
     assert secret not in json.dumps(client.last_attempt)
 
 
+def test_validation_warning_contains_exception_type_and_short_message(tmp_path, caplog):
+    import logging
+    reason = 'HTF watch plan price mismatch ' + ('detail ' * 40)
+    assert len(reason) > 200
+    client = setup(tmp_path, lambda request: good_response())
+    client.response_validator = lambda payload: (_ for _ in ()).throw(ValueError(reason))
+    caplog.set_level(logging.WARNING)
+    assert client.complete_json(system='SECRET_PROMPT', user='SECRET_PACKET') is None
+    warnings = [record.getMessage() for record in caplog.records if record.getMessage().startswith('AI doğrulama:')]
+    assert warnings == ['AI doğrulama: ValueError: ' + reason[:200]]
+    assert 'SECRET_PROMPT' not in warnings[0]
+    assert 'SECRET_PACKET' not in warnings[0]
+    assert 'fake-gemini' not in warnings[0]
+    assert client.last_attempt['validation_issues'] == [dict(field='response', type='custom_validation')]
+    assert reason not in str(client.last_attempt)
+
+
 def test_safe_domain_validation_reason_is_visible_without_model_output(tmp_path):
     client=setup(tmp_path,lambda request:good_response())
     def reject(payload):raise ValueError('independent watch trade requires a fresh price plan')
