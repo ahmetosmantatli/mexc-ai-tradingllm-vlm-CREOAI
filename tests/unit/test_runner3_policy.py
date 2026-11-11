@@ -118,10 +118,11 @@ def test_a_margin_share_that_cannot_hold_the_loss_notional_does_not_use_max_leve
     leverage, margin, size=leverage_for_choch_loss(
         notional=100., entry=100., stop=98., free_margin=40., margin_target=2., equity=50.,
         max_leverage=20, maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02)
-    assert leverage==1
-    assert size==pytest.approx(2/1.0006)
+    assert leverage==10
+    assert size==pytest.approx(2/.1006)
     assert margin+size*.0006<=2+1e-8
     assert leverage!=20
+    assert size*(100-98)/100<=50*.15+1e-9
 
 
 def test_both_shares_reject_margin_under_one_usdt():
@@ -145,6 +146,34 @@ def test_choch_loss_uses_free_margin_instead_of_a_default_or_maximum_leverage():
     assert leverage == 2
     assert margin == pytest.approx(10.)
     assert leverage not in (10, 20)
+
+
+def test_equity_under_100_with_omitted_leverage_is_not_1x_and_a_stop_over_15_percent_is_rejected():
+    from trading.runtime.runner3_policy import CONTINUOUS_STOP_RISK_CAP, leverage_for_choch_loss
+
+    # At 1x this notional fits the margin cap with at least 1 USDT of margin.
+    # The same size at 10x still clears that minimum, so the order is not left at 1x.
+    common = dict(entry=100., stop=98., free_margin=40., margin_target=20., equity=50.,
+                  max_leverage=20, maintenance=.005, initial_rate=.01, fee=.0006, liquidation_buffer=.02)
+    leverage, margin, size = leverage_for_choch_loss(notional=12., **common)
+    assert leverage == 10
+    assert leverage != 1
+    assert size == pytest.approx(12.)
+    assert margin == pytest.approx(1.2)
+    assert size * .02 <= 50. * CONTINUOUS_STOP_RISK_CAP + 1e-9
+    profile, _, _ = leverage_for_choch_loss(notional=12., profile_leverage=12, **common)
+    assert profile == 12
+    present, present_margin, present_size = leverage_for_choch_loss(notional=12., preferred_leverage=4, **common)
+    assert present == 4
+    assert present_size == pytest.approx(12.)
+    assert present_size * .02 <= 50. * CONTINUOUS_STOP_RISK_CAP + 1e-9
+    assert present_margin == pytest.approx(3.)
+    omitted_one, _, _ = leverage_for_choch_loss(notional=12., preferred_leverage=1, **common)
+    assert omitted_one == 10
+    with pytest.raises(ValueError, match='equity_stop_cap'):
+        leverage_for_choch_loss(notional=10., entry=100., stop=80., free_margin=40., equity=7.73,
+                                max_leverage=20, maintenance=.005, initial_rate=.01, fee=.0006,
+                                liquidation_buffer=.02)
 
 
 def test_small_price_drift_inside_the_choch_risk_still_enters():

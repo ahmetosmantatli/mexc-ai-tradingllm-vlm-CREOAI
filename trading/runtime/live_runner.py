@@ -114,6 +114,15 @@ class LiveRunner:
             raise ValueError('invalid live leverage')
         return min(cap,requested)
 
+    def _profile_leverage(self, control):
+        """Leverage the risk profile already defines. Not the exchange maximum."""
+        cap = min(getattr(self.cfg, 'live_max_leverage', 10),
+                  self.risk.preset.max_leverage_majors, self.risk.preset.max_leverage_alts)
+        requested = control.get('max_leverage', cap)
+        if isinstance(requested, bool) or not isinstance(requested, (int, float)) or not isfinite(requested) or requested < 1:
+            return None
+        return min(cap, float(requested))
+
     def _symbol_leverage_cap(self,candidate,snapshot):
         rules=self.public.get_contract_rules(candidate.symbol)
         side=1 if candidate.side.value=='long' else 2
@@ -609,7 +618,10 @@ class LiveRunner:
                 equity=snapshot['balance']['equity'],max_leverage=min(self._leverage_cap(control,exchange_cap),exchange_cap),
                 maintenance=max(rules.maintenance,private_risk['maintenance_rate'],private_leverage['maintenance_rate']),
                 initial_rate=private_risk['initial_rate'],fee=fee,liquidation_buffer=self.cfg.liquidation_buffer_pct,
-                preferred_leverage=model_leverage if model_sizing else None, model_sizing=model_sizing)
+                preferred_leverage=model_leverage if (
+                    model_sizing or 0 < snapshot['balance']['equity'] < runner3_policy.SMALL_ACCOUNT_EQUITY_USDT
+                ) else None, model_sizing=model_sizing,
+                profile_leverage=self._profile_leverage(control))
             if sized<proposal.notional-1e-8:
                 _,proposal.notional=rules.size_order(sized,entry,leverage)
             proposal.leverage=leverage
