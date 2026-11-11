@@ -996,72 +996,76 @@ class ContextEvaluator:
             winning_prompt = text_result['prompt']
             attempts = list(text_attempts)
             raw_trace = text_result['raw']
-            vlm_account = copy.deepcopy(account)
-            vlm_account['text_model_decision'] = _decision_packet(text_decision)
-            vlm_client = self.llm.fork() if callable(getattr(self.llm, 'fork', None)) else self.llm
-            from trading.evaluation.pending_vlm import PendingVlm
-            pending = PendingVlm(self.store, fee=self.cfg.paper_fee_rate,
-                                 slippage=self.cfg.paper_slippage_bps / 10000)
-            finished = threading.Event()
+            # Default: a valid text answer is enough. A second Gemini/VLM call
+            # doubles provider load without changing the decision contract.
+            ask_vlm = text_decision is None or bool(getattr(self.cfg, 'runner3_vlm_after_valid_text', False))
+            if ask_vlm:
+                vlm_account = copy.deepcopy(account)
+                vlm_account['text_model_decision'] = _decision_packet(text_decision)
+                vlm_client = self.llm.fork() if callable(getattr(self.llm, 'fork', None)) else self.llm
+                from trading.evaluation.pending_vlm import PendingVlm
+                pending = PendingVlm(self.store, fee=self.cfg.paper_fee_rate,
+                                     slippage=self.cfg.paper_slippage_bps / 10000)
+                finished = threading.Event()
 
-            def vlm_work():
-                try:
-                    review = run_review('vlm', client=vlm_client, prompt_account=vlm_account,
-                                        base_attempts=list(text_attempts),
-                                        deadline_at=time.time() + VLM_DECISION_TIMEOUT_SECONDS,
-                                        cancel=pending.cancelled)
-                    review['symbol'] = symbol
-                    pending.complete(review)
-                except Exception:
-                    pending.complete(dict(decision=None, symbol=symbol))
-                finally:
-                    finished.set()
-                    if vlm_client is not self.llm and callable(getattr(vlm_client, 'close', None)):
-                        vlm_client.close()
+                def vlm_work():
+                    try:
+                        review = run_review('vlm', client=vlm_client, prompt_account=vlm_account,
+                                            base_attempts=list(text_attempts),
+                                            deadline_at=time.time() + VLM_DECISION_TIMEOUT_SECONDS,
+                                            cancel=pending.cancelled)
+                        review['symbol'] = symbol
+                        pending.complete(review)
+                    except Exception:
+                        pending.complete(dict(decision=None, symbol=symbol))
+                    finally:
+                        finished.set()
+                        if vlm_client is not self.llm and callable(getattr(vlm_client, 'close', None)):
+                            vlm_client.close()
 
-            # Text already decided. VLM is asked the same question and has two minutes.
-            threading.Thread(target=vlm_work, name='vlm-decision', daemon=True).start()
-            # Cap is the VLM deadline. An empty or invalid answer ends the wait immediately.
-            arrived = finished.wait(VLM_DECISION_TIMEOUT_SECONDS)
-            vlm_result = pending.take() if arrived else None
-            if vlm_result is not None:
-                provider_called = provider_called or bool(vlm_result.get('called'))
-                attempts = vlm_result.get('attempts') or attempts
-                raw_trace = vlm_result.get('raw') or raw_trace
-                decision = vlm_result['decision']
-                decision_mode = 'vlm'
-                winning_identity = vlm_result.get('identity') or winning_identity
-                winning_prompt = vlm_result.get('prompt') or winning_prompt
-            elif text_decision is not None:
-                # Silence, timeout, or unusable chart output: the text decision stands.
-                if not arrived:
-                    pending.close_deadline()
-                    if hasattr(vlm_client, 'on_trace'):
-                        vlm_client.on_trace = lambda update: None
-                    attempts = list(text_attempts) + [dict(review_mode='vlm', status='timeout', generation_requests=0)]
-                    raw_trace = text_result['raw']
+                # Text already decided or failed. VLM is asked the same question and has two minutes.
+                threading.Thread(target=vlm_work, name='vlm-decision', daemon=True).start()
+                # Cap is the VLM deadline. An empty or invalid answer ends the wait immediately.
+                arrived = finished.wait(VLM_DECISION_TIMEOUT_SECONDS)
+                vlm_result = pending.take() if arrived else None
+                if vlm_result is not None:
+                    provider_called = provider_called or bool(vlm_result.get('called'))
+                    attempts = vlm_result.get('attempts') or attempts
+                    raw_trace = vlm_result.get('raw') or raw_trace
+                    decision = vlm_result['decision']
+                    decision_mode = 'vlm'
+                    winning_identity = vlm_result.get('identity') or winning_identity
+                    winning_prompt = vlm_result.get('prompt') or winning_prompt
+                elif text_decision is not None:
+                    # Silence, timeout, or unusable chart output: the text decision stands.
+                    if not arrived:
+                        pending.close_deadline()
+                        if hasattr(vlm_client, 'on_trace'):
+                            vlm_client.on_trace = lambda update: None
+                        attempts = list(text_attempts) + [dict(review_mode='vlm', status='timeout', generation_requests=0)]
+                        raw_trace = text_result['raw']
+                    else:
+                        review = pending.box.get('value') or {}
+                        pending.close_deadline()
+                        if review.get('attempts'):
+                            attempts = review['attempts']
+                            raw_trace = review.get('raw') or raw_trace
+                            provider_called = provider_called or bool(review.get('called'))
+                    decision = text_decision
+                    decision_mode = 'text'
+                    winning_identity = text_result['identity'] or winning_identity
+                    winning_prompt = text_result['prompt'] or winning_prompt
                 else:
                     review = pending.box.get('value') or {}
                     pending.close_deadline()
+                    if not arrived and hasattr(vlm_client, 'on_trace'):
+                        vlm_client.on_trace = lambda update: None
                     if review.get('attempts'):
                         attempts = review['attempts']
                         raw_trace = review.get('raw') or raw_trace
                         provider_called = provider_called or bool(review.get('called'))
-                decision = text_decision
-                decision_mode = 'text'
-                winning_identity = text_result['identity'] or winning_identity
-                winning_prompt = text_result['prompt'] or winning_prompt
-            else:
-                review = pending.box.get('value') or {}
-                pending.close_deadline()
-                if not arrived and hasattr(vlm_client, 'on_trace'):
-                    vlm_client.on_trace = lambda update: None
-                if review.get('attempts'):
-                    attempts = review['attempts']
-                    raw_trace = review.get('raw') or raw_trace
-                    provider_called = provider_called or bool(review.get('called'))
-                decision = None
-                decision_mode = None
+                    decision = None
+                    decision_mode = None
         else:
             mode = 'vlm' if self.cfg.analysis_version == 'vlm' and paths else 'text'
             try:

@@ -82,6 +82,10 @@ def test_hold_deduplicates_closed_event_and_records_token_usage(tmp_path,monkeyp
     assert data['account']['current_equity']==500
     assert data['position']['original_thesis']==row['proposal']['rationale']
     assert runner.store.db.execute('SELECT count(*) FROM ai_usage_events').fetchone()[0]==2
+    # Live management ships the compact management_market, not padded OHLCV.
+    for view in data['market']['timeframes']:
+        assert len(view['recent_ohlcv'])<=8
+        assert view['history_bars']==len(view['recent_ohlcv'])
 
 
 @pytest.mark.parametrize('short', [False, True])

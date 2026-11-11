@@ -57,14 +57,15 @@ def ready_answer(data, **extra):
     return answer
 
 
-def evaluator(tmp_path, monkeypatch, model, market=None, version='text', prepare=None):
+def evaluator(tmp_path, monkeypatch, model, market=None, version='text', prepare=None,
+              vlm_after_valid_text=True):
     market = rebase_market() if market is None else market
     monkeypatch.setattr('trading.analysis.build_bundle', lambda *args, **kwargs:
                         SimpleNamespace(fingerprint='lane', to_context=lambda **kw: deepcopy(market)))
     monkeypatch.setattr('trading.analysis.render_bundle', lambda *args, **kwargs:
                         [SimpleNamespace(path=tmp_path / 'chart.png')])
     settings = Settings(_env_file=None, analysis_version=version, live_structure_setups_enabled=True,
-                        live_price_plan_enabled=True)
+                        live_price_plan_enabled=True, runner3_vlm_after_valid_text=vlm_after_valid_text)
     store = RuntimeStore(str(tmp_path / 'state'))
     reviewed = ContextEvaluator(model, store,
         SimpleNamespace(get_contract_rules=lambda symbol: SimpleNamespace(max_leverage=20, price_step=.01)),
@@ -258,6 +259,25 @@ def test_missing_chart_does_not_block_the_text_decision(tmp_path, monkeypatch):
     assert store.get('analysis_trace')['decision_mode'] == 'text'
 
 
+def test_valid_text_skips_vlm_when_runner3_vlm_after_valid_text_is_false(tmp_path, monkeypatch):
+    def text(packet):
+        return ready_answer(packet, rationale='Metin modeli tek çağrıda karar verdi.')
+
+    def vision(model, packet):
+        raise AssertionError('valid text must not start a second VLM call')
+
+    model = DecisionModel(text, vision)
+    run, store = evaluator(tmp_path, monkeypatch, model, vlm_after_valid_text=False)
+    result = run()
+    assert result.action.value == 'trade'
+    assert result.metadata['decision_ai']['review_mode'] == 'text'
+    assert result.metadata['rationale'].startswith('Metin modeli')
+    assert len(model.calls) == 1
+    assert model.calls[0].get('images') is None
+    assert store.get('analysis_trace')['decision_mode'] == 'text'
+    assert Settings(_env_file=None).runner3_vlm_after_valid_text is False
+
+
 def test_valid_vlm_decision_replaces_the_text_decision(tmp_path, monkeypatch):
     def text(packet):
         return dict(action='hold', signal_id=None, rationale='Metin modeli bu kurulumu bekletiyor.',
@@ -409,7 +429,7 @@ def test_local_limit_is_not_an_exchange_order_and_a_later_market_plan_can_enter(
                    live_structure_setups_enabled=True, live_price_plan_enabled=True,
                    live_allowed_accounts=('ahmet',), risk_profile='balanced', risk_per_trade_pct=.01,
                    default_target_leverage=5, kill_switch_path=str(tmp_path / 'STOP'),
-                   analysis_chart_dir=str(tmp_path / 'charts'))
+                   analysis_chart_dir=str(tmp_path / 'charts'), runner3_vlm_after_valid_text=True)
     store = RuntimeStore(str(tmp_path / 'runtime.sqlite3'))
     control = dict(runner_id='runner3', enabled=True, stopped=False, updated_at=1, version='text',
                    risk_profile='balanced', risk_per_trade_pct=.01, max_leverage=5, max_positions=2,

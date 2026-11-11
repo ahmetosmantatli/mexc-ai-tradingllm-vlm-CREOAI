@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     live_runner3_aggressive_model_sizing_enabled: bool = False
     live_runner3_continuous_aggressive_enabled: bool = False
     live_runner3_daily_net_target_usdt: float | None = Field(default=None, gt=0)
+    # After a valid Runner 3 text decision, skip the second (VLM) provider call by default.
+    runner3_vlm_after_valid_text: bool = False
     live_management_min_interval_seconds: float = Field(default=60, ge=15, le=3600)
     live_leverage_mode: str = Field(default='profile',pattern='^(profile|exchange)$')
     live_max_leverage: int = Field(default=10,ge=1,le=25)

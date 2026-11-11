@@ -3,11 +3,15 @@ import copy
 import json
 from types import SimpleNamespace
 
-from trading.evaluation.context import build_prompt, compact_market, change_summary
+from trading.agents.model_limits import estimate_input_tokens
+from trading.evaluation.context import (
+    MANAGEMENT_OHLCV_BARS, MANAGEMENT_STRUCTURE_ROWS, build_prompt, change_summary,
+    compact_market, management_market)
 from trading.evaluation.service import ContextEvaluator, ModelDecision
 from trading.quant.signals import CandidateSignal, StrategyName
 from trading.models.domain import Side
 from trading.config import Settings
+from trading.runtime.live_management import POLICY
 from trading.runtime.store import RuntimeStore
 
 
@@ -41,6 +45,36 @@ def test_compact_tables_preserve_all_current_values_and_no_rounding():
             tab=after['features'][kind]
             decoded=[dict(zip(tab['columns'],row)) for row in tab['rows']]
             assert decoded==before['features'][kind]
+
+
+def test_management_market_keeps_a_short_wick_window_and_drops_padded_history():
+    original=market()
+    for view in original['timeframes']:
+        view['recent_ohlcv']=[[i,100+i,102,98,101,10] for i in range(40)]
+        view['features']['swings']=[dict(direction='bullish',at=i,level=100+i) for i in range(20)]
+        view['features']['breaks']=[dict(direction='bullish',at=i,level=100+i) for i in range(20)]
+    padded=copy.deepcopy(original)
+    # Old padded history precedes the live wick window; only the tail is kept.
+    padded['timeframes'][0]['recent_ohlcv']=([['PADDED',i,1,2,3,4] for i in range(4000)]
+        +[[1_700_000_000+i,100.,101.,99.,100.5,1.] for i in range(MANAGEMENT_OHLCV_BARS)])
+    before=json.dumps(dict(task='manage_existing_position',market=compact_market(padded)),
+                      separators=(',',':'))
+    after_market=management_market(padded)
+    after=json.dumps(dict(task='manage_existing_position',market=after_market,
+                          position=dict(symbol='BTC_USDT',side='long'),account=dict(equity=80)),
+                     separators=(',',':'))
+    assert 'PADDED' not in after
+    for view in after_market['timeframes']:
+        assert len(view['recent_ohlcv'])==MANAGEMENT_OHLCV_BARS
+        assert view['history_bars']==MANAGEMENT_OHLCV_BARS
+        assert len(view['features']['swings']['rows'])==MANAGEMENT_STRUCTURE_ROWS
+        assert len(view['features']['breaks']['rows'])==MANAGEMENT_STRUCTURE_ROWS
+        assert view['features']['last_swing_high']['price']==123.4567890123
+        assert view['features']['trend']=='bullish'
+    assert len(after.encode())<len(before.encode())*.05
+    # Management system + compact market stays well under Groq's 8k class with completion reserve.
+    assert estimate_input_tokens(POLICY, after)+2048<=8000
+    assert estimate_input_tokens(POLICY, after)<4500
 
 
 def test_prompt_uses_setup_card_not_full_audit_and_is_materially_smaller():

@@ -797,7 +797,12 @@ class ProviderPool:
             return False
         attempt=attempts[-1]
         status=attempt.get('http_status')
-        transient=(status==429 or isinstance(status,int) and status>=500
+        # Same-cycle retry is for brief transport blips and short Retry-After windows.
+        # 5xx cooldowns stay binding so a hot 503 model is not cleared and re-hit.
+        # Dead models (404) are never same-cycle retried.
+        if attempt.get('error_category')=='model_unavailable' or status==404:
+            return False
+        transient=(status==429
             or attempt.get('error_category') in ('network_timeout','network_error'))
         if not transient:
             return False
@@ -997,13 +1002,22 @@ class ProviderPool:
             if self._nvidia_review_stopped():
                 return self._finish(None)
             attempts=self.last_trace['attempts']
-            if attempts and is_model_output_failure(attempts[-1]):
+            last=attempts[-1] if attempts else {}
+            if attempts and is_model_output_failure(last):
                 # Changing a credential cannot fix this response's output contract.
                 model=self._model(slot,images)
                 remaining=[other for other in remaining if self._model(other,images)!=model]
                 if retry is not None and self._model(retry,images)==model:
                     retry=None
                 self.last_fallback_reason='invalid_model_output'
+            elif (last.get('error_category')=='model_unavailable'
+                  or last.get('http_status')==404):
+                # Dead model id: skip every remaining slot that shares it.
+                model=self._model(slot,images)
+                remaining=[other for other in remaining if self._model(other,images)!=model]
+                if retry is not None and self._model(retry,images)==model:
+                    retry=None
+                self.last_fallback_reason='model_unavailable'
             elif retry is None and self._retryable(slot,images):
                 retry=slot
         if vision_probe:
@@ -1020,10 +1034,12 @@ class ProviderPool:
             if not self._wait(delay):
                 self.last_status='stopped'
                 return self._finish(None)
-            # Router's generic 60s network/server cooldown is a local scheduling
-            # hint; only HTTP429 Retry-After must remain binding.
+            # Only clear soft local network cooldowns for a same-cycle retry.
+            # HTTP429 Retry-After and 5xx cooldowns remain binding.
             previous=[a for a in self.last_trace['attempts'] if a.get('slot')==retry.label][-1]
-            if previous.get('http_status')!=429:
+            status=previous.get('http_status')
+            if (status!=429 and not (isinstance(status,int) and status>=500)
+                    and previous.get('error_category')!='provider_server_error'):
                 retry.router.store.put(retry.provider+':retry_at:'+self._model(retry,images),0)
             reservation=self._reserve([retry],system,user,max_tokens,images)
             if reservation:

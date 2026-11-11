@@ -266,8 +266,11 @@ def test_compact_review_stays_under_8k_and_keeps_swings_not_the_prior_paragraph(
     system='Runner 3 review. '+gate+(' Use the supplied evidence only.'*300)
     calls=[]
 
+    # Gemini is first in the pool; hold it so the 8K Groq compact path is the one measured.
     def transport(request):
         calls.append(request)
+        if 'generativelanguage' in request.url.host:
+            return httpx.Response(429, headers={'retry-after': '60'}, json={'error': {'message': 'minute'}})
         body=dict(action='hold', signal_id=None, rationale='Geçerli bekleme kararı.',
                   invalidation='Kurulum bozulursa bekleme biter.', watch_note='')
         return httpx.Response(200, json=dict(choices=[dict(message=dict(content=json.dumps(body)))],
@@ -278,11 +281,13 @@ def test_compact_review_stays_under_8k_and_keeps_swings_not_the_prior_paragraph(
     provider.response_validator=ModelDecision.model_validate
     provider.claude.complete_json=lambda **kwargs: (_ for _ in ()).throw(AssertionError('valid BEKLE must not start fallback'))
     assert provider.complete_json(system=system, user=raw)['action']=='hold'
-    assert len(calls)==1 and 'groq' in calls[0].url.host
-    sent_system=json.loads(calls[0].content)['messages'][0]['content']
-    sent_user=_text(calls[0])
+    groq=[request for request in calls if 'groq' in request.url.host]
+    assert len(groq)==1
+    sent_system=json.loads(groq[0].content)['messages'][0]['content']
+    sent_user=_text(groq[0])
     assert estimate_input_tokens(sent_system, sent_user)<8000
     assert estimate_input_tokens(sent_system, sent_user)+cfg.groq_max_completion_tokens<=8000
     sent=json.loads(sent_user)
     assert sent['swings'] and sent['atr'] and sent['prior_clause']=='Fiyat blokta durdu'
-    assert provider.last_trace['attempts'][0].get('status')=='success'
+    assert any(row.get('status')=='success' and row.get('provider')=='groq'
+               for row in provider.last_trace['attempts'])

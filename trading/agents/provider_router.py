@@ -185,6 +185,10 @@ class ProviderRouter:
             if exc.response.status_code==413 or attempt.get('error_category')=='request_token_budget':
                 # The packet does not fit this model. That is not a window hold.
                 attempt['error_category']='does-not-fit'
+            elif (exc.response.status_code==404
+                  or attempt.get('error_category')=='model_unavailable'):
+                # Dead / renamed model: skip for an hour instead of re-hitting every minute.
+                self._cooldown(model,3600)
             elif exc.response.status_code!=429:
                 self._cooldown(model,60)
         except Exception as exc:
