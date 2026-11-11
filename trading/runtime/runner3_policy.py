@@ -13,6 +13,7 @@ MARGIN_RESERVE_FRACTION = .15
 MIN_NET_TARGET_R = 1.25
 MAX_COST_SHARE = .30
 SMALL_ACCOUNT_EQUITY_USDT = 100.
+SMALL_ACCOUNT_LEVERAGE_FLOOR = 10
 MIN_OPEN_MARGIN_USDT = 1.
 GUCLU_MARGIN_FALLBACK = .35
 GUCLU_MARGIN_INSTRUCTION = (
@@ -243,18 +244,35 @@ def drift_respects_choch_risk(*, side, fresh_entry, stop, target, choch_extreme,
     return unit * quantity <= risk_budget + 1e-8
 
 
+def _aggressive_leverage_floor(profile_leverage, cap):
+    """Leverage the profile already defines, or 10x when it has no usable number.
+
+    A profile value of 1x is not usable under 100 USDT. The exchange cap still
+    bounds the result. A cap that cannot leave 1x is rejected by the caller.
+    """
+    floor_value = SMALL_ACCOUNT_LEVERAGE_FLOOR
+    if (isinstance(profile_leverage, (int, float)) and not isinstance(profile_leverage, bool)
+            and isfinite(profile_leverage) and profile_leverage >= 2
+            and float(profile_leverage) == int(profile_leverage)):
+        floor_value = int(profile_leverage)
+    return min(floor_value, cap)
+
+
 def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_leverage,
                             maintenance, initial_rate, fee, liquidation_buffer, margin_target=None,
-                            preferred_leverage=None, model_sizing=False):
-    """Lowest leverage that posts the tightest of the loss budget, margin target, and free margin.
+                            preferred_leverage=None, model_sizing=False, profile_leverage=None):
+    """Post the CHoCH loss budget inside the margin cap.
 
     ``notional`` is the CHoCH stop-loss budget. It is a ceiling, not a reason to
     move the stop. ``margin_target`` is the margin cap: Standart's 20% of equity,
     the text model's Güçlü share, or the 35% fallback. The size cannot exceed
     that cap, the loss budget, or free margin. Leverage is only raised far
-    enough to post the loss-sized notional inside that margin cap unless the
-    model's preferred leverage fits. The legacy small-account policy also
-    enforces a 1 USDT margin minimum.
+    enough to post that notional unless the model's preferred leverage fits.
+    Under 100 USDT that search must not stop at 1x: omitted leverage, or a
+    model leverage of 1x, uses the profile's leverage, or 10x when the profile
+    has no number. A model leverage above 1x stays when it fits. The stop
+    cannot lose more than 15% of equity. The legacy small-account policy still
+    rejects a margin budget under 1 USDT.
     """
     values = (notional, entry, stop, free_margin, equity, max_leverage, maintenance, initial_rate, fee, liquidation_buffer)
     if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) for value in values):
@@ -268,9 +286,13 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
         margin_cap = min(free_margin, margin_target)
     if margin_cap <= 0:
         raise ValueError('runner3_margin_reserve')
-    minimum_margin = MIN_OPEN_MARGIN_USDT if not model_sizing and 0 < equity < SMALL_ACCOUNT_EQUITY_USDT else 0.
+    small = 0 < equity < SMALL_ACCOUNT_EQUITY_USDT
+    minimum_margin = MIN_OPEN_MARGIN_USDT if not model_sizing and small else 0.
     if margin_cap < minimum_margin:
         raise ValueError('runner3_margin_below_minimum')
+    stop_fraction = abs(entry - stop) / entry
+    if notional * stop_fraction > equity * CONTINUOUS_STOP_RISK_CAP + 1e-9:
+        raise ValueError('equity_stop_cap')
     cap = floor(max_leverage)
     if cap < 1 or cap > 100000:
         raise ValueError('runner3_margin_reserve')
@@ -290,29 +312,55 @@ def leverage_for_choch_loss(*, notional, entry, stop, free_margin, equity, max_l
             return None
         if margin < minimum_margin:
             return None
+        if size * stop_fraction > equity * CONTINUOUS_STOP_RISK_CAP + 1e-9:
+            return None
         return leverage, margin, size
 
-    if isinstance(preferred_leverage, (int, float)) and 1 <= preferred_leverage <= cap and preferred_leverage == int(preferred_leverage):
-        leverage = int(preferred_leverage)
+    def search(start):
+        for leverage in range(start, cap + 1):
+            selected = fit(leverage, notional)
+            if selected is not None:
+                return selected
+        # The loss-sized notional does not fit. Keep the stop and take the margin
+        # cap at the lowest safe leverage from this floor, not the exchange maximum.
+        for leverage in range(start, cap + 1):
+            margin_rate = max(1 / leverage, initial_rate)
+            fitted = min(notional, margin_cap / (margin_rate + fee))
+            selected = fit(leverage, fitted)
+            if selected is not None:
+                return selected
+        return None
+
+    preferred = None
+    if (isinstance(preferred_leverage, (int, float)) and not isinstance(preferred_leverage, bool)
+            and 1 <= preferred_leverage <= cap and float(preferred_leverage) == int(preferred_leverage)):
+        preferred = int(preferred_leverage)
+    # Under 100 USDT a model leverage of 1x is not a choice. Above 1x it stays
+    # when it fits the margin cap, the liquidation buffer, and the 15% stop.
+    if small and preferred is not None and preferred < 2:
+        preferred = None
+    if preferred is not None:
+        leverage = preferred
         margin_rate = max(1 / leverage, initial_rate)
         fitted = min(notional, margin_cap / (margin_rate + fee))
         selected = fit(leverage, fitted)
         if selected is not None:
             return selected
 
-    for leverage in range(1, cap + 1):
-        selected = fit(leverage, notional)
-        if selected is not None:
-            return selected
-    # The loss-sized notional does not fit. Keep the stop and take the margin
-    # cap at the lowest safe leverage instead of the exchange maximum.
-    for leverage in range(1, cap + 1):
-        margin_rate = max(1 / leverage, initial_rate)
-        fitted = min(notional, margin_cap / (margin_rate + fee))
-        selected = fit(leverage, fitted)
-        if selected is not None:
-            return selected
-    if min(notional, margin_cap) <= minimum_margin:
+    selected = search(1)
+    if small and (selected is None or selected[0] < 2):
+        floor_leverage = _aggressive_leverage_floor(profile_leverage, cap)
+        if floor_leverage < 2:
+            raise ValueError('runner3_margin_reserve')
+        replaced = search(floor_leverage)
+        if replaced is None:
+            if minimum_margin and min(notional, margin_cap) <= minimum_margin:
+                raise ValueError('runner3_margin_below_minimum')
+            raise ValueError('runner3_margin_reserve')
+        return replaced
+    if selected is not None:
+        return selected
+    if minimum_margin and min(notional, margin_cap) <= minimum_margin:
         raise ValueError('runner3_margin_below_minimum')
     raise ValueError('runner3_margin_reserve')
 

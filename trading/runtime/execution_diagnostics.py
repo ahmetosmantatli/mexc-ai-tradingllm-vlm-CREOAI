@@ -18,6 +18,7 @@ CODES={
     'runner3_cost_share_too_high':'RUNNER3_COST_SHARE',
     'runner3_margin_reserve':'RUNNER3_MARGIN_RESERVE',
     'runner3_margin_below_minimum':'RUNNER3_MARGIN_BELOW_MINIMUM',
+    'equity_stop_cap':'EQUITY_STOP_CAP',
     'runner3_evidence_expired':'RUNNER3_EVIDENCE_EXPIRED',
     'runner3_stop_reference_mismatch':'RUNNER3_STOP_REFERENCE',
     'runner3_structural_stop_too_tight':'RUNNER3_STRUCTURAL_STOP',
