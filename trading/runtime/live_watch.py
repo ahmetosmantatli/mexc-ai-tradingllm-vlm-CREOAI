@@ -40,21 +40,26 @@ class LiveWatchReviewer:
         coordinator.observe(symbol,price=ticker.last_price,closed_candles=observed,expected_revision=card['revision'])
         card=coordinator.card(symbol)
         if card['status'] not in ('watching','triggered'):return None
+        armed_single=any(row.get('symbol')==symbol and row.get('status')=='armed' and row.get('single_trigger')
+            for row in r.store.get('price_action_holds', []) if isinstance(row, dict))
         # Closed opposing BOS on entry/context TFs requests review, not an automatic reversal.
-        for structural_tf in ('15m','4h'):
-            rows=self.bars(symbol,structural_tf)
-            if len(rows)<30:continue
-            candles=closed_candles(rows,TIMEFRAMES[structural_tf],now)
-            features=structure_features(candles)
-            adverse='bearish' if card['side']=='long' else 'bullish'
-            breaks=[b for b in features['breaks'] if b['direction']==adverse and b['at']+TIMEFRAMES[structural_tf]>card['created_at']]
-            if breaks:
-                latest=breaks[-1]
-                event=dict(timeframe=structural_tf,available_at=latest['at']+TIMEFRAMES[structural_tf],
-                    direction=adverse,level=latest['level'],kind='confirmed_opposing_BOS')
-                coordinator.request_structure_review(symbol,event,expected_revision=card['revision'],now=now)
-                card=coordinator.card(symbol)
+        # One stored numeric trigger is not sent back on every structure twitch.
+        if not armed_single:
+            for structural_tf in ('15m','4h'):
+                rows=self.bars(symbol,structural_tf)
+                if len(rows)<30:continue
+                candles=closed_candles(rows,TIMEFRAMES[structural_tf],now)
+                features=structure_features(candles)
+                adverse='bearish' if card['side']=='long' else 'bullish'
+                breaks=[b for b in features['breaks'] if b['direction']==adverse and b['at']+TIMEFRAMES[structural_tf]>card['created_at']]
+                if breaks:
+                    latest=breaks[-1]
+                    event=dict(timeframe=structural_tf,available_at=latest['at']+TIMEFRAMES[structural_tf],
+                        direction=adverse,level=latest['level'],kind='confirmed_opposing_BOS')
+                    coordinator.request_structure_review(symbol,event,expected_revision=card['revision'],now=now)
+                    card=coordinator.card(symbol)
         if card['status']!='triggered':return None
+        if armed_single and card.get('reason')=='structure_changed':return None
         rows=self.bars(symbol,'15m');latest=rows[-1]
         reference=card['candidate']
         event_key=watch_event_key(card)

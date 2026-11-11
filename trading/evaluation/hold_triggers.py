@@ -84,7 +84,8 @@ def log_hold(symbol, rationale, levels):
 
 
 def save_hold(store, *, symbol, rationale, levels, side=None, setup_id=None, old_market=None,
-              trigger_timeframe=None, price=None, tick=0, now=None):
+              trigger_timeframe=None, price=None, tick=0, now=None, single_trigger=False,
+              model_accepted=False):
     """Replace this symbol's hold. A hold with no numeric level is refused."""
     if not levels:
         raise ValueError('hold_without_trigger')
@@ -94,7 +95,8 @@ def save_hold(store, *, symbol, rationale, levels, side=None, setup_id=None, old
         latched = [item['price'] for item in levels if _prints(price, item['price'], tick)]
     row = dict(symbol=symbol, side=side, setup_id=setup_id, rationale=str(rationale or '')[:500],
                triggers=copy.deepcopy(levels), old_market=copy.deepcopy(old_market),
-               trigger_timeframe=trigger_timeframe, latched=latched, status='armed', created_at=now)
+               trigger_timeframe=trigger_timeframe, latched=latched, status='armed', created_at=now,
+               single_trigger=bool(single_trigger), model_accepted=bool(model_accepted))
     rows = [item for item in store.get('price_action_holds', []) if item.get('symbol') != symbol]
     rows.append(row)
     store.put('price_action_holds', rows[-80:])
@@ -148,7 +150,8 @@ def review_signal(row):
     price = float(row['printed_price'])
     long = row.get('side') != 'short'
     prior = dict(rationale=row.get('rationale'), triggers=row.get('triggers'),
-                 printed_trigger=row.get('trigger_price'), old_market=row.get('old_market'))
+                 printed_trigger=row.get('trigger_price'), old_market=row.get('old_market'),
+                 model_accepted=bool(row.get('model_accepted')))
     return CandidateSignal(
         symbol=row['symbol'], side='long' if long else 'short', strategy=StrategyName.STRUCTURE_SETUP,
         entry_price=price, stop_loss_price=price * (0.98 if long else 1.02),

@@ -206,6 +206,20 @@ class WatchCoordinator:
             self._event(state,'structure_changed',now)
             return True
 
+    def consume_structure_review(self, symbol, *, now=None):
+        """The structure event was reviewed. The same event does not queue again."""
+        now = time() if now is None else now
+        with self.store.lock, self.store.db:
+            self.store.db.execute('BEGIN IMMEDIATE')
+            state = self.card(symbol)
+            if state.get('reason') != 'structure_changed' or state.get('status') != 'triggered':
+                return False
+            state.update(status='watching', reason='structure_reviewed',
+                         revision=state.get('revision', 0) + 1, updated_at=now)
+            self._put(self._key(symbol), state)
+            self._event(state, 'structure_reviewed', now)
+            return True
+
     def terminate(self,symbol,reason='cancelled',*,now=None,expected_revision=None):
         if reason not in ('cancelled','position_opened','invalidated','expired'):
             raise ValueError('invalid terminal reason')

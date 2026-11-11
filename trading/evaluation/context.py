@@ -103,7 +103,14 @@ def runner3_model_view(account, market):
     market = copy.deepcopy(market) if isinstance(market, dict) else {}
     selection = account.get('setup_selection') if isinstance(account.get('setup_selection'), dict) else None
     options = list(selection.get('options') or []) if selection else []
-    ready = [row for row in options if closed_choch_at_block_or_flow(row)]
+
+    def _early(row):
+        evidence = row.get('evidence') if isinstance(row, dict) and isinstance(row.get('evidence'), dict) else {}
+        return row.get('state') == 'ready' and evidence.get('kind') == 'htf_zone_internal'
+
+    early = [row for row in options if _early(row)]
+    # The 1h weak-low card is the early entry. A 4h/15m CHoCH is not what this path waits for.
+    ready = early or [row for row in options if closed_choch_at_block_or_flow(row)]
     shown = ready if ready else options
     if selection is not None:
         selection['options'] = shown
@@ -155,11 +162,15 @@ def runner3_model_view(account, market):
         total += len(chosen)
         frames.append(view)
     market['timeframes'] = frames
-    market['summary'] = dict(
-        kind='closed_choch_at_block_or_flow',
+    early_shown = [row for row in shown if isinstance(row, dict) and _early(row)]
+    summary = dict(
+        kind='algorithm_read' if early_shown and not any(closed_choch_at_block_or_flow(row) for row in shown if isinstance(row, dict)) else 'closed_choch_at_block_or_flow',
         setup_ids=[row.get('setup_id') for row in shown if isinstance(row, dict)],
         candle_count=total,
         prior_hold=isinstance(account.get('prior_hold'), dict))
+    if early_shown:
+        summary['read'] = early_shown[0].get('algorithm_read')
+    market['summary'] = summary
     return account, market
 
 
@@ -183,13 +194,15 @@ def build_prompt(candidate, market, memory, positions, account, version, changes
 COMPACT_SYSTEM = (
     'Return JSON only for this MEXC USDT perpetual. HOLD is a valid decision. '
     'Decide from the compact review. You may disagree with the prior clause; it is not an instruction. '
+    'The algorithm read lists swings, the weak-low level, the trigger candle, and the candidate block. That read is not a fact you must obey. '
     'Use the lane, direction, swing points from the last candles, higher-timeframe bias, ATR, '
     'distance from price to the block or flow, funding when it is present, the closed CHoCH price, '
     'the stop swing, the next target, any farther with-trend target, and the three gates '
     '(1.25 R, 15% equity stop, free margin). '
     'The prior note is at most one short clause plus the numeric trigger. '
     'Raw candles are omitted and are not a hold reason. '
-    'A trade still needs that closed CHoCH at a block or a flow and a supplied target. Touch alone is not an entry. '
+    'A block or flow trade still needs that closed CHoCH and a supplied target. '
+    'The 1h weak swing with its 5m trigger does not need a 15m close. Touch alone is not an entry. '
     'If the decision data is missing or the call would be a guess, return hold. Do not invent a trade.'
 )
 
@@ -407,6 +420,21 @@ def _decision_setup(option, price):
             card['distance_to_block'] = abs(price - block_price)
     if bias:
         card['higher_timeframe_bias'] = bias
+    weak = _positive_price(evidence.get('weak_level'))
+    if weak is not None:
+        card['weak_level'] = weak
+    trigger = evidence.get('trigger_candle')
+    if isinstance(trigger, dict):
+        card['trigger_candle'] = {key: trigger.get(key) for key in ('timeframe', 'open_time', 'open', 'high', 'low', 'close')}
+    block = evidence.get('candidate_block')
+    if isinstance(block, dict):
+        card['candidate_block'] = {key: block.get(key) for key in ('timeframe', 'open_time', 'field', 'price') if key in block}
+    if isinstance(option.get('algorithm_read'), str):
+        card['read'] = option['algorithm_read']
+    if option.get('swing_highs'):
+        card['highs'] = option['swing_highs']
+    if option.get('swing_lows'):
+        card['lows'] = option['swing_lows']
     if prices:
         card['next_target'] = prices[0]
         if evidence.get('alignment') != 'against_higher_timeframe' and len(prices) > 1:
