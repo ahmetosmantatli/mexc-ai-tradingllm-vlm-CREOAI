@@ -387,11 +387,34 @@ def _opposing_locations(view, tf, *, long, entry):
 
 
 def _liquidity_taken(view, swing, field):
-    """A sweep or a later close through the swing takes its liquidity."""
+    """A sweep, a swept equal-H/L pool member, or a later close takes liquidity.
+
+    Pool sweeps from ``market.structure_features`` carry every member. A double
+    bottom/top is taken when the pool outer wick is swept, not only when the
+    latest swing alone is.
+    """
     price = swing['price']
+    pivot_at = swing.get('open_time')
     want = 'low_sweep' if field == 'low' else 'high_sweep'
+    pool_kind = 'eql' if field == 'low' else 'eqh'
+
+    def _member_hit(members):
+        for member in members or []:
+            if not isinstance(member, dict):
+                continue
+            if member.get('price') == price or (pivot_at is not None and member.get('pivot_at') == pivot_at):
+                return True
+        return False
+
     for event in view['features'].get('sweeps') or []:
-        if isinstance(event, dict) and event.get('direction') == want and event.get('level') == price:
+        if not isinstance(event, dict) or event.get('direction') != want:
+            continue
+        if event.get('level') == price or _member_hit(event.get('members')):
+            return True
+    for pool in view['features'].get('liquidity_pools') or []:
+        if not isinstance(pool, dict) or pool.get('kind') != pool_kind or not pool.get('swept_at'):
+            continue
+        if _member_hit(pool.get('members')):
             return True
     for row in view['rows']:
         if row[0] <= swing['open_time']:

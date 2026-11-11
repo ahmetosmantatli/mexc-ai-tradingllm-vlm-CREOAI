@@ -1,10 +1,14 @@
 """Versioned PA definitions, not a claim that discretionary ICT predicts returns.
 
-Confirmed swing: strict extremum over two candles on both sides; available only
-on close of right-hand confirmation candle. BOS: first close crossing the most
-recent previously-confirmed swing. Sweep: wick crosses prior confirmed swing and
-same candle closes back inside it. FVG: three-candle nonoverlap high/low gap.
-All features are retrospective evidence computed exclusively from closed candles.
+Confirmed swing: extremum over two candles on both sides; available only on
+close of the right-hand confirmation candle. Equal highs/lows count: the
+leftmost bar of a plateau wins the tie (strict vs left neighbors, inclusive vs
+right). BOS: first close crossing the most recent previously-confirmed swing.
+Sweep: wick crosses a prior confirmed swing or an equal-high/low pool outer
+wick and the same candle closes back inside. Equal-H/L pools cluster consecutive
+same-side swings within a tenth of ATR; a pool sweep takes every member.
+FVG: three-candle nonoverlap high/low gap. All features are retrospective
+evidence computed exclusively from closed candles.
 """
 from dataclasses import asdict, dataclass
 from hashlib import sha256
@@ -18,7 +22,8 @@ import httpx
 
 TIMEFRAMES = {'4h': ('Hour4', 14400), '15m': ('Min15', 900), '5m': ('Min5', 300)}
 HOURLY_TIMEFRAME = ('Min60', 3600)
-FEATURE_VERSION = 'pa-closed-v1'
+FEATURE_VERSION = 'pa-closed-v2'
+POOL_ATR_FRACTION = .1
 
 
 @dataclass(frozen=True)
@@ -70,12 +75,74 @@ def closed_candles(rows, interval_seconds, now=None, *, min_count=30):
     return tuple(candles)
 
 
+def _true_range_atr(candles):
+    """Average true range over the closed series (one bar needs a prior close)."""
+    if len(candles) < 2:
+        return 0.
+    total = 0.
+    for index in range(1, len(candles)):
+        bar, prior = candles[index], candles[index - 1]
+        total += max(bar.high - bar.low, abs(bar.high - prior.close), abs(bar.low - prior.close))
+    return total / (len(candles) - 1)
+
+
+def _is_swing_high(pivot, left, right):
+    """Leftmost plateau wins: strict vs left neighbors, inclusive vs right."""
+    return all(pivot.high > bar.high for bar in left) and all(pivot.high >= bar.high for bar in right)
+
+
+def _is_swing_low(pivot, left, right):
+    """Leftmost plateau wins: strict vs left neighbors, inclusive vs right."""
+    return all(pivot.low < bar.low for bar in left) and all(pivot.low <= bar.low for bar in right)
+
+
+def _swing_neighbors(candles, pivot_index, radius, confirm_index):
+    left = [candles[j] for j in range(pivot_index - radius, pivot_index)]
+    right = [candles[j] for j in range(pivot_index + 1, confirm_index + 1)]
+    return left, right
+
+
+def _member(swing):
+    return dict(price=swing['price'], pivot_at=swing['pivot_at'], confirmed_at=swing['confirmed_at'])
+
+
+def _update_liquidity_pools(pools, swing, *, atr):
+    """Attach ``swing`` to the open same-side pool when within a tenth of ATR.
+
+    Consecutive same-side swings form one pool. The level is the outer wick.
+    A pool confirms when its second member confirms. One-member seeds stay
+    internal until a second equal swing arrives.
+    """
+    if atr <= 0:
+        return
+    side = 'eqh' if swing['kind'] == 'high' else 'eql'
+    tolerance = POOL_ATR_FRACTION * atr
+    open_pool = next((pool for pool in reversed(pools)
+                      if pool['kind'] == side and pool.get('swept_at') is None), None)
+    if open_pool is not None and abs(open_pool['members'][-1]['price'] - swing['price']) <= tolerance:
+        if any(row['pivot_at'] == swing['pivot_at'] for row in open_pool['members']):
+            return
+        open_pool['members'].append(_member(swing))
+        prices = [row['price'] for row in open_pool['members']]
+        open_pool['level'] = max(prices) if side == 'eqh' else min(prices)
+        if len(open_pool['members']) >= 2 and open_pool.get('confirmed_at') is None:
+            open_pool['confirmed_at'] = swing['confirmed_at']
+        return
+    pools.append(dict(kind=side, level=swing['price'], members=[_member(swing)],
+                      confirmed_at=None, swept_at=None))
+
+
+def _finalize_liquidity_pools(pools):
+    """Drop one-member seeds; keep confirmed equal-H/L pools only."""
+    return [dict(pool) for pool in pools if len(pool.get('members') or []) >= 2 and pool.get('confirmed_at')]
+
+
 def structure_features(candles, *, swing_radius=2):
     """Return timestamped, explicitly confirmed structure. No hidden future bars."""
     if swing_radius < 1:
         raise ValueError('swing radius must be positive')
     interval = candles[1].timestamp-candles[0].timestamp if len(candles)>1 else 0
-    swings, breaks, sweeps, gaps = [], [], [], []
+    swings, breaks, sweeps, gaps, pools = [], [], [], [], []
     last_high = last_low = None
     broken_high = broken_low = None
     for i, candle in enumerate(candles):
@@ -95,6 +162,29 @@ def structure_features(candles, *, swing_radius=2):
                 broken_low = last_low['pivot_at']
             elif candle.low < level and candle.close >= level:
                 sweeps.append(dict(direction='low_sweep', at=candle.timestamp, level=level))
+        for pool in pools:
+            if pool.get('confirmed_at') is None or pool.get('swept_at') is not None:
+                continue
+            # confirmed_at is the close time of the bar that confirmed the
+            # second member; this bar may sweep it on later closes only.
+            if pool['confirmed_at'] > candle.timestamp:
+                continue
+            level = pool['level']
+            took = ((pool['kind'] == 'eqh' and candle.high > level and candle.close <= level)
+                    or (pool['kind'] == 'eql' and candle.low < level and candle.close >= level))
+            if not took:
+                continue
+            pool['swept_at'] = candle.timestamp
+            direction = 'high_sweep' if pool['kind'] == 'eqh' else 'low_sweep'
+            members = [dict(row) for row in pool['members']]
+            existing = next((event for event in reversed(sweeps)
+                             if event['at'] == candle.timestamp and event['direction'] == direction
+                             and event['level'] == level), None)
+            if existing is not None:
+                existing.update(pool=True, kind=pool['kind'], members=members)
+            else:
+                sweeps.append(dict(direction=direction, at=candle.timestamp, level=level,
+                                   pool=True, kind=pool['kind'], members=members))
         if i >= 2:
             before = candles[i-2]
             if candle.low > before.high:
@@ -104,29 +194,37 @@ def structure_features(candles, *, swing_radius=2):
         pivot_index = i-swing_radius
         if pivot_index >= swing_radius:
             pivot = candles[pivot_index]
-            neighbors = [candles[j] for j in range(pivot_index-swing_radius, i+1) if j != pivot_index]
-            if all(pivot.high > c.high for c in neighbors):
+            left, right = _swing_neighbors(candles, pivot_index, swing_radius, i)
+            # ATR only from bars closed so far — no look-ahead into later candles.
+            atr = _true_range_atr(candles[:i + 1])
+            if _is_swing_high(pivot, left, right):
                 last_high = dict(kind='high', price=pivot.high, pivot_at=pivot.timestamp, confirmed_at=candle.timestamp+interval)
                 swings.append(last_high)
-            if all(pivot.low < c.low for c in neighbors):
+                _update_liquidity_pools(pools, last_high, atr=atr)
+            if _is_swing_low(pivot, left, right):
                 last_low = dict(kind='low', price=pivot.low, pivot_at=pivot.timestamp, confirmed_at=candle.timestamp+interval)
                 swings.append(last_low)
+                _update_liquidity_pools(pools, last_low, atr=atr)
     return dict(definition_version=FEATURE_VERSION, swing_radius=swing_radius,
                 last_swing_high=last_high, last_swing_low=last_low,
                 swings=swings[-12:], breaks=breaks[-12:], sweeps=sweeps[-12:], fvgs=gaps[-12:],
+                liquidity_pools=_finalize_liquidity_pools(pools)[-8:],
                 trend='bullish' if breaks and breaks[-1]['direction']=='bullish' else 'bearish' if breaks else 'undetermined',
                 caveat='FVGs are historical formations, not asserted unfilled zones; patterns are not calibrated trade probabilities.')
 
 
 def _pivots(candles, radius=2):
-    """Confirmed strict pivots as (confirmed_index, kind, price, pivot_index)."""
+    """Confirmed pivots as (confirmed_index, kind, price, pivot_index).
+
+    Equal highs/lows use the same leftmost-plateau tie rule as structure_features.
+    """
     found=[]
     for i in range(2*radius,len(candles)):
         p=i-radius
-        neighbors=[candles[j] for j in range(p-radius,i+1) if j!=p]
-        if all(candles[p].high>c.high for c in neighbors):
+        left, right = _swing_neighbors(candles, p, radius, i)
+        if _is_swing_high(candles[p], left, right):
             found.append((i,'high',candles[p].high,p))
-        if all(candles[p].low<c.low for c in neighbors):
+        if _is_swing_low(candles[p], left, right):
             found.append((i,'low',candles[p].low,p))
     return found
 
