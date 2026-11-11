@@ -665,12 +665,13 @@ class LiveRunner:
 
     def _apply(self,candidate,result,control):
         trace_id=result.metadata.get('analysis_trace_id')
-        def finish(reason, *, notify=True):
+        def finish(reason, *, notify=True, intent_id=None):
+            details = None if intent_id is None else dict(intent_id=intent_id)
             if trace_id and result.action.value == 'trade':
                 if reason == 'LIVE_PROTECTED':
-                    finalize_trace(self.store, trace_id, 'opened', reason)
+                    finalize_trace(self.store, trace_id, 'opened', reason, details)
                 else:
-                    self._record_entry_rejection(candidate, trace_id, reason, notify=notify)
+                    self._record_entry_rejection(candidate, trace_id, reason, details, notify=notify)
             return self.status(reason)
         if result.action.value!='trade':
             return finish('HOLD_LIVE_MODEL')
@@ -761,13 +762,24 @@ class LiveRunner:
                 self.store.put('live_seen',(self.store.get('live_seen',[])+[candidate.features['dedup_key']])[-2000:])
                 coordinator.terminate(candidate.symbol,'position_opened',expected_revision=card['revision'])
             try:
+                from trading.runtime.ready_fill import mark_outcome
+                mark_outcome(self.store, state)
+            except (TypeError, ValueError, sqlite3.Error):
+                pass
+            try:
                 self._refresh()
             except sqlite3.Error:
                 raise
             except Exception:
                 pass # Protection is confirmed; failed balance refresh stays explicitly unready.
-            return finish('LIVE_PROTECTED')
-        return finish('HOLD_LIVE_'+str(state.get('status','UNKNOWN')).upper(), notify=False)
+            return finish('LIVE_PROTECTED', intent_id=intent.get('intent_id'))
+        try:
+            from trading.runtime.ready_fill import mark_outcome
+            mark_outcome(self.store, state)
+        except (TypeError, ValueError, sqlite3.Error):
+            pass
+        return finish('HOLD_LIVE_'+str(state.get('status','UNKNOWN')).upper(), notify=False,
+                      intent_id=intent.get('intent_id'))
 
     def _capacity_probe(self, images, prompt_bytes, ceiling):
         probe=getattr(self.llm,'probe_free_capacity',None)
@@ -1013,6 +1025,14 @@ class LiveRunner:
                         symbol=intent.get('proposal',{}).get('symbol'),at=time.time(),sent=False,
                         proposal=copy.deepcopy(intent.get('proposal',{})),net_pnl=intent.get('net_pnl'),
                         close_reason=intent.get('close_reason'),is_simulated=False))
+                    try:
+                        from trading.runtime.ready_fill import mark_outcome
+                        mark_outcome(self.store, intent)
+                    except (TypeError, ValueError, sqlite3.Error):
+                        pass
+            summary = self.store.get('ready_fill_summary')
+            if isinstance(summary, dict) and summary.get('cards'):
+                snapshot['ready_fill_summary'] = summary
             self.store.put('live_events',events[-200:])
             self.store.put('status',snapshot)
         return snapshot

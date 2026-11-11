@@ -178,7 +178,31 @@ def finalize_trace(store, trace_id, status, reason, details=None):
                 row.update(trace)
         store.put('analysis_history',history)
         _publish_latest(store,trace)
-        return True
+    fill = {'opened': 'filled', 'rejected': 'rejected', 'not_opened': 'none'}[status]
+    intent_id = None if not isinstance(details, dict) else details.get('intent_id')
+    try:
+        from trading.runtime.ready_fill import mark_execution
+        mark_execution(
+            store, trace_id=trace_id, fill_status=fill, execution_reason=reason,
+            intent_id=intent_id, order_sent=status in ('opened', 'rejected'),
+            setup_id=trace.get('setup_id'))
+    except (TypeError, ValueError, sqlite3.Error):
+        pass
+    return True
+
+
+def _note_ready_fill(store, *, symbol, options, entry, fee, slippage, trace,
+                     selected_setup_id=None, veto_reason=None, model_not_asked=False,
+                     runner_id='runner3'):
+    """Best-effort READY→fill journal; never blocks the live path."""
+    try:
+        from trading.runtime.ready_fill import record_ready_review
+        return record_ready_review(
+            store, symbol=symbol, options=options, entry=entry, fee=fee, slippage=slippage,
+            trace=trace, selected_setup_id=selected_setup_id, veto_reason=veto_reason,
+            model_not_asked=model_not_asked, runner_id=runner_id)
+    except (TypeError, ValueError, sqlite3.Error, KeyError):
+        return []
 
 
 def _ground_card_plan(setup, candidate, chart_context, *, entry, fee, slippage, price_step, now, allow_blocked=False):
@@ -608,6 +632,13 @@ class ContextEvaluator:
                 if failed:
                     logging.getLogger('worker').info('VETO %s check=%s', symbol, failed)
                     _consume_structure(coordinator, candidate, prior_watch)
+                    _note_ready_fill(
+                        self.store, symbol=symbol, options=options, entry=candidate.entry_price,
+                        fee=fee, slippage=slippage,
+                        trace=dict(id=uuid4().hex, status='completed', action='hold', model_action='hold',
+                                   completed_at=time.time(), setup_id=(card or {}).get('setup_id')),
+                        selected_setup_id=(card or {}).get('setup_id'), veto_reason=failed,
+                        model_not_asked=True, runner_id=live_account.get('runner_id', 'runner3'))
                     return EvaluationResult(action=GraphAction.HOLD, hold_reason=failed,
                         metadata={'provider_called': False, 'model_not_asked': True, 'veto': failed})
                 if direct_decision is None:
@@ -638,6 +669,13 @@ class ContextEvaluator:
                     now=time.time())
                 if failed:
                     logging.getLogger('worker').info('VETO %s check=%s', symbol, failed)
+                    _note_ready_fill(
+                        self.store, symbol=symbol, options=options, entry=candidate.entry_price,
+                        fee=fee, slippage=slippage,
+                        trace=dict(id=uuid4().hex, status='completed', action='hold', model_action='hold',
+                                   completed_at=time.time(), setup_id=match.get('setup_id')),
+                        selected_setup_id=match.get('setup_id'), veto_reason=failed,
+                        model_not_asked=True, runner_id=live_account.get('runner_id', 'runner3'))
                     return EvaluationResult(action=GraphAction.HOLD, hold_reason=failed,
                         metadata={'provider_called': False, 'model_not_asked': True, 'veto': failed})
                 if direct_decision is not None:
@@ -1110,6 +1148,11 @@ class ContextEvaluator:
             if live_account is not None and provider_called:
                 from trading.runtime.edge_research import record_review
                 record_review(self.store,trace,candidate,None,self.cfg)
+                if runner3:
+                    _note_ready_fill(
+                        self.store, symbol=symbol, options=options, entry=candidate.entry_price,
+                        fee=fee, slippage=slippage, trace=trace,
+                        runner_id=live_account.get('runner_id', 'runner3'))
             if not waiting_only:
                 logging.getLogger('worker').info('UNPARSED %s review failed', symbol)
                 if runner3:
@@ -1158,6 +1201,13 @@ class ContextEvaluator:
             if live_account is not None:
                 from trading.runtime.edge_research import record_review
                 record_review(self.store,trace,source_candidate,shadow_plan,self.cfg)
+                if runner3:
+                    _note_ready_fill(
+                        self.store, symbol=symbol, options=options, entry=candidate.entry_price,
+                        fee=fee, slippage=slippage, trace=trace,
+                        selected_setup_id=decision.setup_id,
+                        model_not_asked=model_not_asked,
+                        runner_id=live_account.get('runner_id', 'runner3'))
             if provider_called:
                 memory['last_failure']=dict(evaluation_key=evaluation_key,retry_at=time.time()+60)
                 self.store.put(key,memory)
@@ -1250,6 +1300,13 @@ class ContextEvaluator:
         if live_account is not None:
             from trading.runtime.edge_research import record_review
             record_review(self.store,trace,source_candidate,planned_candidate,self.cfg)
+            if runner3:
+                _note_ready_fill(
+                    self.store, symbol=symbol, options=options, entry=candidate.entry_price,
+                    fee=fee, slippage=slippage, trace=trace,
+                    selected_setup_id=decision.setup_id,
+                    model_not_asked=model_not_asked or ready_setup_after_hold,
+                    runner_id=live_account.get('runner_id', 'runner3'))
         decision_ai=dict(winning_identity)
         if runner3:
             decision_ai['review_mode']=decision_mode
@@ -1327,6 +1384,13 @@ class ContextEvaluator:
         if entry_block:
             metadata['veto']=entry_block
             logging.getLogger('worker').info('VETO %s check=%s', symbol, entry_block)
+            if runner3 and live_account is not None:
+                _note_ready_fill(
+                    self.store, symbol=symbol, options=options, entry=candidate.entry_price,
+                    fee=fee, slippage=slippage, trace=trace,
+                    selected_setup_id=decision.setup_id, veto_reason=entry_block,
+                    model_not_asked=model_not_asked or ready_setup_after_hold,
+                    runner_id=live_account.get('runner_id', 'runner3'))
             if candidate.features.get('hold_review'):
                 from trading.evaluation.hold_triggers import save_hold, snapshot_market, trigger_levels
                 setup=selection if isinstance(selection, dict) else None

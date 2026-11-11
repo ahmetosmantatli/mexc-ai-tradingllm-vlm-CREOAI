@@ -142,17 +142,23 @@ def review_summary(rows):
 
 
 def export(root, output, since=0):
-    rows=[r for r in read_traces(Path(root)) if r.get('started_at',0)>=since]
+    from trading.runtime.ready_fill import read_events, summarize as summarize_ready_fill, summary_line
+    root_path=Path(root)
+    rows=[r for r in read_traces(root_path) if r.get('started_at',0)>=since]
     groups=summarize(rows)
+    ready_rows=[r for r in read_events(root_path) if (r.get('at') or 0)>=since]
+    ready_summary=summarize_ready_fill(ready_rows)
     output=Path(output)
     output.mkdir(parents=True,exist_ok=True,mode=0o700)
     report=dict(generated_at=datetime.now(timezone.utc).isoformat(),evaluations=len(rows),groups=groups,review_summary=review_summary(rows),
         runner_efficiency=summarize_efficiency(rows),
-        limitations='Observed records only; older history may be incomplete. Unknown usage is not zero. Groq billing is not inferred. Token cost estimates are not invoices. No future spend forecast.',
+        ready_fill_summary=ready_summary,
+        ready_fill_events=ready_rows,
+        limitations='Observed records only; older history may be incomplete. Unknown usage is not zero. Groq billing is not inferred. Token cost estimates are not invoices. No future spend forecast. READY→fill rows are live journal evidence, not a profitability claim.',
         traces=rows)
     # These fixed files are regenerated on demand; server directory must stay private.
     files=[]
-    for name in ('ai-usage.json','ai-requests.csv','ai-usage-summary.txt'):
+    for name in ('ai-usage.json','ai-requests.csv','ai-usage-summary.txt','ready-fill.json','ready-fill-summary.txt'):
         path=output/name
         descriptor=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
         os.fchmod(descriptor,0o600)
@@ -178,6 +184,22 @@ def export(root, output, since=0):
             text.write(key+': '+json.dumps(details[key],ensure_ascii=False)+'\n')
         text.write('En sik incelenen 20 parite/kurulum (ayni piyasa verisi tekrari tek basina gereksiz istek kaniti degildir):\n')
         for row in details['review_counts'][:20]:text.write(json.dumps(row,ensure_ascii=False)+'\n')
+        line=summary_line(ready_summary)
+        if line:
+            text.write(line+'\n')
+        json.dump(dict(generated_at=report['generated_at'],summary=ready_summary,events=ready_rows,
+                       limitations=ready_summary.get('note')),files[3][1],ensure_ascii=False,indent=2)
+        ready_text=files[4][1]
+        ready_text.write((line or 'READY→fill: kayit yok')+'\n')
+        ready_text.write('Canli READY karti -> dolum olcumu. Kar/zarar kaniti degildir.\n')
+        ready_text.write(json.dumps(ready_summary,ensure_ascii=False)+'\n')
+        for row in ready_rows:
+            ready_text.write(json.dumps({
+                key: row.get(key) for key in (
+                    'account','symbol','setup_id','card_kind','entry','stop','target','net_r_at_gate',
+                    'ai_decision','decision_detail','veto_reason','order_sent','fill_status',
+                    'execution_reason','outcome','realized_r','close_reason','trace_id','intent_id')
+            },ensure_ascii=False)+'\n')
     finally:
         for _,handle in files:handle.close()
     return report
@@ -197,6 +219,10 @@ def main():
     report=export(Path(cfg.runtime_db_path).parent,args.output_dir,since)
     print(f"{report['evaluations']} kayıtlı analiz; raporlar: {args.output_dir}")
     print('ai-usage-summary.txt | ai-requests.csv | ai-usage.json')
+    print('ready-fill-summary.txt | ready-fill.json')
+    ready=report.get('ready_fill_summary') or {}
+    if ready.get('cards'):
+        print(f"READY→fill kart: {ready['cards']} | dolum: {ready.get('filled',0)} | ret: {ready.get('rejected_fills',0)}")
 
 
 if __name__=='__main__':
