@@ -438,7 +438,7 @@ def test_flow_confirms_the_same_way_as_a_block(context_tf, trigger_tf, horizon):
     higher = view(ctx, context_tf)
     higher['features']['order_block_candidates'] = []
     origin = higher['recent_ohlcv'][-5]
-    higher['features']['fvgs'] = [dict(direction='bullish', at=origin[0], lower=94., upper=97.)]
+    higher['features']['fvgs'] = [dict(direction='bullish', at=origin[0], lower=93., upper=97.)]
     setup = next(row for row in build_htf_zone_setups(ctx, current_price=101., price_step=.01)
                  if row['context_timeframe'] == context_tf and row['state'] == 'ready')
     assert setup['evidence']['zone']['kind'] == 'flow'
@@ -446,6 +446,44 @@ def test_flow_confirms_the_same_way_as_a_block(context_tf, trigger_tf, horizon):
     assert setup['side'] == 'long'
     assert setup['stop_reference']['timeframe'] == trigger_tf
     assert setup['stop_reference']['field'] == 'low'
+
+
+@pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
+def test_a_filled_flow_is_not_a_zone(context_tf, trigger_tf):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context(context_tf, trigger_tf)
+    higher = view(ctx, context_tf)
+    higher['features']['order_block_candidates'] = []
+    origin = higher['recent_ohlcv'][-5]
+    higher['features']['fvgs'] = [dict(direction='bullish', at=origin[0], lower=93., upper=97.)]
+    higher['recent_ohlcv'][-3][3] = 92.5
+    assert not [row for row in build_htf_zone_setups(ctx, current_price=101., price_step=.01)
+                if row['context_timeframe'] == context_tf and row['evidence'].get('zone', {}).get('kind') == 'flow']
+
+
+def test_flow_fill_reads_only_later_wicks_through_the_far_edge():
+    from trading.quant.structure_setups import _flow_filled
+
+    rows = [[0, 10., 11., 9., 10., 1.], [1, 10., 12., 10., 11., 1.], [2, 11., 13., 10.5, 12., 1.]]
+    view_ = dict(rows=rows)
+    assert not _flow_filled(dict(direction='bullish', at=1, lower=10.4, upper=11.), view_)
+    assert _flow_filled(dict(direction='bullish', at=1, lower=10.5, upper=11.), view_)
+    assert not _flow_filled(dict(direction='bullish', at=2, lower=10.5, upper=11.), view_)
+    assert not _flow_filled(dict(direction='bearish', at=1, lower=12., upper=13.5), view_)
+    assert _flow_filled(dict(direction='bearish', at=1, lower=12., upper=13.), view_)
+    assert not _flow_filled(dict(direction='bearish', at=0, lower=12., upper=13.), dict(rows=rows[:2]))
+
+
+def test_a_filled_flow_is_not_a_target():
+    from trading.quant.structure_setups import _opposing_locations
+
+    rows = [[0, 10., 11., 9., 10., 1.], [1, 10., 15., 10., 11., 1.], [2, 11., 12., 10.5, 11.5, 1.]]
+    gap = dict(direction='bearish', at=1, lower=13., upper=15.)
+    open_gap = dict(rows=rows, features=dict(fvgs=[gap]))
+    assert [ref['price'] for ref in _opposing_locations(open_gap, '1h', long=True, entry=11.5)] == [15.]
+    filled = dict(rows=rows + [[3, 11.5, 15.2, 11., 12., 1.]], features=dict(fvgs=[gap]))
+    assert _opposing_locations(filled, '1h', long=True, entry=11.5) == []
 
 
 def test_htf_zone_rejects_open_confirmation_and_distal_close_invalidation():

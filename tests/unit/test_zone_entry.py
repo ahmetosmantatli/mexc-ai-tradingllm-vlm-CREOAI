@@ -46,7 +46,7 @@ def _bullish_block(view_row, *, low, high):
         direction='bullish', open_time=bar[0], low=low, high=high, status='untested'))
 
 
-def weak_long_market(*, target_high=120., target_low=112., farther=None):
+def weak_long_market(*, target_high=120., target_low=112., farther=None, block=True):
     """1h weak low, bullish candle there, 5m CHoCH. No sweep and no 15m CHoCH."""
     ctx = htf_zone_context('1h', '5m')
     higher = view(ctx, '1h')
@@ -58,7 +58,8 @@ def weak_long_market(*, target_high=120., target_low=112., farther=None):
     higher['features']['sweeps'] = []
     higher['features']['structure_shifts'] = []
     higher['features']['breaks'] = []
-    _bearish_block(higher, low=target_low, high=target_high)
+    if block:
+        _bearish_block(higher, low=target_low, high=target_high)
     if farther is not None:
         book = view(ctx, '4h')
         _bearish_block(book, low=farther - 8, high=farther)
@@ -66,14 +67,15 @@ def weak_long_market(*, target_high=120., target_low=112., farther=None):
         frame = view(ctx, name)
         frame['features']['structure_shifts'] = []
         frame['features']['sweeps'] = []
+    # The 5m reaction reaches near the 1h weak low at 90 (within half a 1h ATR).
     lower = view(ctx, '5m')
     low_swing = lower['features']['last_swing_low']
     origin = next(row for row in lower['recent_ohlcv'] if row[0] == low_swing['pivot_at'])
-    origin[3] = 94.
-    low_swing['price'] = 94.
+    origin[3] = 92.
+    low_swing['price'] = 92.
     for row in lower['features']['swings']:
         if row.get('kind') == 'low':
-            row['price'] = 94.
+            row['price'] = 92.
     return ctx
 
 
@@ -132,7 +134,8 @@ def test_an_older_5m_choch_is_still_the_trigger_without_a_15m_close():
     assert _internal(market) == []
 
 
-def test_weak_high_is_the_short_with_the_5m_trigger():
+def weak_short_market(*, reaction=108.):
+    """1h weak high at 110, bearish candle there, 5m bearish CHoCH after a 5m high at ``reaction``."""
     market = weak_long_market()
     higher = view(market, '1h')
     swing = next(row for row in higher['features']['swings'] if row['kind'] == 'high')
@@ -147,17 +150,26 @@ def test_weak_high_is_the_short_with_the_5m_trigger():
     lower['features']['structure_shifts'] = [dict(at=latest[0], direction='bearish', level=99., kind='choch')]
     high_swing = lower['features']['last_swing_high']
     origin = next(row for row in lower['recent_ohlcv'] if row[0] == high_swing['pivot_at'])
-    origin[2] = 103.
-    high_swing['price'] = 103.
+    origin[2] = reaction
+    high_swing['price'] = reaction
     for row in lower['features']['swings']:
         if row.get('kind') == 'high':
-            row['price'] = 103.
+            row['price'] = reaction
     _bullish_block(higher, low=80., high=86.)
-    card, = [row for row in _internal(market, 99.) if row['side'] == 'short']
+    return market
+
+
+def _shorts(market, price=99.):
+    return [row for row in _internal(market, price) if row['side'] == 'short']
+
+
+def test_weak_high_is_the_short_with_the_5m_trigger():
+    market = weak_short_market()
+    card, = _shorts(market)
     assert card['trigger_timeframe'] == '5m'
     assert card['evidence']['weak_field'] == 'high'
     assert card['stop_reference']['field'] == 'high'
-    assert card['stop_loss_price'] > 103.
+    assert card['stop_loss_price'] > 108.
     assert card['target_reference']['timeframe'] == '1h'
     assert card['evidence']['alignment'] == 'against_higher_timeframe'
     assert len(card['opposing_target_levels']) == 1
@@ -202,6 +214,121 @@ def test_counter_structure_target_is_only_the_next_block_and_4h_is_the_better_ta
         rich, entry=100., stop=rich['stop_loss_price'], fee=0.0006, slippage=0.0005, price_step=.01)
     assert level['timeframe'] == '1h'
     assert target == pytest.approx(130.)
+
+
+def _set_5m_low(market, price):
+    lower = view(market, '5m')
+    swing = lower['features']['last_swing_low']
+    origin = next(row for row in lower['recent_ohlcv'] if row[0] == swing['pivot_at'])
+    origin[3] = price
+    for row in lower['features']['swings']:
+        if row.get('kind') == 'low':
+            row['price'] = price
+    return origin
+
+
+def _add_1h_swing(market, index, kind, price):
+    higher = view(market, '1h')
+    row = higher['recent_ohlcv'][index]
+    row[3 if kind == 'low' else 2] = price
+    swing = dict(kind=kind, price=price, pivot_at=row[0], confirmed_at=higher['recent_ohlcv'][index + 2][0] + 3600)
+    higher['features']['swings'].insert(0, swing)
+    return swing
+
+
+def test_the_5m_reaction_must_reach_near_the_weak_level():
+    near = weak_long_market()
+    card, = _internal(near)
+    hourly = view(near, '1h')['recent_ohlcv']
+    from trading.quant.structure_setups import _atr
+    assert card['evidence']['reaction_extreme'] == 92.
+    assert card['evidence']['proximity_band_atr'] == .5
+    assert card['evidence']['weak_distance_atr'] == pytest.approx(10. / _atr(hourly), abs=1e-3)
+    assert '5m reached 92' in card['algorithm_read']
+    far = weak_long_market()
+    _set_5m_low(far, 94.)
+    assert _internal(far) == []
+    assert _shorts(weak_short_market())
+    assert _shorts(weak_short_market(reaction=103.)) == []
+
+
+def test_the_nearest_weak_level_is_tried_first():
+    market = weak_long_market()
+    _add_1h_swing(market, 1, 'low', 89.5)
+    card, = _internal(market)
+    assert card['evidence']['weak_level'] == 90.
+    assert card['invalidation_price'] == 90.
+    short = weak_short_market()
+    _add_1h_swing(short, 0, 'high', 110.5)
+    card, = _shorts(short)
+    assert card['evidence']['weak_level'] == 110.
+
+
+def test_the_stop_is_beyond_the_5m_extreme_before_the_choch_not_the_last_pivot():
+    market = weak_long_market()
+    lower = view(market, '5m')
+    origin = next(row for row in lower['recent_ohlcv'] if row[3] == 92.)
+    minor = lower['recent_ohlcv'][-3]
+    lower['features']['swings'].append(dict(kind='low', price=minor[3], pivot_at=minor[0], confirmed_at=lower['closed_at']))
+    card, = _internal(market)
+    assert card['stop_reference'] == dict(timeframe='5m', open_time=origin[0], field='low')
+    assert card['stop_loss_price'] < 92.
+    short = weak_short_market()
+    top = next(row for row in view(short, '5m')['recent_ohlcv'] if row[2] == 108.)
+    card, = _shorts(short)
+    assert card['stop_reference'] == dict(timeframe='5m', open_time=top[0], field='high')
+    assert card['stop_loss_price'] > 108.
+
+
+def _bearish_gap(market, index, *, lower, upper):
+    higher = view(market, '1h')
+    row = higher['recent_ohlcv'][index]
+    row[2] = upper
+    higher['features']['fvgs'] = [dict(direction='bearish', at=row[0], lower=lower, upper=upper)]
+
+
+def test_without_a_1h_block_the_target_is_an_unfilled_flow_then_an_untaken_swing():
+    market = weak_long_market(block=False)
+    _bearish_gap(market, 6, lower=106., upper=108.)
+    card, = _internal(market)
+    assert card['take_profit_price'] == pytest.approx(108.)
+    assert card['opposing_target_levels'][0]['kind'] == 'flow'
+    assert card['evidence']['candidate_block']['kind'] == 'flow'
+    assert 'next 1h flow 108' in card['algorithm_read']
+    filled = weak_long_market(block=False)
+    _bearish_gap(filled, 6, lower=106., upper=108.)
+    view(filled, '1h')['recent_ohlcv'][9][2] = 108.5
+    card, = _internal(filled)
+    assert card['take_profit_price'] == pytest.approx(110.)
+    assert card['opposing_target_levels'] == [dict(timeframe='1h', open_time=card['target_reference']['open_time'],
+                                                   field='high', price=110., kind='swing')]
+    bare, = _internal(weak_long_market(block=False))
+    assert bare['opposing_target_levels'][0]['kind'] == 'swing'
+
+
+def test_short_without_a_1h_block_targets_the_unfilled_flow_below():
+    market = weak_short_market()
+    higher = view(market, '1h')
+    higher['features']['order_block_candidates'] = [
+        block for block in higher['features']['order_block_candidates'] if block['direction'] != 'bullish']
+    row = higher['recent_ohlcv'][6]
+    row[3] = 84.
+    higher['features']['fvgs'] = [dict(direction='bullish', at=row[0], lower=84., upper=86.)]
+    card, = _shorts(market)
+    assert card['take_profit_price'] == pytest.approx(84.)
+    assert card['opposing_target_levels'][0]['kind'] == 'flow'
+    higher['recent_ohlcv'][10][3] = 83.
+    card, = _shorts(market)
+    assert card['opposing_target_levels'][0]['kind'] == 'swing'
+    assert card['take_profit_price'] < 99.
+
+
+def test_the_compact_card_shows_distance_and_target_kind():
+    from trading.evaluation.context import _decision_setup
+    card, = _internal(weak_long_market())
+    compact = _decision_setup(card, 100.)
+    assert compact['weak_distance_atr'] == card['evidence']['weak_distance_atr']
+    assert compact['candidate_block']['kind'] == 'block'
 
 
 def _answer(packet):

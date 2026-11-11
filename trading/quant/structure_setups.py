@@ -224,6 +224,8 @@ def build_structure_setups(market_context, *, current_price, price_step=0, trigg
 
 HTF_ZONE_PATHS = (('4h', '15m', 'swing'), ('1h', '5m', 'intraday'))
 HTF_ZONE_VERSION = 'htf-zone-setup-v1'
+# The 5m reaction must reach within this many 1h ATRs of the weak level.
+WEAK_PROXIMITY_ATR = .5
 
 
 def _confirmed_zone(block, higher, context_tf):
@@ -250,6 +252,20 @@ def _confirmed_zone(block, higher, context_tf):
                 open_time=origin['open_time'], confirmed_at=confirmation[0] + SECONDS[context_tf])
 
 
+def _flow_filled(gap, view):
+    """A later closed wick traded through the far edge, so the gap is filled.
+
+    A bullish gap is filled at its lower edge, a bearish gap at its upper
+    edge. Only closed rows after the gap candle count.
+    """
+    at = gap.get('at')
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return False
+    if gap.get('direction') == 'bullish':
+        return any(row[3] <= gap['lower'] for row in view['rows'] if row[0] > at)
+    return any(row[2] >= gap['upper'] for row in view['rows'] if row[0] > at)
+
+
 def _confirmed_flow(gap, higher, context_tf):
     """A fair-value gap is a flow. It confirms the same way a block does."""
     direction = gap.get('direction')
@@ -259,7 +275,7 @@ def _confirmed_flow(gap, higher, context_tf):
     if not _positive(lower) or not _positive(upper) or lower >= upper:
         return None
     origin = next((row for row in higher['rows'] if row[0] == gap.get('at')), None)
-    if origin is None:
+    if origin is None or _flow_filled(gap, higher):
         return None
     long = direction == 'bullish'
     later = [row for row in higher['rows'] if row[0] > origin[0]]
@@ -321,6 +337,8 @@ def _opposing_locations(view, tf, *, long, entry):
         if long and direction != 'bearish':
             continue
         if not long and direction != 'bullish':
+            continue
+        if not _positive(gap.get('lower')) or not _positive(gap.get('upper')) or _flow_filled(gap, view):
             continue
         price = gap.get('upper') if long else gap.get('lower')
         add('flow', price, gap.get('at'))
@@ -397,12 +415,27 @@ def _trigger_shift(lower, direction):
     return None, None
 
 
-def _stop_swing(lower, trigger_tf, shift, long):
+def _reaction_stop(lower, trigger_tf, shift, long):
+    """The lowest trigger low up to the CHoCH candle, or the highest high for a short."""
     field = 'low' if long else 'high'
-    prior = [ref for ref in _swings({trigger_tf: lower}, field) if ref['open_time'] <= shift['at']]
-    if prior:
-        return max(prior, key=lambda ref: ref['open_time'])
-    return _reference(lower, trigger_tf, shift['at'], field)
+    span = [row for row in lower['rows'] if row[0] <= shift['at']]
+    if not span:
+        return None
+    pick = min(span, key=lambda row: (row[3], -row[0])) if long else max(span, key=lambda row: (row[2], row[0]))
+    return _reference(lower, trigger_tf, pick[0], field)
+
+
+def _fallback_targets(higher, *, long, entry):
+    """With no opposing 1h block, the next unfilled 1h flow, then the nearest untaken 1h swing."""
+    flows = [ref for ref in _opposing_locations(higher, '1h', long=long, entry=entry) if ref.get('kind') == 'flow']
+    if flows:
+        return flows[:1]
+    field = 'high' if long else 'low'
+    swings = [dict(ref, kind='swing') for ref in _swings({'1h': higher}, field)
+              if (ref['price'] > entry if long else ref['price'] < entry)
+              and not _liquidity_taken(higher, ref, field)]
+    swings.sort(key=lambda ref: (abs(ref['price'] - entry), ref['open_time']))
+    return swings[:1]
 
 
 def _swing_points(views):
@@ -450,6 +483,10 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
 
     A weak low or high is a swing whose liquidity has not been taken. The
     entry does not wait for a sweep, and it does not wait for a 15m or 4h CHoCH.
+    The 5m reaction must reach within half a 1h ATR of the weak level, and the
+    nearest such level is tried first. The stop is beyond the 5m extreme up to
+    the CHoCH candle. With no opposing 1h block, the target is the next
+    unfilled 1h flow, then the nearest untaken 1h swing.
     """
     if '1h' not in views or '5m' not in views:
         return []
@@ -460,12 +497,19 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
     if not (observed < lower['closed_at'] + seconds):
         return []
     points = _swing_points({'4h': book, '1h': higher, '5m': lower} if book else {'1h': higher, '5m': lower})
+    hourly_atr = _atr(higher['rows'])
+    if not hourly_atr > 0:
+        return []
+    band = WEAK_PROXIMITY_ATR * hourly_atr
     cards = []
     for long, field, direction in ((True, 'low', 'bullish'), (False, 'high', 'bearish')):
         shift, trigger = _trigger_shift(lower, direction)
         if shift is None:
             continue
-        for swing in _swings({'1h': higher}, field):
+        reach = min(row[3] for row in lower['rows']) if long else max(row[2] for row in lower['rows'])
+        nearby = [swing for swing in _swings({'1h': higher}, field) if abs(reach - swing['price']) <= band]
+        nearby.sort(key=lambda swing: (abs(current_price - swing['price']), -swing['open_time']))
+        for swing in nearby:
             if _liquidity_taken(higher, swing, field):
                 continue
             if swing['open_time'] > shift['at']:
@@ -473,12 +517,13 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
             reaction = _reaction_candle(higher, swing, long)
             if reaction is None:
                 continue
-            stop_ref = _stop_swing(lower, '5m', shift, long)
+            stop_ref = _reaction_stop(lower, '5m', shift, long)
             if stop_ref is None:
                 continue
             entry = current_price
             aligned = higher_trend == direction and higher_trend in ('bullish', 'bearish')
-            ordered = _target_blocks(higher, '1h', book, long=long, entry=entry, aligned=aligned)
+            ordered = (_target_blocks(higher, '1h', book, long=long, entry=entry, aligned=aligned)
+                       or _fallback_targets(higher, long=long, entry=entry))
             if not ordered:
                 continue
             target_ref = ordered[0]
@@ -487,10 +532,12 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
             target = _tick(target_ref['price'], price_step, up=not long)
             if not (0 < stop < entry < target if long else 0 < target < entry < stop):
                 continue
+            target_kind = target_ref.get('kind', 'block')
             read = (
                 f"1h {field} {swing['price']:g} not swept, "
+                f"5m reached {reach:g}, "
                 f"{'bullish' if long else 'bearish'} candle, "
-                f"5m through {shift['level']:g}, next 1h block {target_ref['price']:g}"
+                f"5m through {shift['level']:g}, next 1h {target_kind} {target_ref['price']:g}"
             )
             evidence = dict(
                 kind='htf_zone_internal', stage='confirmed',
@@ -499,9 +546,12 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
                           high=target_ref['price'] if long else swing['price'],
                           open_time=swing['open_time']),
                 weak_level=swing['price'], weak_field=field,
+                weak_distance_atr=round(abs(entry - swing['price']) / hourly_atr, 3),
+                reaction_extreme=reach, proximity_band_atr=WEAK_PROXIMITY_ATR,
                 trigger_candle=dict(timeframe='5m', open_time=trigger[0], open=trigger[1],
                                     high=trigger[2], low=trigger[3], close=trigger[4]),
-                candidate_block={key: target_ref[key] for key in ('timeframe', 'open_time', 'field', 'price')},
+                candidate_block=dict({key: target_ref[key] for key in ('timeframe', 'open_time', 'field', 'price')},
+                                     kind=target_kind),
                 shift=shift, touch_at=reaction[0] + SECONDS['1h'],
                 confirmation_at=lower['closed_at'], expires_at=lower['closed_at'] + seconds,
                 alignment='with_higher_timeframe' if aligned else 'against_higher_timeframe')
@@ -646,9 +696,11 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0):
     A touch or a future level can produce a watch. The LTF trigger must close
     after the touch candle, so same-candle intrabar ordering is never inferred.
     An early 1h card does not wait for a 15m or 4h CHoCH. A weak swing is
-    liquidity that has not been taken. The 5m CHoCH is the trigger, the stop
-    is under that 5m swing, and the target is the next 1h block. A 4h block
-    is only the better target.
+    liquidity that has not been taken, and the 5m reaction must reach near it.
+    The 5m CHoCH is the trigger, the stop is beyond the 5m extreme before it,
+    and the target is the next 1h block, else the next unfilled 1h flow, else
+    the nearest untaken 1h swing. A 4h block is only the better target.
+    A filled flow is neither a zone nor a target.
     BTC/ETH context stays independent of the symbol's executable evidence.
     """
     if (not _positive(current_price) or isinstance(price_step, bool)
