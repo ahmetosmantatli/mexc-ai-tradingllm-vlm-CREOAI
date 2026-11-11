@@ -64,13 +64,16 @@ def test_confirm_path_helper_picks_entry_path():
     assert _confirm_path_ready_card([card], side='short') is None
 
 
-def test_flag_default_off_still_asks_model(tmp_path, monkeypatch):
+def test_flag_off_still_asks_model(tmp_path, monkeypatch):
     result, model = _run(tmp_path, monkeypatch, auto_entry=False)
     assert model.calls
     assert result.action.value == 'trade'
     assert not result.metadata.get('model_not_asked')
     assert not result.metadata.get('structure_auto_entry')
-    assert Settings(_env_file=None).live_runner3_structure_auto_entry_enabled is False
+
+
+def test_flag_defaults_on():
+    assert Settings(_env_file=None).live_runner3_structure_auto_entry_enabled is True
 
 
 def test_flag_on_confirm_bar_skips_model(tmp_path, monkeypatch):

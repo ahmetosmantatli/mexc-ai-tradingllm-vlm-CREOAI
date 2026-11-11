@@ -712,12 +712,12 @@ class ContextEvaluator:
                 if direct_decision is not None:
                     model_not_asked = True
         if (runner3 and not model_not_asked and price_rules is not None
-                and getattr(self.cfg, 'live_runner3_structure_auto_entry_enabled', False)
+                and getattr(self.cfg, 'live_runner3_structure_auto_entry_enabled', True)
                 and not candidate.features.get('hold_review')):
             # Cold early READY with confirm_bar/ob_retest: open without the model.
             # Uses the same choose_zone_target + entry_veto path as accepted_entry
             # (early cards are not closed_entry_structure / _ground_card_plan).
-            # 1.25R / 15% stop / free margin stay. Flag default off.
+            # 1.25R / 15% stop / free margin stay. Flag default on.
             card = _confirm_path_ready_card(options, side=candidate.side)
             if card is not None:
                 cash_equity, cash_free = runner3_policy.cash_for_veto(equity, live_account)
