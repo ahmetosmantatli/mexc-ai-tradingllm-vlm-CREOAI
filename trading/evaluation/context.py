@@ -247,7 +247,8 @@ COMPACT_SYSTEM = (
     'The prior note is at most one short clause plus the numeric trigger. '
     'Raw candles are omitted and are not a hold reason. '
     'A block or flow trade still needs that closed CHoCH and a supplied target. '
-    'The 1h weak swing with its 5m trigger does not need a 15m close. The 4h weak swing with its 15m trigger does not need a higher CHoCH. Touch alone is not an entry. '
+    'The 1h weak swing with its 5m trigger does not need a 15m close. The 4h weak swing with its 15m trigger does not need a higher CHoCH. '
+    'Early READY needs entry_path confirm_bar or ob_retest after the LTF CHoCH; a naked CHoCH is WATCH. Touch alone is not an entry. '
     'If the decision data is missing or the call would be a guess, return hold. Do not invent a trade.'
 )
 
@@ -471,6 +472,9 @@ def _decision_setup(option, price):
     distance = evidence.get('weak_distance_atr')
     if isinstance(distance, (int, float)) and not isinstance(distance, bool) and isfinite(distance) and distance >= 0:
         card['weak_distance_atr'] = distance
+    path = evidence.get('entry_path')
+    if path in ('confirm_bar', 'ob_retest'):
+        card['entry_path'] = path
     trigger = evidence.get('trigger_candle')
     if isinstance(trigger, dict):
         card['trigger_candle'] = {key: trigger.get(key) for key in ('timeframe', 'open_time', 'open', 'high', 'low', 'close')}

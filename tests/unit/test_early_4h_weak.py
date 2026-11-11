@@ -15,7 +15,9 @@ def _wide_entry_cap(monkeypatch):
 
 
 def weak_long_4h_market(*, target_high=120., target_low=112., block=True):
-    """4h weak low, bullish candle there, 15m CHoCH. No sweep and no higher CHoCH."""
+    """4h weak low, bullish candle there, 15m CHoCH + confirm bar. No sweep and no higher CHoCH."""
+    from .test_zone_entry import _ltf_confirm_after_choch
+
     ctx = htf_zone_context('4h', '15m')
     higher = view(ctx, '4h')
     swing = next(row for row in higher['features']['swings'] if row['kind'] == 'low')
@@ -41,11 +43,14 @@ def weak_long_4h_market(*, target_high=120., target_low=112., block=True):
     for row in lower['features']['swings']:
         if row.get('kind') == 'low':
             row['price'] = 92.
+    _ltf_confirm_after_choch(lower, long=True, level=100.)
     return ctx
 
 
 def weak_short_4h_market(*, reaction=108.):
-    """4h weak high at 110, bearish candle there, 15m bearish CHoCH after a 15m high at ``reaction``."""
+    """4h weak high at 110, bearish candle there, 15m bearish CHoCH + confirm bar after a 15m high at ``reaction``."""
+    from .test_zone_entry import _ltf_confirm_after_choch
+
     market = weak_long_4h_market()
     higher = view(market, '4h')
     swing = next(row for row in higher['features']['swings'] if row['kind'] == 'high')
@@ -55,9 +60,7 @@ def weak_short_4h_market(*, reaction=108.):
     pivot[2] = swing['price']
     pivot[3] = min(pivot[3], pivot[4])
     lower = view(market, '15m')
-    latest = lower['recent_ohlcv'][-1]
-    latest[1:5] = [100., 101., 96., 97.]
-    lower['features']['structure_shifts'] = [dict(at=latest[0], direction='bearish', level=99., kind='choch')]
+    _ltf_confirm_after_choch(lower, long=False, level=99.)
     high_swing = lower['features']['last_swing_high']
     origin = next(row for row in lower['recent_ohlcv'] if row[0] == high_swing['pivot_at'])
     origin[2] = reaction
@@ -113,6 +116,7 @@ def test_weak_low_uses_the_15m_trigger_and_does_not_wait_for_a_sweep():
     assert card['state'] == 'ready'
     assert card['side'] == 'long'
     assert card['evidence']['weak_field'] == 'low'
+    assert card['evidence']['entry_path'] == 'confirm_bar'
     assert card['evidence']['shift']['kind'] in ('choch', 'mss')
     assert view(market, '4h')['features']['structure_shifts'] == []
     assert view(market, '4h')['features']['sweeps'] == []
@@ -128,6 +132,7 @@ def test_weak_low_uses_the_15m_trigger_and_does_not_wait_for_a_sweep():
     assert 'not swept' in read
     assert '4h low' in read
     assert '15m reached' in read
+    assert 'entry_path confirm_bar' in read
     assert 'valid' not in read
 
 
