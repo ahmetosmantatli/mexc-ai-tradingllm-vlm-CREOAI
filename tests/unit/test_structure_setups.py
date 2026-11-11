@@ -4,6 +4,12 @@ import pytest
 from trading.quant.structure_setups import build_structure_setups
 
 
+@pytest.fixture(autouse=True)
+def _zone_cards_ready(monkeypatch):
+    """These tests exercise the zone CHoCH/MSS entry path, which is off by default."""
+    monkeypatch.setattr('trading.quant.structure_setups.ZONE_CARDS_READY', True)
+
+
 NOW = 1440000
 
 
@@ -260,19 +266,65 @@ def test_htf_zone_touch_then_ltf_shift_keeps_different_entry_stop_and_target_tim
     assert build_htf_zone_setups(ctx, current_price=99. if short else 101., price_step=.01)[0]['setup_id'] == setup['setup_id']
 
 
+def _add_high(higher, index, price):
+    higher['recent_ohlcv'][index][2] = price
+    higher['features']['swings'].append(dict(
+        kind='high', price=price, pivot_at=higher['recent_ohlcv'][index][0],
+        confirmed_at=higher['recent_ohlcv'][index + 3][0]))
+
+
+def _add_low(higher, index, price):
+    higher['recent_ohlcv'][index][3] = price
+    higher['features']['swings'].append(dict(
+        kind='low', price=price, pivot_at=higher['recent_ohlcv'][index][0],
+        confirmed_at=higher['recent_ohlcv'][index + 3][0]))
+
+
 def test_farther_opposing_high_is_supplied_after_the_nearest():
     from trading.quant.structure_setups import build_htf_zone_setups
 
     ctx = htf_zone_context('4h', '15m')
     higher = view(ctx, '4h')
-    higher['recent_ohlcv'][1][2] = 120.
-    higher['features']['swings'].append(dict(
-        kind='high', price=120., pivot_at=higher['recent_ohlcv'][1][0],
-        confirmed_at=higher['recent_ohlcv'][4][0]))
+    _add_high(higher, 0, 120.)
+    _add_low(higher, 1, 91.)
     setup, = build_htf_zone_setups(ctx, current_price=101., price_step=.01)
     assert [level['price'] for level in setup['opposing_target_levels']] == [110., 120.]
+    assert {level['kind'] for level in setup['opposing_target_levels']} == {'swing'}
     assert setup['take_profit_price'] == pytest.approx(110.)
     assert setup['target_reference']['open_time'] == setup['opposing_target_levels'][0]['open_time']
+
+
+def test_a_lower_high_without_a_low_between_is_not_a_structural_target():
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = htf_zone_context('4h', '15m')
+    _add_high(view(ctx, '4h'), 1, 120.)
+    setup, = build_htf_zone_setups(ctx, current_price=101., price_step=.01)
+    assert [(level['price'], level['kind']) for level in setup['opposing_target_levels']] == [(120., 'swing')]
+
+
+def test_equal_highs_are_one_pool_target_at_the_outer_wick():
+    from trading.quant.structure_setups import _structural_targets, _views
+
+    ctx = htf_zone_context('4h', '15m')
+    higher = view(ctx, '4h')
+    _add_high(higher, 0, 110.02)
+    _add_low(higher, 1, 91.)
+    higher_view = _views(ctx)['4h']
+    levels = _structural_targets(higher_view, '4h', long=True, entry=101.)
+    assert [(level['price'], level['kind']) for level in levels] == [(110.02, 'pool')]
+
+
+def test_a_taken_swing_is_not_a_structural_target():
+    from trading.quant.structure_setups import _structural_targets, _views
+
+    ctx = htf_zone_context('4h', '15m')
+    higher = view(ctx, '4h')
+    _add_high(higher, 0, 120.)
+    _add_low(higher, 1, 91.)
+    higher['recent_ohlcv'][-1][2:5] = [121., 98., 120.5]
+    levels = _structural_targets(_views(ctx)['4h'], '4h', long=True, entry=101.)
+    assert 120. not in [level['price'] for level in levels]
 
 
 @pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
@@ -378,11 +430,23 @@ def test_counter_htf_target_is_the_next_block(context_tf, trigger_tf):
                  if row['context_timeframe'] == context_tf and row['side'] == 'short' and row['state'] == 'ready')
     assert setup['evidence']['alignment'] == 'against_higher_timeframe'
     assert setup['evidence']['shift']['kind'] == 'choch'
-    assert setup['take_profit_price'] == pytest.approx(88.)
+    assert setup['take_profit_price'] == pytest.approx(95.)
+    assert setup['target_reference']['timeframe'] == context_tf
+    assert setup['opposing_target_levels'] == [dict(setup['target_reference'], price=95., kind='swing')]
+
+
+@pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
+def test_counter_htf_target_falls_back_to_the_nearer_lower_block(context_tf, trigger_tf):
+    from trading.quant.structure_setups import build_htf_zone_setups
+
+    ctx = _counter_context(context_tf, trigger_tf)
+    lower = view(ctx, trigger_tf)
+    lower['recent_ohlcv'][-6][1:5] = [97., 98., 96.5, 97.]
+    lower['features']['order_block_candidates'][0].update(low=96.5, high=98.)
+    setup = next(row for row in build_htf_zone_setups(ctx, current_price=99., price_step=.01)
+                 if row['context_timeframe'] == context_tf and row['side'] == 'short' and row['state'] == 'ready')
+    assert setup['take_profit_price'] == pytest.approx(96.5)
     assert setup['target_reference']['timeframe'] == trigger_tf
-    assert setup['opposing_target_levels'] == [dict(setup['target_reference'], price=88.)]
-    assert all(level['timeframe'] == trigger_tf for level in setup['opposing_target_levels'])
-    assert all(level['price'] != 95. for level in setup['opposing_target_levels'])
 
 
 @pytest.mark.parametrize('context_tf,trigger_tf', [('4h', '15m'), ('1h', '5m')])
@@ -391,10 +455,8 @@ def test_with_htf_target_can_be_farther(context_tf, trigger_tf):
 
     ctx = htf_zone_context(context_tf, trigger_tf)
     higher = view(ctx, context_tf)
-    higher['recent_ohlcv'][1][2] = 120.
-    higher['features']['swings'].append(dict(
-        kind='high', price=120., pivot_at=higher['recent_ohlcv'][1][0],
-        confirmed_at=higher['recent_ohlcv'][4][0]))
+    _add_high(higher, 0, 120.)
+    _add_low(higher, 1, 91.)
     setup = next(row for row in build_htf_zone_setups(ctx, current_price=101., price_step=.01)
                  if row['context_timeframe'] == context_tf and row['state'] == 'ready')
     assert setup['evidence']['alignment'] == 'with_higher_timeframe'

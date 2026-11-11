@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
+
 from trading.exchange.mexc_public import MexcPublicClient, TickerSnapshot
 from trading.quant.scanner import LiquidityFilter, MarketScanner
 from trading.quant.strategies import TrendStrategy
+
+
+@pytest.fixture(autouse=True)
+def _zone_cards_ready(monkeypatch):
+    """These tests exercise the zone CHoCH/MSS entry path, which is off by default."""
+    monkeypatch.setattr('trading.quant.structure_setups.ZONE_CARDS_READY', True)
 
 
 def _rising_klines(start: float = 100.0, n: int = 40, step: float = 0.5) -> list[list[float]]:

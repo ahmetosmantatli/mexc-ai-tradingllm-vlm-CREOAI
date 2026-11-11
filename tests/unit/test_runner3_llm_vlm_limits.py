@@ -16,6 +16,12 @@ from .test_structure_setups import NOW, htf_zone_context, view
 from .test_watch_service import signal
 
 
+@pytest.fixture(autouse=True)
+def _zone_cards_ready(monkeypatch):
+    """These tests exercise the zone CHoCH/MSS entry path, which is off by default."""
+    monkeypatch.setattr('trading.quant.structure_setups.ZONE_CARDS_READY', True)
+
+
 def rebase_market(symbol='BTC_USDT'):
     offset = int(time.time()) - NOW - 1
 
@@ -808,10 +814,12 @@ def _ready_market():
     higher = next(view for view in market['timeframes'] if view['timeframe'] == '4h')
     rows = higher['recent_ohlcv']
     rows[0][2] = 101.
-    rows[1][2] = 120.
+    rows[1][3] = 91.
+    rows[6][2] = 120.
     higher['features']['swings'].extend([
         dict(kind='high', price=101., pivot_at=rows[0][0], confirmed_at=rows[3][0]),
-        dict(kind='high', price=120., pivot_at=rows[1][0], confirmed_at=rows[4][0]),
+        dict(kind='low', price=91., pivot_at=rows[1][0], confirmed_at=rows[4][0]),
+        dict(kind='high', price=120., pivot_at=rows[6][0], confirmed_at=rows[9][0]),
     ])
     return market
 
@@ -1098,10 +1106,10 @@ def _awaiting_touch_market(symbol='USELESS_USDT'):
 
 def _with_farther_high(market):
     higher = next(view for view in market['timeframes'] if view['timeframe'] == '4h')
-    higher['recent_ohlcv'][1][2] = 120.
+    higher['recent_ohlcv'][6][2] = 120.
     higher['features']['swings'].append(dict(
-        kind='high', price=120., pivot_at=higher['recent_ohlcv'][1][0],
-        confirmed_at=higher['recent_ohlcv'][4][0]))
+        kind='high', price=120., pivot_at=higher['recent_ohlcv'][6][0],
+        confirmed_at=higher['recent_ohlcv'][9][0]))
     return market
 
 
