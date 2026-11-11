@@ -226,6 +226,8 @@ HTF_ZONE_PATHS = (('4h', '15m', 'swing'), ('1h', '5m', 'intraday'))
 HTF_ZONE_VERSION = 'htf-zone-setup-v1'
 # The 5m reaction must reach within this many 1h ATRs of the weak level.
 WEAK_PROXIMITY_ATR = .5
+# Entry (current price) must still be within this many 1h ATRs of the weak level.
+WEAK_ENTRY_MAX_ATR = 1.
 # A confirmed zone CHoCH/MSS card stays a watch unless this is on. In the
 # 10-day replay those cards lost about 0.9R per trade that cleared 1.25R net.
 ZONE_CARDS_READY = False
@@ -253,6 +255,36 @@ def _confirmed_zone(block, higher, context_tf):
         return None
     return dict(kind='block', timeframe=context_tf, direction=direction, low=low_price, high=high_price,
                 open_time=origin['open_time'], confirmed_at=confirmation[0] + SECONDS[context_tf])
+
+
+def _origin_block(block, higher):
+    """The block re-anchored to the origin of the move that broke structure.
+
+    The origin is the extreme candle between the broken swing and the break:
+    the lowest low for a bullish block, the highest high for a bearish one.
+    Its status is re-read from closes after the break. None when the break
+    or its swing is not in the supplied rows.
+    """
+    direction = block.get('direction')
+    at = block.get('confirmed_by')
+    brk = next((row for row in higher['features'].get('breaks') or []
+                if isinstance(row, dict) and row.get('at') == at and row.get('direction') == direction), None)
+    if brk is None or not _positive(brk.get('swing_at')):
+        return None
+    span = [row for row in higher['rows'] if brk['swing_at'] <= row[0] < at]
+    if not span or span[0][0] != brk['swing_at']:
+        return None
+    long = direction == 'bullish'
+    origin = (min(reversed(span), key=lambda row: row[3]) if long
+              else max(reversed(span), key=lambda row: row[2]))
+    later = [row for row in higher['rows'] if row[0] > at]
+    if any(row[4] < origin[3] if long else row[4] > origin[2] for row in later):
+        status = 'invalidated'
+    elif any(row[3] <= origin[2] and row[2] >= origin[3] for row in later):
+        status = 'retested'
+    else:
+        status = 'untested'
+    return dict(block, open_time=origin[0], low=origin[3], high=origin[2], status=status, origin='move')
 
 
 def _flow_filled(gap, view):
@@ -524,8 +556,9 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
 
     A weak low or high is a swing whose liquidity has not been taken. The
     entry does not wait for a sweep, and it does not wait for a 15m or 4h CHoCH.
-    The 5m reaction must reach within half a 1h ATR of the weak level, and the
-    nearest such level is tried first. The stop is beyond the 5m extreme up to
+    The 5m reaction must reach within half a 1h ATR of the weak level, the
+    current price must still be within one 1h ATR of it, and the nearest such
+    level is tried first. The stop is beyond the 5m extreme up to
     the CHoCH candle. With no opposing 1h block, the target is the next
     unfilled 1h flow, then the nearest untaken 1h swing.
     """
@@ -551,6 +584,8 @@ def _early_weak_cards(views, *, current_price, price_step, observed, symbol):
         nearby = [swing for swing in _swings({'1h': higher}, field) if abs(reach - swing['price']) <= band]
         nearby.sort(key=lambda swing: (abs(current_price - swing['price']), -swing['open_time']))
         for swing in nearby:
+            if abs(current_price - swing['price']) > WEAK_ENTRY_MAX_ATR * hourly_atr:
+                continue
             if _liquidity_taken(higher, swing, field):
                 continue
             if swing['open_time'] > shift['at']:
@@ -733,8 +768,9 @@ def _zone_option(zone, higher, lower, trigger_tf, horizon, current_price, price_
 def build_htf_zone_setups(market_context, *, current_price, price_step=0, zone_ready=None):
     """Use a confirmed HTF block or flow, a later closed LTF touch, then a closed CHoCH/MSS.
 
-    Swing is 4h structure with a 15m trigger. Intraday is 1h structure with a
-    5m trigger. Both directions use that same path. A ready long stops just
+    A block is re-anchored to the origin of the move: the extreme candle between
+    the broken swing and the break. Swing is 4h structure with a 15m trigger.
+    Intraday is 1h structure with a 5m trigger. Both directions use that same path. A ready long stops just
     beyond the CHoCH low. A ready short stops just beyond the CHoCH high.
     The trigger candle must close through the CHoCH level, and that CHoCH must
     be a swing (not internal) break. Targets are untaken alternating swings or
@@ -746,8 +782,8 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0, zone_r
     A touch or a future level can produce a watch. The LTF trigger must close
     after the touch candle, so same-candle intrabar ordering is never inferred.
     An early 1h card does not wait for a 15m or 4h CHoCH. A weak swing is
-    liquidity that has not been taken, and the 5m reaction must reach near it.
-    The 5m CHoCH is the trigger, the stop is beyond the 5m extreme before it,
+    liquidity that has not been taken, the 5m reaction must reach near it, and
+    price must not have run more than one 1h ATR away from it. The 5m CHoCH is the trigger, the stop is beyond the 5m extreme before it,
     and the target is the next 1h block, else the next unfilled 1h flow, else
     the nearest untaken 1h swing. A 4h block is only the better target.
     A filled flow is neither a zone nor a target.
@@ -766,7 +802,7 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0, zone_r
         higher, lower = views[context_tf], views[trigger_tf]
         zones = []
         for block in higher['features'].get('order_block_candidates', []):
-            zone = _confirmed_zone(block, higher, context_tf)
+            zone = _confirmed_zone(_origin_block(block, higher) or block, higher, context_tf)
             if zone is not None:
                 zones.append(zone)
         for gap in higher['features'].get('fvgs', []) or []:
