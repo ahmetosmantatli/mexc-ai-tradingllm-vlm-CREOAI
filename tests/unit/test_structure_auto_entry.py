@@ -84,8 +84,11 @@ def test_flag_on_confirm_bar_skips_model(tmp_path, monkeypatch):
     assert model.calls == []
     assert result.metadata.get('model_not_asked') is True
     assert result.metadata.get('structure_auto_entry') is True
+    assert result.metadata.get('entry_path') == 'confirm_bar'
     assert result.action.value == 'trade'
     assert result.proposal is not None
+    assert 'girildi' not in (result.metadata.get('rationale') or '').lower()
+    assert 'plan hazır' in (result.metadata.get('rationale') or '')
     label, detail = map_ai_decision(
         dict(status='completed', action='trade', model_action='trade', structure_auto_entry=True),
         selected=True, model_not_asked=True)
@@ -104,3 +107,4 @@ def test_under_one_point_two_five_vetoes_without_model(tmp_path, monkeypatch):
     assert result.hold_reason == 'cost_adjusted_r'
     assert result.metadata.get('structure_auto_entry') is True
     assert result.metadata.get('veto') == 'cost_adjusted_r'
+    assert result.metadata.get('structure_veto_details', {}).get('code') == 'cost_adjusted_r'

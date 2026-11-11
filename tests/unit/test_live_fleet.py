@@ -460,3 +460,53 @@ def test_ready_setup_after_bekle_is_said_on_telegram(tmp_path):
         assert 'Giriş, hazır kurulumdan alındı. Model BEKLE seçmişti.' in screen
     finally:
         f.stop()
+
+
+def test_structure_auto_entry_plan_notice_is_not_ai_or_fill(tmp_path):
+    from types import SimpleNamespace
+    from trading.runtime.live_runner import LiveRunner
+    from trading.runtime.structure_entry_messages import (
+        STRUCTURE_OUTCOME_KEY, enqueue_structure_outcome, format_reject_telegram)
+
+    f = fleet(tmp_path)
+    try:
+        runner = f.runners['a']
+        runner.binding_id = 'binding'
+        LiveRunner._record_review_notice(SimpleNamespace(binding_id='binding', store=runner.store), dict(
+            id='struct', symbol='TSMSTOCK_USDT', completed_at=1, status='completed', action='trade',
+            model_action='trade', model='', decision_mode=None, attempts=[],
+            strategy='structure_setup', structure_auto_entry=True, entry_path='confirm_bar',
+            rationale='TSMSTOCK_USDT confirm_bar hazır kurulumdan auto-entry plan hazır. Model sorulmadı.'))
+        reject = format_reject_telegram(
+            symbol='TSMSTOCK_USDT', reason='free_margin', path='confirm_bar', side='long',
+            details=dict(free_margin=0.8, required_margin=2.0, contracts=0))
+        enqueue_structure_outcome(
+            runner.store, binding_id='binding', outcome='REJECT', symbol='TSMSTOCK_USDT',
+            reason='free_margin', path='confirm_bar', side='long', text=reject,
+            details=dict(free_margin=0.8, contracts=0))
+        f.publish(f.accounts[0])
+        texts = [row[0][1] for row in f.controller.messages]
+        plan = next(text for text in texts if 'auto-entry planı kuruldu' in text)
+        assert 'AI işlem önerdi' not in plan
+        assert 'girildi' not in plan.lower()
+        assert 'Emir henüz gönderilmedi' in plan
+        assert 'auto-entry plan hazır' in plan
+        outcome = next(text for text in texts if 'REJECT | yapı auto-entry' in text)
+        assert 'free_margin' in outcome
+        assert 'serbest marjin=0.8' in outcome
+        assert runner.store.get(STRUCTURE_OUTCOME_KEY) == []
+    finally:
+        f.stop()
+
+
+def test_structure_trace_outcome_avoids_ai_suggested_wording():
+    from trading.agents.telemetry import trace_outcome
+    waiting = dict(action='trade', status='completed', structure_auto_entry=True,
+                   entry_path='ob_retest', execution_status='awaiting_risk')
+    assert 'AI işlem önerdi' not in trace_outcome(waiting)
+    assert 'Yapı auto-entry planı kuruldu' in trace_outcome(waiting)
+    rejected = dict(action='hold', model_action='trade', status='completed',
+                    structure_auto_entry=True, entry_path='confirm_bar',
+                    execution_status='rejected')
+    assert 'AI işlem önerdi' not in trace_outcome(rejected)
+    assert 'giriş kontrolünde açılmadı' in trace_outcome(rejected)

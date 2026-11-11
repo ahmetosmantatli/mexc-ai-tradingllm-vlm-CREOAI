@@ -428,6 +428,8 @@ class LiveRunner:
                       status=trace['status'], action=trace.get('action'), model=trace.get('model'),
                       decision_mode=trace.get('decision_mode'),
                       ready_setup_after_hold=bool(trace.get('ready_setup_after_hold')),
+                      structure_auto_entry=bool(trace.get('structure_auto_entry')),
+                      entry_path=trace.get('entry_path'),
                       rationale=' '.join((trace.get('rationale') or '').split())[:180],
                       strategy=trace.get('strategy'), seed_timeframe=trace.get('seed_timeframe'),
                       review_reason=(trace.get('why_reconsidered') or {}).get('reason'),
@@ -436,6 +438,52 @@ class LiveRunner:
         with self.store.lock:
             pending = self.store.get(key, [])
             self.store.put(key, (pending + [notice])[-200:])
+
+    def _structure_entry_path(self, result):
+        from trading.runtime.structure_entry_messages import entry_path_from_metadata
+        return entry_path_from_metadata(result.metadata if result is not None else None)
+
+    def _record_structure_outcome(self, outcome, candidate, result, *, reason=None, details=None,
+                                  order_id=None, intent=None):
+        from trading.runtime.structure_entry_messages import (
+            enqueue_structure_outcome, format_pass_telegram, format_reject_telegram,
+            log_structure_attempt)
+        metadata = {} if result is None else (result.metadata or {})
+        path = metadata.get('entry_path') or self._structure_entry_path(result)
+        side = candidate.side.value
+        details = dict(details or {})
+        details.setdefault('entry_path', path)
+        details.setdefault('side', side)
+        if outcome == 'PASS':
+            proposal = None if intent is None else (intent.get('proposal') or {})
+            stop = (proposal.get('stop_loss') or {}).get('price')
+            text = format_pass_telegram(
+                symbol=candidate.symbol, side=side, path=path,
+                leverage=proposal.get('leverage') if proposal else None,
+                entry=intent.get('entry_fill_price') if intent else proposal.get('entry_price') if proposal else None,
+                stop=stop,
+                target=proposal.get('take_profit_price') if proposal else None,
+                contracts=intent.get('effective_contracts') if intent else None,
+                notional=proposal.get('notional') if proposal else None,
+                order_id=order_id or (None if intent is None else intent.get('exchange_order_id')))
+            log_structure_attempt(
+                outcome='PASS', symbol=candidate.symbol, path=path, side=side,
+                details=dict(details, leverage=proposal.get('leverage') if proposal else None,
+                             entry=intent.get('entry_fill_price') if intent else None,
+                             stop=stop, target=proposal.get('take_profit_price') if proposal else None,
+                             contracts=intent.get('effective_contracts') if intent else None,
+                             notional=proposal.get('notional') if proposal else None),
+                order_id=order_id or (None if intent is None else intent.get('exchange_order_id')))
+        else:
+            text = format_reject_telegram(
+                symbol=candidate.symbol, reason=reason or 'REJECT', details=details,
+                path=path, side=side)
+            log_structure_attempt(
+                outcome='REJECT', symbol=candidate.symbol, path=path, reason=reason,
+                side=side, details=details, order_id=order_id)
+        enqueue_structure_outcome(
+            self.store, binding_id=self.binding_id, outcome=outcome, symbol=candidate.symbol,
+            reason=reason, details=details, path=path, side=side, text=text, order_id=order_id)
 
     def _evaluate(self,candidate,snapshot,control):
         child=self.llm.fork() if callable(getattr(self.llm,'fork',None)) else self.llm
@@ -671,6 +719,11 @@ class LiveRunner:
             analysis_trace_id=result.metadata.get('analysis_trace_id'),
             contract_size=rules.size,analysis_version=self.cfg.analysis_version,charts=result.metadata.get('charts',[]),
             decision_ai=result.metadata.get('decision_ai',{}),account_generation=snapshot['generation'])
+        if result.metadata.get('structure_auto_entry'):
+            proposal.metadata['structure_auto_entry'] = True
+            path = result.metadata.get('entry_path') or self._structure_entry_path(result)
+            if path:
+                proposal.metadata['entry_path'] = path
         if runner_id == 'runner3':
             proposal.metadata['htf_setup'] = {key: copy.deepcopy(setup[key]) for key in
                 ('context_timeframe','trigger_timeframe','evidence')}
@@ -680,13 +733,31 @@ class LiveRunner:
                  'target_reference', 'opposing_target_levels')}
         return proposal
 
-    def _record_entry_rejection(self, candidate, trace_id, reason, details=None, *, notify=True):
-        if not finalize_trace(self.store, trace_id, 'rejected', reason, details) or not notify:
+    def _record_entry_rejection(self, candidate, trace_id, reason, details=None, *, notify=True,
+                                result=None):
+        payload = dict(details or {})
+        structure = bool(result is not None and (result.metadata or {}).get('structure_auto_entry'))
+        if structure:
+            payload['structure_auto_entry'] = True
+            path = (result.metadata or {}).get('entry_path') or self._structure_entry_path(result)
+            if path:
+                payload['entry_path'] = path
+            payload.setdefault('side', candidate.side.value)
+        finalized = True
+        if trace_id:
+            finalized = finalize_trace(self.store, trace_id, 'rejected', reason, payload)
+        if structure:
+            # Structure outcome Telegram is the clear reject; skip the generic
+            # "İşlem önerisi reddedildi" duplicate for this path.
+            self._record_structure_outcome(
+                'REJECT', candidate, result, reason=reason, details=payload)
+            return
+        if not finalized or not notify:
             return
         with self.store.lock:
             pending = self.store.get('live:entry_rejection_notices', [])
             pending.append(dict(at=time.time(), binding_id=self.binding_id,
-                                symbol=candidate.symbol, reason=reason, details=details or {}))
+                                symbol=candidate.symbol, reason=reason, details=payload))
             self.store.put('live:entry_rejection_notices', pending[-100:])
 
     def _decision_still_live(self, candidate, result, started):
@@ -740,18 +811,33 @@ class LiveRunner:
 
     def _apply(self,candidate,result,control):
         trace_id=result.metadata.get('analysis_trace_id')
-        def finish(reason, *, notify=True, intent_id=None):
-            details = None if intent_id is None else dict(intent_id=intent_id)
+        def finish(reason, *, notify=True, intent_id=None, intent=None, details=None):
+            payload = dict(details or {})
+            if intent_id is not None:
+                payload.setdefault('intent_id', intent_id)
             if result.action.value == 'trade' and reason != 'LIVE_PROTECTED':
-                if self._price_invalidated_acceptance(reason, details):
+                if self._price_invalidated_acceptance(reason, payload):
                     self._clear_accepted_entry(candidate.symbol)
-            if trace_id and result.action.value == 'trade':
+            if result.action.value == 'trade':
                 if reason == 'LIVE_PROTECTED':
-                    finalize_trace(self.store, trace_id, 'opened', reason, details)
+                    if trace_id:
+                        finalize_trace(self.store, trace_id, 'opened', reason, payload or None)
+                    if (result.metadata or {}).get('structure_auto_entry'):
+                        self._record_structure_outcome(
+                            'PASS', candidate, result, intent=intent,
+                            order_id=None if intent is None else intent.get('exchange_order_id'))
                 else:
-                    self._record_entry_rejection(candidate, trace_id, reason, details, notify=notify)
+                    self._record_entry_rejection(
+                        candidate, trace_id, reason, payload, notify=notify, result=result)
             return self.status(reason)
         if result.action.value!='trade':
+            if ((result.metadata or {}).get('structure_auto_entry')
+                    and (result.metadata or {}).get('veto')):
+                veto = result.metadata['veto']
+                details = dict(result.metadata.get('structure_veto_details') or {})
+                details.setdefault('code', veto)
+                self._record_structure_outcome(
+                    'REJECT', candidate, result, reason=veto, details=details)
             return finish('HOLD_LIVE_MODEL')
         if (result.selected_signal is None or result.selected_signal.signal_id!=candidate.signal_id
                 or not all(note and note.mode=='llm' for note in (result.market,result.strategy,result.portfolio))):
@@ -856,14 +942,20 @@ class LiveRunner:
                 raise
             except Exception:
                 pass # Protection is confirmed; failed balance refresh stays explicitly unready.
-            return finish('LIVE_PROTECTED', intent_id=intent.get('intent_id'))
+            return finish('LIVE_PROTECTED', intent_id=intent.get('intent_id'), intent=state)
         try:
             from trading.runtime.ready_fill import mark_outcome
             mark_outcome(self.store, state)
         except (TypeError, ValueError, sqlite3.Error):
             pass
-        return finish('HOLD_LIVE_'+str(state.get('status','UNKNOWN')).upper(), notify=False,
-                      intent_id=intent.get('intent_id'))
+        exec_reason = 'HOLD_LIVE_'+str(state.get('status','UNKNOWN')).upper()
+        reject_details = dict(status=state.get('status'))
+        if isinstance(state.get('entry_rejection'), dict):
+            reject_details.update(state['entry_rejection'])
+        # notify=False skips generic entry-rejection Telegram; structure path still
+        # emits a clear REJECT via _record_entry_rejection when flagged.
+        return finish(exec_reason, notify=False, intent_id=intent.get('intent_id'),
+                      intent=state, details=reject_details)
 
     def _capacity_probe(self, images, prompt_bytes, ceiling):
         probe=getattr(self.llm,'probe_free_capacity',None)
@@ -1002,8 +1094,9 @@ class LiveRunner:
                     if result.metadata.get('provider_called') is not False:
                         queue.evaluated(candidate)
                     if getattr(result, 'hold_reason', None) == 'decision_expired' and result.metadata.get('analysis_trace_id'):
-                        self._record_entry_rejection(candidate, result.metadata['analysis_trace_id'],
-                                                     'HOLD_LIVE_DECISION_EXPIRED')
+                        self._record_entry_rejection(
+                            candidate, result.metadata['analysis_trace_id'],
+                            'HOLD_LIVE_DECISION_EXPIRED', result=result)
                     outcomes.append(self._apply(candidate,result,control))
                 except sqlite3.Error:
                     raise
@@ -1015,7 +1108,9 @@ class LiveRunner:
                     if result is not None and result.action.value=='trade':
                         if self._price_invalidated_acceptance(reason, details):
                             self._clear_accepted_entry(candidate.symbol)
-                        self._record_entry_rejection(candidate,result.metadata.get('analysis_trace_id'),reason,details)
+                        self._record_entry_rejection(
+                            candidate, result.metadata.get('analysis_trace_id'), reason, details,
+                            result=result)
                     outcomes.append(self.status(reason))
             return next((row for row in outcomes if row['reason']=='LIVE_PROTECTED'),outcomes[-1])
         except sqlite3.Error:

@@ -338,9 +338,8 @@ def _ready_card_decision(candidate, card, chart_context, *, entry, price_step, n
         runner3_policy.validate_evidence(card, plan, now)
     except (KeyError, TypeError, ValueError):
         return None
-    rationale = (
-        f'{candidate.symbol} hazır kurulumdan güncel fiyattan girildi. '
-        'Kapalı CHoCH, blok veya akış ve stop vardı. Model yeniden sorulmadı.')
+    from trading.runtime.structure_entry_messages import structure_ready_card_rationale
+    rationale = structure_ready_card_rationale(candidate.symbol)
     return ModelDecision(
         action='trade', signal_id=candidate.signal_id, setup_id=card['setup_id'],
         rationale=rationale[:1200], invalidation='Kapalı CHoCH stopu bozulursa işlem biter.',
@@ -420,6 +419,21 @@ def _one_touch_level(options, price):
 def _consume_structure(coordinator, candidate, prior_watch):
     if _structure_review(candidate, prior_watch):
         coordinator.consume_structure_review(candidate.symbol)
+
+
+def _structure_veto_details(failed, *, side, entry, stop, target, fee, slippage,
+                            free_margin, equity, path):
+    """Numbers for Telegram/logs when structure auto-entry fails entry_veto."""
+    details = dict(entry_path=path, side=side, free_margin=free_margin, equity=equity,
+                   entry=entry, stop=stop, target=target, code=failed)
+    try:
+        ratio = runner3_policy.cost_adjusted_r(
+            side=side, entry=entry, stop=stop, target=target, fee=fee, slippage=slippage)
+    except (TypeError, ValueError):
+        ratio = None
+    if isinstance(ratio, (int, float)):
+        details['net_r'] = float(ratio)
+    return details
 
 
 def _internal_entry_decision(candidate, card, chart_context, *, entry, stop, fee, slippage,
@@ -646,6 +660,7 @@ class ContextEvaluator:
         direct_decision = None
         model_not_asked = False
         structure_auto_entry = False
+        structure_entry_path = None
         if runner3 and candidate.features.get('hold_review') and price_rules is not None:
             # A printed number enters only when it matches a plan the model already accepted.
             card = _retrigger_card(candidate, options)
@@ -728,6 +743,12 @@ class ContextEvaluator:
                     now=time.time())
                 if failed:
                     logging.getLogger('worker').info('VETO %s check=%s', symbol, failed)
+                    path = (card.get('evidence') or {}).get('entry_path') or card.get('entry_path')
+                    veto_details = _structure_veto_details(
+                        failed, side=card.get('side') or candidate.side.value,
+                        entry=candidate.entry_price, stop=card.get('stop_loss_price'),
+                        target=card.get('take_profit_price'), fee=fee, slippage=slippage,
+                        free_margin=cash_free, equity=cash_equity, path=path)
                     _consume_structure(coordinator, candidate, prior_watch)
                     _note_ready_fill(
                         self.store, symbol=symbol, options=options, entry=candidate.entry_price,
@@ -740,17 +761,18 @@ class ContextEvaluator:
                         model_not_asked=True, runner_id=live_account.get('runner_id', 'runner3'))
                     return EvaluationResult(action=GraphAction.HOLD, hold_reason=failed,
                         metadata={'provider_called': False, 'model_not_asked': True,
-                                  'structure_auto_entry': True, 'veto': failed})
+                                  'structure_auto_entry': True, 'veto': failed,
+                                  'entry_path': path, 'structure_veto_details': veto_details})
                 if direct_decision is not None:
                     path = (card.get('evidence') or {}).get('entry_path') or card.get('entry_path')
-                    rationale = (
-                        f'{symbol} {path} hazır kurulumdan girildi. Model sorulmadı. '
-                        'Stop karttan; hedef 1.25 geçen yapı seviyesi.')
+                    from trading.runtime.structure_entry_messages import structure_plan_rationale
+                    rationale = structure_plan_rationale(symbol, path)
                     direct_decision = direct_decision.model_copy(update=dict(
                         rationale=rationale[:1200],
                         invalidation='Kapalı CHoCH stopu bozulursa işlem biter.'))
                     model_not_asked = True
                     structure_auto_entry = True
+                    structure_entry_path = path
         if (runner3 and not model_not_asked and price_rules is not None
                 and _structure_review(candidate, prior_watch) and _awaiting_only(options)):
             from trading.evaluation.hold_triggers import save_hold, snapshot_market
@@ -790,6 +812,9 @@ class ContextEvaluator:
             why_reconsidered=changes,seed_timeframe=candidate.features.get('seed_timeframe'),
             market_fingerprint=fingerprint,input_fingerprint=digest(prompt),
             context_policy=POLICY_VERSION,prompt_bytes=len(prompt.encode()))
+        if structure_auto_entry:
+            trace['structure_auto_entry'] = True
+            trace['entry_path'] = structure_entry_path
         if runner2:
             trace['strategy_cohort']=policy_version if runner3 else 'runner2-multihorizon-ict-v1'
         publish_progress(self.store,trace)
@@ -1217,7 +1242,9 @@ class ContextEvaluator:
             metadata['model_not_asked'] = True
         if structure_auto_entry:
             metadata['structure_auto_entry'] = True
+            metadata['entry_path'] = structure_entry_path
             trace['structure_auto_entry'] = True
+            trace['entry_path'] = structure_entry_path
         if decision is None:
             metadata['provider_busy']=getattr(self.llm,'last_status','')=='paid_in_flight'
             wait_statuses={'cooldown_skipped','quota_skipped','paid_in_flight','stopped','missing_key','budget_exhausted','budget_or_interval_hold'}
