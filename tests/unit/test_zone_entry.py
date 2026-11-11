@@ -13,6 +13,12 @@ from .test_runner3_llm_vlm_limits import DecisionModel, evaluator, rebase_market
 from .test_structure_setups import NOW, htf_zone_context, view
 
 
+@pytest.fixture(autouse=True)
+def _wide_entry_cap(monkeypatch):
+    """These fixtures price the entry 1.2-1.4 1h ATR from the weak level."""
+    monkeypatch.setattr('trading.quant.structure_setups.WEAK_ENTRY_MAX_ATR', 2.)
+
+
 def _rebase(market):
     offset = int(time.time()) - NOW - 1
 
