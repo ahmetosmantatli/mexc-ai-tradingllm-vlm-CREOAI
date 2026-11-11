@@ -189,6 +189,8 @@ class ProviderRouter:
                 self._cooldown(model,60)
         except Exception as exc:
             attempt.update(status='failed',error_category='network_timeout' if isinstance(exc,httpx.TimeoutException) else 'network_error' if isinstance(exc,httpx.TransportError) else 'invalid_output_or_local_validation')
+            if attempt['error_category']=='invalid_output_or_local_validation':
+                logging.warning('AI doğrulama: %s: %s', type(exc).__name__, str(exc)[:200])
             self.last_fallback_reason='groq_error_or_invalid_output'
             self._cooldown(model,60)
         finally:
@@ -265,6 +267,7 @@ class ProviderRouter:
             try:
                 result=self.valid(result)
             except Exception as exc:
+                logging.warning('AI doğrulama: %s: %s', type(exc).__name__, str(exc)[:200])
                 self.last_status='error_or_invalid_output'
                 self.last_trace['attempts'][-1].update(status='invalid_schema',error_category='invalid_decision_schema',
                     validation_issues=self._validation_issues(exc))

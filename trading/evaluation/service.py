@@ -819,11 +819,10 @@ class ContextEvaluator:
                                     invalidation_price=option['invalidation_price'])
                     if trigger.startswith('closed_candle'):
                         expected['timeframe'] = option['trigger_timeframe']
-                    if decision.watch_plan is None:
+                    if decision.watch_plan is None or any(
+                            getattr(decision.watch_plan, field) != value for field, value in expected.items()):
                         from trading.evaluation.watch import WatchPlan
                         decision.watch_plan = WatchPlan(expires_at=time.time()+86400, **expected)
-                    elif any(getattr(decision.watch_plan, field) != value for field, value in expected.items()):
-                        raise ValueError('HTF watch plan differs from supplied trigger or invalidation')
                 elif decision.watch_plan is not None:
                     raise ValueError('HTF watch has no supplied executable trigger')
             if decision.watch_plan is not None and decision.watch_plan.trigger_condition in ('price_above','price_below'):

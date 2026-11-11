@@ -135,6 +135,7 @@ class GeminiClient:
                 else 'network_error' if isinstance(exc,httpx.TransportError)
                 else 'invalid_output_or_local_validation')
             if attempt['error_category']=='invalid_output_or_local_validation':
+                logging.warning('AI doğrulama: %s: %s', type(exc).__name__, str(exc)[:200])
                 attempt['validation_issues']=validation_issues(exc,self.decision_schema)
             self._cooldown(key)
             return None

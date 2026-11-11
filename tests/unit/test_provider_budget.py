@@ -243,6 +243,38 @@ def test_legacy_json_truncation_also_rejected_even_when_parseable(tmp_path):
     assert store.get('ai_budget')['successful_calls']==1
 
 
+def test_router_validation_warning_contains_exception_type_and_short_message(tmp_path, caplog):
+    import logging
+    from trading.agents.provider_router import ProviderRouter
+    reason = 'supplied watch price mismatch ' + ('detail ' * 40)
+    assert len(reason) > 200
+    cfg = Settings(_env_file=None, anthropic_api_key='test-key', ai_primary_provider='anthropic')
+    store = RuntimeStore(str(tmp_path / 'router.sqlite3'))
+    router = ProviderRouter(cfg, Budget(store, cfg), store)
+    router.decision_schema = DECISION_SCHEMA
+
+    def count(**kwargs):
+        return SimpleNamespace(input_tokens=200)
+
+    def create(**kwargs):
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=200, output_tokens=40), stop_reason='tool_use',
+            content=[SimpleNamespace(type='tool_use', name='submit_trade_decision', input={'action': 'hold', 'signal_id': None})])
+
+    router.claude._client = SimpleNamespace(messages=SimpleNamespace(count_tokens=count, create=create))
+    router.response_validator = lambda payload: (_ for _ in ()).throw(ValueError(reason))
+    caplog.set_level(logging.WARNING)
+    assert router.complete_json(system='SECRET_PROMPT', user='SECRET_PACKET') is None
+    warnings = [record.getMessage() for record in caplog.records if record.getMessage().startswith('AI doğrulama:')]
+    assert warnings == ['AI doğrulama: ValueError: ' + reason[:200]]
+    assert 'SECRET_PROMPT' not in warnings[0]
+    assert 'SECRET_PACKET' not in warnings[0]
+    assert 'test-key' not in warnings[0]
+    attempt = router.last_trace['attempts'][0]
+    assert attempt['validation_issues'] == [dict(field='response', type='custom_validation')]
+    assert reason not in str(attempt)
+    router.close()
+
+
 def test_router_forwards_schema_and_checks_unknown_signal_without_retry(tmp_path):
     from trading.agents.provider_router import ProviderRouter
     cfg=Settings(_env_file=None,anthropic_api_key='test',ai_primary_provider='anthropic')
