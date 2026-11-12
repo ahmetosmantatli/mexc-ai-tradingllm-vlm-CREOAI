@@ -1329,9 +1329,20 @@ def test_omitted_risk_share_becomes_an_order_inside_the_cap_and_a_wide_stop_is_v
     assert share == pytest.approx(.03)
     assert share <= .15
     assert result.metadata['sizing_plan']['risk_per_trade_pct'] == pytest.approx(.03)
-    stop_fraction = abs(result.proposal.entry_price - result.proposal.stop_loss.price) / result.proposal.entry_price
-    assert result.proposal.max_loss_if_stopped == pytest.approx(1000 * share)
-    assert result.proposal.notional == pytest.approx(1000 * share / stop_fraction)
+    assert result.proposal.metadata.get('fee_aware_sizing') is True
+    from trading.evaluation.planning import FEE_AWARE_SIZE_HAIRCUT
+    from trading.runtime.runner3_policy import ioc_target_economics
+    entry = result.proposal.entry_price
+    stop = result.proposal.stop_loss.price
+    target = result.proposal.take_profit_price
+    fee = Settings(_env_file=None).paper_fee_rate
+    slip = Settings(_env_file=None).paper_slippage_bps / 10000
+    unit = ioc_target_economics(
+        side=result.proposal.side.value, entry=entry, stop=stop, target=target,
+        fee=fee, slippage=slip)[2]
+    expected_notional = 1000 * share * entry / unit * FEE_AWARE_SIZE_HAIRCUT
+    assert result.proposal.notional == pytest.approx(expected_notional)
+    assert result.proposal.max_loss_if_stopped == pytest.approx(unit * expected_notional / entry)
     assert store.get('analysis_trace')['status'] == 'completed'
 
     def present(packet):

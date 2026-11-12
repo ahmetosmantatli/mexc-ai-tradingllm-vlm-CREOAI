@@ -148,7 +148,61 @@ def test_margin_share_does_not_change_size_and_an_unusable_share_stays_empty():
 def test_paper_gate_rejects_tiny_amount_never_increases_to_minimum():
     proposal = size({'leverage': 2, 'risk_per_trade_pct': .00000001})
     ledger = PaperLedger(RuntimeStore(':memory:'), 1000.)
-    with pytest.raises(ValueError, match='quantity outside'):
+    with pytest.raises(ValueError, match='contract quantity below exchange minimum'):
         ledger.open(proposal, rules(minimum=10), 99.99, 100., 's1', .03, .01)
     assert not ledger.positions
     assert ledger.equity == 1000.
+
+
+def test_fee_aware_continuous_sizing_clears_entry_veto_at_fifteen_percent():
+    """~8 USDT continuous size-to-ceiling must use fee+slip unit loss, not raw stop%."""
+    from trading.evaluation.planning import FEE_AWARE_SIZE_HAIRCUT
+    from trading.runtime.runner3_policy import (
+        CONTINUOUS_STOP_RISK_CAP, entry_veto, ioc_target_economics)
+
+    equity = 8.
+    fee, slip = 0.0006, 0.0005
+    signal = candidate(stop_loss_price=98., take_profit_price=108.)
+    raw = size(equity=equity, policy_risk=CONTINUOUS_STOP_RISK_CAP)
+    assert entry_veto(
+        side='long', entry=100., stop=98., target=108., equity=equity, free_margin=equity,
+        fee=fee, slippage=slip, notional=raw.notional, leverage=raw.leverage) == 'equity_stop'
+
+    sized = size(equity=equity, policy_risk=CONTINUOUS_STOP_RISK_CAP, fee=fee, slippage=slip)
+    assert sized.metadata['fee_aware_sizing'] is True
+    _g, _n, unit = ioc_target_economics(
+        side='long', entry=100., stop=98., target=108., fee=fee, slippage=slip)
+    expected = equity * CONTINUOUS_STOP_RISK_CAP * 100. / unit * FEE_AWARE_SIZE_HAIRCUT
+    assert sized.notional == pytest.approx(expected)
+    assert sized.notional < raw.notional
+    modeled = unit * sized.notional / 100.
+    assert modeled <= equity * CONTINUOUS_STOP_RISK_CAP + 1e-8
+    assert sized.max_loss_if_stopped == pytest.approx(modeled)
+    assert entry_veto(
+        side='long', entry=100., stop=98., target=108., equity=equity, free_margin=equity,
+        fee=fee, slippage=slip, notional=sized.notional, leverage=sized.leverage) is None
+
+
+def test_fee_aware_sizing_still_rejects_min_contract_over_equity_stop():
+    """Min-contract notional that still exceeds the 15% fee+slip cap must REJECT."""
+    from trading.runtime.runner3_policy import CONTINUOUS_STOP_RISK_CAP, entry_veto
+
+    equity = 8.
+    fee, slip = 0.0006, 0.0005
+    # Wide structural stop (~5%) + min-contract style notional (~40 USDT) >> 15% of ~8.
+    min_contract_notional = 40.
+    assert entry_veto(
+        side='long', entry=100., stop=95., target=115., equity=equity, free_margin=equity,
+        fee=fee, slippage=slip, notional=min_contract_notional, leverage=10) == 'equity_stop'
+    # Fee-aware size for the same levels stays under the cap when physics allows.
+    sized = size(
+        equity=equity, policy_risk=CONTINUOUS_STOP_RISK_CAP, fee=fee, slippage=slip,
+        candidate=candidate(stop_loss_price=95., take_profit_price=115.))
+    assert sized.notional < min_contract_notional
+    assert entry_veto(
+        side='long', entry=100., stop=95., target=115., equity=equity, free_margin=equity,
+        fee=fee, slippage=slip, notional=sized.notional, leverage=sized.leverage) is None
+    # Do not invent a fill by bumping to min contract past the equity stop.
+    assert entry_veto(
+        side='long', entry=100., stop=95., target=115., equity=equity, free_margin=equity,
+        fee=fee, slippage=slip, notional=min_contract_notional, leverage=10) == 'equity_stop'

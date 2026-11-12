@@ -1371,7 +1371,10 @@ class ContextEvaluator:
         prepared_proposal=None
         if decision.action=='trade' and entry_block is None:
             try:
-                prepared_proposal=apply_decision_sizing(planned_candidate,decision.sizing_plan,equity,risk_per_trade_pct,target_leverage,exchange_cap)
+                sizing_costs = dict(fee=fee, slippage=slippage) if runner3 else {}
+                prepared_proposal=apply_decision_sizing(
+                    planned_candidate, decision.sizing_plan, equity, risk_per_trade_pct,
+                    target_leverage, exchange_cap, **sizing_costs)
             except PlanSizingError:
                 return reject_coordinated('invalid_model_sizing')
         local_limit=bool(runner3 and decision.limit_price is not None)
