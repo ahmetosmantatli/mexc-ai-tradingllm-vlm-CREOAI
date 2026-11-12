@@ -20,7 +20,8 @@ def _wide_entry_cap(monkeypatch):
     monkeypatch.setattr('trading.quant.structure_setups.WEAK_ENTRY_MAX_ATR', 2.)
 
 
-def _run(tmp_path, monkeypatch, *, auto_entry, market=None, text=None, equity=11.58):
+def _run(tmp_path, monkeypatch, *, auto_entry, market=None, text=None, equity=11.58,
+         risk_per_trade_pct=.03, continuous=False):
     market = _rebase(weak_long_market() if market is None else market)
     market['symbol'] = 'BTC_USDT'
 
@@ -49,11 +50,13 @@ def _run(tmp_path, monkeypatch, *, auto_entry, market=None, text=None, equity=11
     seed.symbol = 'BTC_USDT'
     seed.entry_price = 100.
     seed.features.update(htf_zone_seed=True, source_closed_at=time.time() - 1, dedup_key='seed')
+    account = dict(mode='LIVE', currency='USDT', runner_id='runner3',
+                   current_equity=equity, available_usdt=equity)
+    if continuous:
+        account.update(continuous_aggressive=True, aggressive_model_sizing=True)
     result = reviewed.evaluate_candidates(
-        [seed], equity=equity, risk_per_trade_pct=.03, target_leverage=20,
-        live_account_context=dict(mode='LIVE', currency='USDT', runner_id='runner3',
-                                  current_equity=equity, available_usdt=equity),
-        live_positions={})
+        [seed], equity=equity, risk_per_trade_pct=risk_per_trade_pct, target_leverage=20,
+        live_account_context=account, live_positions={})
     return result, model
 
 
@@ -108,3 +111,37 @@ def test_under_one_point_two_five_vetoes_without_model(tmp_path, monkeypatch):
     assert result.metadata.get('structure_auto_entry') is True
     assert result.metadata.get('veto') == 'cost_adjusted_r'
     assert result.metadata.get('structure_veto_details', {}).get('code') == 'cost_adjusted_r'
+
+
+def test_continuous_eight_usdt_confirm_bar_survives_fee_aware_equity_stop(tmp_path, monkeypatch):
+    """~8 USDT continuous confirm_bar: fee-aware notional clears evaluate equity_stop."""
+    from trading.runtime.runner3_policy import CONTINUOUS_STOP_RISK_CAP, entry_veto, ioc_target_economics
+
+    def boom(packet):
+        raise AssertionError('model must not be asked')
+
+    equity = 8.
+    result, model = _run(
+        tmp_path, monkeypatch, auto_entry=True, text=boom, equity=equity,
+        risk_per_trade_pct=CONTINUOUS_STOP_RISK_CAP, continuous=True)
+    assert model.calls == []
+    assert result.metadata.get('structure_auto_entry') is True
+    assert result.metadata.get('entry_path') == 'confirm_bar'
+    assert result.action.value == 'trade'
+    assert result.hold_reason != 'equity_stop'
+    assert result.metadata.get('veto') is None
+    assert result.proposal is not None
+    assert result.proposal.metadata.get('fee_aware_sizing') is True
+    fee = Settings(_env_file=None).paper_fee_rate
+    slip = Settings(_env_file=None).paper_slippage_bps / 10000
+    unit = ioc_target_economics(
+        side=result.proposal.side.value, entry=result.proposal.entry_price,
+        stop=result.proposal.stop_loss.price, target=result.proposal.take_profit_price,
+        fee=fee, slippage=slip)[2]
+    modeled = unit * result.proposal.notional / result.proposal.entry_price
+    assert modeled <= equity * CONTINUOUS_STOP_RISK_CAP + 1e-8
+    assert entry_veto(
+        side=result.proposal.side, entry=result.proposal.entry_price,
+        stop=result.proposal.stop_loss.price, target=result.proposal.take_profit_price,
+        equity=equity, free_margin=equity, fee=fee, slippage=slip,
+        notional=result.proposal.notional, leverage=result.proposal.leverage) is None

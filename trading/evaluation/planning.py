@@ -7,6 +7,10 @@ contract minima and liquidation remain mandatory gates. A sub-minimum quantity
 may bump to the exchange minimum only when the caller's risk notional still
 covers that minimum; otherwise it is rejected early with a clear below-minimum
 reason rather than silently rounding to 0.
+
+When fee and slippage are supplied, notional uses the same IOC unit-loss model
+as entry_veto so continuous size-to-ceiling plans are not immediately killed by
+fee+slip after a raw-stop size. The 15% equity stop cap is unchanged.
 """
 from math import isfinite
 from typing import Any
@@ -16,6 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from trading.equity.state import EquityState
 from trading.models.domain import Side, StopLossSpec, TradeProposal
 from trading.quant.signals import CandidateSignal
+
+# Stay under entry_veto's fee+slip equity_stop float edge when sizing to the cap.
+FEE_AWARE_SIZE_HAIRCUT = 0.999
 
 
 def _usable_margin_share(value):
@@ -87,6 +94,9 @@ def apply_decision_sizing(
     policy_risk: float,
     policy_leverage: float,
     exchange_cap: float,
+    *,
+    fee: float | None = None,
+    slippage: float | None = None,
 ) -> TradeProposal:
     """Size one selected candidate; raise PlanSizingError instead of clamping.
 
@@ -97,6 +107,11 @@ def apply_decision_sizing(
     plan exceeding *either* limit is rejected. The exchange maximum is
     information, not a replacement for user policy. Unknown fields (including
     symbol, cash amount or prices) are rejected.
+
+    When *fee* and *slippage* are both supplied, notional is sized so the
+    fee+slip modeled stop loss stays inside the risk budget (same unit model as
+    ``entry_veto``), with a small haircut so size-to-ceiling continuous plans
+    clear the later equity_stop check. Omitting costs keeps raw-stop sizing.
     """
     current_equity = _number(equity.equity if isinstance(equity, EquityState) else equity, 'equity')
     risk_limit = _number(policy_risk, 'policy_risk')
@@ -128,14 +143,31 @@ def apply_decision_sizing(
         raise PlanSizingError('invalid_candidate_price_direction')
     stop_fraction = abs(entry-stop)/entry
     risk_budget = current_equity*risk
-    notional = risk_budget/stop_fraction
-    if not all(isfinite(value) and value > 0 for value in (stop_fraction, risk_budget, notional)):
+    fee_aware = fee is not None and slippage is not None
+    if fee_aware:
+        if isinstance(fee, bool) or not isinstance(fee, (int, float)) or not isfinite(fee) or fee < 0:
+            raise PlanSizingError('invalid_entry_costs')
+        if isinstance(slippage, bool) or not isinstance(slippage, (int, float)) or not isfinite(slippage) or slippage < 0:
+            raise PlanSizingError('invalid_entry_costs')
+        from trading.runtime.runner3_policy import ioc_target_economics
+        _gross, _net, unit = ioc_target_economics(
+            side='long' if long else 'short', entry=entry, stop=stop, target=target,
+            fee=float(fee), slippage=float(slippage))
+        if not isfinite(unit) or unit <= 0:
+            raise PlanSizingError('invalid_sized_amount')
+        # Match entry_veto: modeled_loss = unit * (notional / entry) ≤ risk_budget.
+        notional = risk_budget * entry / unit * FEE_AWARE_SIZE_HAIRCUT
+        max_loss = unit * notional / entry
+    else:
+        notional = risk_budget/stop_fraction
+        max_loss = risk_budget
+    if not all(isfinite(value) and value > 0 for value in (stop_fraction, risk_budget, notional, max_loss)):
         raise PlanSizingError('invalid_sized_amount')
     return TradeProposal(
         symbol=candidate.symbol, side=candidate.side, leverage=leverage,
         notional=notional, entry_price=entry,
         stop_loss=StopLossSpec(price=stop, percent_from_entry=stop_fraction),
-        take_profit_price=target, max_loss_if_stopped=risk_budget,
+        take_profit_price=target, max_loss_if_stopped=max_loss,
         expected_edge=candidate.confidence, fee_free_pair=candidate.fee_free_pair,
         rationale=candidate.rationale,
         metadata=dict(strategy=candidate.strategy.value, signal_id=candidate.signal_id,
@@ -143,5 +175,6 @@ def apply_decision_sizing(
                       sizing_source='model' if plan else 'policy',
                       sizing_plan=plan.model_dump(exclude_none=True) if plan else None,
                       risk_per_trade_pct=risk, policy_risk_limit=risk_limit,
-                      policy_leverage_limit=leverage_limit, exchange_leverage_limit=exchange_limit),
+                      policy_leverage_limit=leverage_limit, exchange_leverage_limit=exchange_limit,
+                      fee_aware_sizing=fee_aware),
     )
