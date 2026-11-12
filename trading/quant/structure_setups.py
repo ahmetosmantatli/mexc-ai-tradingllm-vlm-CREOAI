@@ -1037,4 +1037,8 @@ def build_htf_zone_setups(market_context, *, current_price, price_step=0, zone_r
     options.extend(_early_weak_cards(
         views, current_price=current_price, price_step=price_step,
         observed=market_context['observed_at'], symbol=market_context.get('symbol')))
+    # Parallel OB-reject → weak-extreme watch family (WATCH only; no auto-entry).
+    from trading.quant.htf_ob_reject_watch import build_htf_ob_reject_watch
+    options.extend(build_htf_ob_reject_watch(
+        market_context, current_price=current_price, price_step=price_step, views=views))
     return options

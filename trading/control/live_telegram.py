@@ -234,19 +234,29 @@ class LiveTelegramController(TelegramController):
             return text
         stages={'awaiting_touch':'Bölge teması bekleniyor',
                 'awaiting_confirmation':'Temas var, kapanış teyidi bekleniyor',
-                'confirmed':'Kapanış teyidi görüldü'}
+                'confirmed':'Kapanış teyidi görüldü',
+                'awaiting_entry':'Erken CHoCH; teyit bekleniyor',
+                'ob_armed':'HTF OB silahlı (zayıf ekstremum)',
+                'prox_alert':'HTF OB yakınlık alarmı (~%1–2)',
+                'htf_wick_ok':'HTF OB fitil red (kapanış geçmedi)',
+                'ltf_choch':'LTF CHoCH zayıf ekstremuma'}
         recent=sorted(tracking.items(),key=lambda item:item[1]['last_scanned_at'],reverse=True)
         lines=[]
         now=time.time()
         for symbol, row in recent[:6]:
             for setup in row['setups'][:2]:
                 evidence=setup['evidence']
-                zone=evidence['zone']
-                stage=stages[evidence['stage']]
+                zone=evidence.get('zone') or {}
+                stage=stages.get(evidence.get('stage'), evidence.get('stage') or '?')
                 if evidence.get('expires_at',now+1)<=now:
                     stage='Son teyidin süresi doldu'
+                kind=evidence.get('kind') or ''
+                tag=' · OB-red' if kind=='htf_ob_reject_watch' else ''
+                low=zone.get('low'); high=zone.get('high')
+                box=(f"{low:g}–{high:g}" if isinstance(low,(int,float)) and isinstance(high,(int,float))
+                     else '—')
                 lines.append(f"{symbol} {setup['side']} · {setup['context_timeframe']} → {setup['trigger_timeframe']}"
-                             f" · {zone['low']:g}–{zone['high']:g} · {stage}")
+                             f" · {box} · {stage}{tag}")
         return text[:2600]+'\n\nAlgoritmanın son bölge gözlemleri\n'+'\n'.join(lines)
 
     def diagnostics_text(self,account_id):
