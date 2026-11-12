@@ -153,6 +153,11 @@ class LivePositionManager:
             for row in r._intents():
                 if not self._permitted(revision):break
                 if row.get('status')!='protected' or row.get('management_pending'):continue
+                try:self.review_ob_reject_threat(row,control)
+                except Exception as exc:
+                    r.store.put('ob_reject_threat_status',dict(at=time.time(),symbol=row['proposal']['symbol'],
+                        status='threat_review_failed',error_type=type(exc).__name__,
+                        reason='OB-red tehdit kontrolü tamamlanamadı; mevcut SL/TP korunuyor.'))
                 try:self.review(row,control)
                 except Exception as exc:
                     r.store.put('management_status',dict(at=time.time(),symbol=row['proposal']['symbol'],
@@ -167,6 +172,116 @@ class LivePositionManager:
                 r.store.put('vlm_book_status',dict(at=time.time(),status='idle_review_failed',
                     error_type=type(exc).__name__,reason='VLM incelemesi tamamlanamadı; mevcut SL/TP korunuyor.'))
         finally:r._management_lock.release()
+
+    def _scanned_ob_reject_cards(self, symbol):
+        tracking = self.runner.store.get('htf_zone_scan', {}) or {}
+        row = tracking.get(symbol) or {}
+        cards = []
+        for setup in row.get('setups') or []:
+            if not isinstance(setup, dict):
+                continue
+            evidence = setup.get('evidence') if isinstance(setup.get('evidence'), dict) else {}
+            if evidence.get('kind') != 'htf_ob_reject_watch':
+                continue
+            cards.append(setup)
+        return cards
+
+    def review_ob_reject_threat(self, intent, control):
+        """Defensive link: open position + opposing OB-reject threat → tighten bias.
+
+        Applies stop tighten only through the existing move_stop write path.
+        TP shortening is recorded on the management card and injected into the
+        LLM prompt; live TP writes stay on the existing runner2 extend-only path.
+        Never flips side.
+        """
+        from trading.quant.htf_ob_reject_watch import management_link_for_open_position
+        from trading.evaluation.price_plan import CandleReference
+
+        r = self.runner
+        if not self._permitted(control.get('updated_at')):
+            return
+        if intent.get('status') != 'protected' or intent.get('management_pending'):
+            return
+        proposal = intent['proposal']
+        symbol = proposal['symbol']
+        side = proposal['side']
+        cards = self._scanned_ob_reject_cards(symbol)
+        if not cards:
+            return
+        stop, target = r.executor.protection_levels(intent)
+        entry = intent['entry_fill_price']
+        quote = r.quote(symbol)
+        fair = quote.raw.get('fairPrice') if isinstance(quote.raw, dict) else None
+        current = fair if isinstance(fair, (int, float)) and fair > 0 else (quote.bid1 if side == 'long' else quote.ask1)
+        rules = r.public.get_contract_rules(symbol)
+        plan = management_link_for_open_position(
+            position_side=side, entry=entry, stop=stop, target=target, cards=cards,
+            current_price=current, price_step=rules.price_step)
+        key = self.key(intent)
+        with r.store.lock:
+            card = r.store.get(key, {})
+            card['ob_reject_threat'] = dict(
+                at=time.time(), linked=bool(plan.get('linked')), flip=False,
+                plan={k: plan.get(k) for k in (
+                    'threat_side', 'threat_stage', 'threat_setup_id', 'tighten_stop',
+                    'shorten_target', 'stop', 'target', 'previous_stop', 'previous_target',
+                    'reason', 'action') if k in plan})
+            r.store.put(key, card)
+        if not plan.get('linked') or plan.get('flip'):
+            return
+        r.store.put('ob_reject_threat_status', dict(
+            at=time.time(), symbol=symbol, status='linked',
+            threat_stage=plan.get('threat_stage'), reason=plan.get('reason')))
+        if not plan.get('tighten_stop'):
+            return
+        # One defensive stop tighten per threat setup id (avoid write storms).
+        fired = (r.store.get(key, {}) or {}).get('ob_reject_stop_fired')
+        if fired == plan.get('threat_setup_id'):
+            return
+        revision = intent.get('management_revision', 0)
+        # Anchor stop to the latest closed review candle wick on the safe side.
+        from trading.analysis import build_bundle
+        bundle = build_bundle(r.public, symbol, include_hourly=True)
+        market = bundle.to_context(ict=True)
+        timeframe = '15m'
+        view = next((v for v in market['timeframes'] if v['timeframe'] == timeframe), None)
+        if view is None or not view.get('recent_ohlcv'):
+            return
+        bar = view['recent_ohlcv'][-1]
+        field = 'low' if side == 'long' else 'high'
+        anchor = bar[3] if field == 'low' else bar[2]
+        new_stop = plan['stop']
+        # Keep the written stop on the safe side of the wick anchor.
+        if side == 'long' and not new_stop <= anchor:
+            new_stop = min(new_stop, anchor)
+        if side == 'short' and not new_stop >= anchor:
+            new_stop = max(new_stop, anchor)
+        if side == 'long' and not (stop < new_stop < min(quote.bid1, fair or quote.bid1)):
+            return
+        if side == 'short' and not (stop > new_stop > max(quote.ask1, fair or quote.ask1)):
+            return
+        data = dict(
+            action='move_stop', position_id=intent['position_id'],
+            reason=plan.get('reason') or 'OB-red tehdidine karşı stop sıkılaştırıldı.',
+            review_timeframe=timeframe, stop_price=new_stop,
+            stop_reference=CandleReference(timeframe=timeframe, open_time=int(bar[0]), field=field).model_dump(),
+            close_fraction=None, ai=dict(provider='deterministic', model='htf_ob_reject_watch'))
+        try:
+            latest = r.executor.manage_position(
+                intent['intent_id'], data, expected_revision=revision,
+                decision_id='obrej-' + uuid4().hex[:20],
+                guard=lambda: self._permitted(control.get('updated_at')))
+        except Exception as exc:
+            r.store.put('ob_reject_threat_status', dict(
+                at=time.time(), symbol=symbol, status='stop_tighten_failed',
+                error_type=type(exc).__name__, reason=str(exc)[:240]))
+            return
+        with r.store.lock:
+            card = r.store.get(key, {})
+            card['ob_reject_stop_fired'] = plan.get('threat_setup_id')
+            card['ob_reject_threat'] = dict(card.get('ob_reject_threat') or {}, applied_stop=True,
+                                           execution_status=latest.get('status'))
+            r.store.put(key, card)
 
     def review(self,intent,control):
         from trading.analysis import build_bundle,render_bundle
@@ -278,6 +393,13 @@ class LivePositionManager:
             break_even=(entry*(1+fee)/((1-fee)*(1-slip)) if long
                         else entry*(1-fee)/((1+fee)*(1+slip)))
             position_card['estimated_break_even_exit_trigger']=break_even
+        threat=card.get('ob_reject_threat') if isinstance(card,dict) else None
+        if isinstance(threat,dict) and threat.get('linked'):
+            position_card['ob_reject_threat']=threat
+            position_card['defensive_bias']=(
+                'HTF OB-rejection toward a weak extreme threatens this open book. '
+                'Prefer tighten stop / reduce / close. Do not reverse or flip side. '
+                'A shorter TP is preferred over extending.')
         if runner2:
             from trading.analysis.market import benchmark_context, trade_flow_context
             market['benchmarks']=benchmark_context(r.public,market)
@@ -352,6 +474,10 @@ class LivePositionManager:
                          'structure before deciding. Consider tightening behind a valid closed wick, including profitable '
                          'territory where executable and estimated costs allow, or reduce/close if the thesis failed. '
                          'Do not extend TP solely on the basis of a previous approach. A sampled reversal alone is not an order.')
+                if position_card.get('ob_reject_threat'):
+                    policy+=(' When position.ob_reject_threat.linked is true, treat the open book as threatened by '
+                             'HTF OB rejection toward a weak extreme. Bias defense: tighten stop, reduce, or close. '
+                             'Never open/add/reverse or flip side.')
             raw=llm.complete_json(system=policy,user=prompt,max_tokens=850,images=paths or None)
             trace.update(copy.deepcopy(getattr(llm,'last_trace',{})))
             trace.update(completed_at=time.time(),provider=getattr(llm,'last_provider','none'),model=getattr(llm,'last_model',''),

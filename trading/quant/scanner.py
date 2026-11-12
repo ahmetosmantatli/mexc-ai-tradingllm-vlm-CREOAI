@@ -244,7 +244,12 @@ class MarketScanner:
                     source_open_at=closed_at-SECONDS[frame],source_closed_at=closed_at)))
         now=market['observed_at']
         touched=any(setup['state']=='watch' and setup['evidence'].get('touch_at') for setup in options)
-        tracking=dict(last_scanned_at=now,priority_until=now+1200 if touched else 0,
+        # OB-reject proximity / wick stages also deserve a priority rescan window.
+        ob_hot=any(
+            (setup.get('evidence') or {}).get('kind')=='htf_ob_reject_watch'
+            and (setup.get('evidence') or {}).get('stage') in ('prox_alert','htf_wick_ok','ltf_choch')
+            for setup in options)
+        tracking=dict(last_scanned_at=now,priority_until=now+1200 if (touched or ob_hot) else 0,
                       setups=[{key:setup[key] for key in ('state','side','context_timeframe','trigger_timeframe','evidence')}
                               for setup in options])
         return signals,tracking
